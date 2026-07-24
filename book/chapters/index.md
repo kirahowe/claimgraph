@@ -29,9 +29,11 @@ one behavior per chapter. These chapters use the in-memory store backend, which
 shares every line of decision logic with the Datalevin backend through a
 storage protocol. The CLI equivalents appear alongside as shell blocks.
 
-**Part III — Operations and Reference** is operational: advanced usage, the
-benchmark and its results, a comparison with the other memory systems in the
-field as of July 2026, a CLI reference, and the bibliography.
+**Part III — Operations and Reference** is operational: advanced usage, a
+hands-on guide to extending the code tier to a new language (and merging
+that work upstream), the benchmark and its results, a comparison with the
+other memory systems in the field as of July 2026, a CLI reference, and the
+bibliography.
 
 ## Building the book
 

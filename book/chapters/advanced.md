@@ -28,7 +28,9 @@ Kotlin with an internal line parse, TypeScript/JavaScript by shelling to a
 version-pinned dependency-cruiser (missing npx skips that analyzer with a
 hint), and a `code-analyzers` map in the project config overrides, disables,
 or adds analyzers — every analyzer emits the same per-unit interchange
-format and feeds the same driver. Each pass reconciles: facts the analysis
+format and feeds the same driver (the extending chapter walks through
+adding a language end to end, config-seam first, upstream after). Each
+pass reconciles: facts the analysis
 no longer produces are invalidated mechanically, unchanged facts reinforce,
 and a unit that moved files supersedes its old location. Absence in code
 means the code stopped saying it, which is the one place absence does imply

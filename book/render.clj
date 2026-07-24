@@ -33,6 +33,7 @@
                "internals.clj"]}
    {:part "Part III — Operations and Reference"
     :chapters ["advanced.md"
+               "extending.clj"
                "benchmark.md"
                "comparison.md"
                "cli_reference.md"
