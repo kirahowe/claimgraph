@@ -34,7 +34,7 @@ Five combinations that, per the survey, no other shipped system has:
    a memory came from; none but claimgraph types *what kind of claim it is*
    and lets that type decide revision policy. "We decided against GraphQL"
    flagging instead of superseding is the only shipped implementation of
-   the pattern the OpenAI temporal-agents cookbook designed.
+   the pattern the [OpenAI temporal-agents cookbook](https://developers.openai.com/cookbook/examples/partners/temporal_agents_with_knowledge_graphs/temporal_agents) designed.
 2. **First-class time travel.** Zep has the strongest hosted bi-temporal
    model but exposes it as timestamp filters. `--as-of` and `history` as
    direct verbs, answering "what did we believe in March and why did it

@@ -37,8 +37,8 @@ trust and confidence ceilings, the episode drives provenance and audit.
 Valid time (`t-valid` to `t-invalid`) is when a fact was true of the world.
 Transaction time (`recorded-at`) is when the store learned it. Temporal
 databases have kept these apart since the 1990s
-([Snodgrass](https://www2.cs.arizona.edu/~rts/tdbbook.pdf)); Datomic,
-XTDB, and Graphiti carried the pattern into modern stores, and claimgraph
+([Snodgrass](https://www2.cs.arizona.edu/~rts/tdbbook.pdf)); [Datomic](https://www.datomic.com/),
+[XTDB](https://xtdb.com/), and [Graphiti](https://github.com/getzep/graphiti) carried the pattern into modern stores, and claimgraph
 models it as explicit attributes so the logic is identical across storage
 backends.
 
@@ -78,8 +78,8 @@ entrenched beliefs need more than a newer timestamp to displace
 
 The predicate vocabulary encodes the defaults: 23 curated `core/*`
 predicates, each carrying its object kind, cardinality, default epistemic
-class, and an anchor into established vocabularies (PROV-O, SPDX, DOAP,
-Dublin Core). Unknown predicates are rejected with a did-you-mean
+class, and an anchor into established vocabularies ([PROV-O](https://www.w3.org/TR/prov-o/), [SPDX](https://spdx.dev/), [DOAP](https://github.com/ewilderj/doap),
+[Dublin Core](https://www.dublincore.org/specifications/dublin-core/dcmi-terms/)). Unknown predicates are rejected with a did-you-mean
 suggestion; genuinely new relations go to an `x/*` staging namespace and
 earn promotion by use.
 
@@ -163,7 +163,7 @@ The LLM appears in exactly three places, all upstream or offline:
 
 Everything else is a pure function. The 2026 freshness result (+10.8 points
 for deterministic versioning over LLM-mediated updates,
-[arXiv:2606.01435](https://arxiv.org/abs/2606.01435)) arrived after this
+[Don't Ask the LLM to Track Freshness](https://arxiv.org/abs/2606.01435)) arrived after this
 rule was set, and said the rule was right.
 
 ## The store is a view; the log is the record

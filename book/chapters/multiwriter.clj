@@ -10,7 +10,7 @@
 ;; moves logs between machines and a merge conflict cannot occur in
 ;; transport.
 ;;
-;; What this deliberately is not: a CRDT. A CRDT's contract is convergence
+;; What this deliberately is not: a [CRDT](https://hal.inria.fr/inria-00609399). A CRDT's contract is convergence
 ;; by construction, which means disagreement gets merged away. Two machines
 ;; disagreeing about a fact is exactly the situation a memory system should
 ;; surface to a human, and claimgraph already has a representation for that:

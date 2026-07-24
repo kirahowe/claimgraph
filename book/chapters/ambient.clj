@@ -191,8 +191,8 @@
 ;; extractor failure never blocks the deterministic recompile. The coach is
 ;; the push-side complement to the
 ;; skill's pull-side judgment, and it stays silent unless the gate fires;
-;; always-on injection is the pattern the AGENTS.md study measured into the
-;; ground, and the mutating-step evidence (SABER) says the moment worth
+;; always-on injection is the pattern the [AGENTS.md study](https://arxiv.org/abs/2602.11988) measured into the
+;; ground, and the mutating-step evidence ([SABER](https://arxiv.org/abs/2512.07850)) says the moment worth
 ;; interrupting is the one right before a write.
 ;;
 ;; The next chapter turns this machinery around: the same conflict engine,

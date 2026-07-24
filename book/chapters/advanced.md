@@ -14,7 +14,7 @@ immediately, a decision as a commitment with `--source-type
 decision-record`), how to phrase facts (entities as stable names, free text
 in literal objects), and what to do with a `flagged` response (never pick a
 winner; show the human the candidates). The store enforces what it can;
-the skill carries what only judgment can. StructMemEval's finding that
+the skill carries what only judgment can. [StructMemEval](https://arxiv.org/abs/2602.11243)'s finding that
 agents organize memory well only when told how is the reason this file
 exists and travels with the repo.
 
@@ -23,9 +23,9 @@ exists and travels with the repo.
 **`ingest-code`** is the mechanical tier: a registry of language analyzers
 (no LLM anywhere) emits `defined-in`, `depends-on`, and `written-in` facts
 at 0.95 confidence under a `:code` episode referenced to
-`<git-sha>[+<dirty-digest>]`. Clojure is parsed internally with edamame,
+`<git-sha>[+<dirty-digest>]`. Clojure is parsed internally with [edamame](https://github.com/borkdude/edamame),
 Kotlin with an internal line parse, TypeScript/JavaScript by shelling to a
-version-pinned dependency-cruiser (missing npx skips that analyzer with a
+version-pinned [dependency-cruiser](https://github.com/sverweij/dependency-cruiser) (missing npx skips that analyzer with a
 hint), and a `code-analyzers` map in the project config overrides, disables,
 or adds analyzers — every analyzer emits the same per-unit interchange
 format and feeds the same driver (the extending chapter walks through
@@ -66,7 +66,7 @@ loop, and the raw material is kept as evidence.
 hand: it summarizes and closes open episodes (summaries become full-text
 searchable, which is what makes "why did we do X" a query), judges open
 conflicts, sweeps for conflict candidates the write path cannot see, emits
-SIRA-style alias enrichment so future FTS queries land better, and reports
+[SIRA](https://arxiv.org/abs/2605.06647)-style alias enrichment so future FTS queries land better, and reports
 `x/*` predicates earning promotion. When no LLM is available it falls back
 to a mechanical digest, so the pass always makes progress.
 

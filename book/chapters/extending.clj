@@ -101,7 +101,7 @@
 ;; exact logic below, as a function, through the same injectable command
 ;; seam the test suite uses — a book build never shells out, and neither
 ;; does the suite (the TypeScript adapter's tests run on canned
-;; dependency-cruiser JSON the same way).
+;; [dependency-cruiser](https://github.com/sverweij/dependency-cruiser) JSON the same way).
 
 (defn python-analyzer-output
   "The script above, as a function of the project root -> its stdout."

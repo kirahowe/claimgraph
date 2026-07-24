@@ -11,7 +11,7 @@ an unmodified vector store. claimgraph's evaluation was
 designed against that backdrop, with three rules: deterministic scoring
 wherever the claim allows it, measurement focused on the axes where the
 field is weakest and structure should pay, and the headline claim
-demonstrated as net end-task improvement, because the AGENTS.md study
+demonstrated as net end-task improvement, because the [AGENTS.md study](https://arxiv.org/abs/2602.11988)
 proved that context merely existing does not help.
 
 Everything below is reproducible from the repo. The mechanics layer and the
@@ -26,11 +26,11 @@ events threaded through them. A hosting migration from Heroku to Fly. A
 namespace renamed and a duplicate merged. A dependency adopted against a
 standing rejection. A decision relitigated. An observation nobody ever
 restates. A poisoned session that plants an instruction-shaped preference
-and a plausible false fact (the MINJA pattern, miniaturized). Notes that
+and a plausible false fact (the [MINJA](https://arxiv.org/abs/2503.03704) pattern, miniaturized). Notes that
 restate facts, contradict a commitment, and get compacted away. And a
 contamination control: a fixture entity named React that is an in-house
 Clojure queueing library, so any correct answer about it must come from the
-graph rather than the model's parametric knowledge (DialSim's
+graph rather than the model's parametric knowledge ([DialSim](https://arxiv.org/abs/2406.13144)'s
 adversarial-renaming trick).
 
 ## Layer one: deterministic mechanics
@@ -48,7 +48,7 @@ amortize).
 Highlights of what the questions actually check: as-of queries between
 supersessions return exactly one answer; the rename resolves old names at
 Recovery@0 (the alias machinery needs zero reads to catch up, where
-ShiftBench found method rankings invert under shift); compaction-absence
+[ShiftBench](https://openreview.net/attachment?id=CCSztIjmOy&name=pdf) found method rankings invert under shift); compaction-absence
 fades instead of invalidating; the echo guard holds (compile, ingest,
 compile is a fixed point); the planted preference stays capped, decays on
 schedule, flags rather than overrides the standing commitment, and traces
@@ -68,7 +68,7 @@ whatever its confidence claims.
 
 ## The ablation: where structure pays, honestly
 
-Following the retrieval-versus-utilization diagnosis, `bb bench ablation`
+Following the [retrieval-versus-utilization diagnosis](https://iclr.cc/virtual/2026/10021251), `bb bench ablation`
 holds the fixture fixed and compares three arms: claimgraph in full, raw
 transcript chunks with TF-IDF retrieval, and claimgraph's facts with
 retrieval degraded to bare FTS.

@@ -140,7 +140,7 @@
 ;; ```
 ;;
 ;; One scope note: claimgraph keeps one dimension of correction less than a
-;; full bi-temporal store like XTDB. It can say what was believed at any
+;; full bi-temporal store like [XTDB](https://xtdb.com/). It can say what was believed at any
 ;; time and when beliefs changed; it does not audit how beliefs *about the
 ;; past* were themselves revised. That trade was made deliberately, and the
 ;; handoff document records it.
