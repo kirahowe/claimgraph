@@ -62,20 +62,17 @@ store entities and fact edges with validity timestamps, invalidating
 contradicted edges rather than deleting them. This is the strongest shipped
 structure for update-heavy recall; a
 [twelve-system study](https://arxiv.org/abs/2606.24775) found temporal-graph
-systems leading in the workloads where facts change. This is the one family
-that holds up for adaptive, long-running agent memory: because every fact
+systems leading in the workloads where facts change. This is the one approach
+that holds up for adaptive, long-running agent memory. Because every fact
 carries when it was true, the store can separate what has been superseded
-from what still holds. Systems without that temporal dimension cannot
-disambiguate when things happened, so they lose track of what is currently
-the case.
+from what still holds. Systems without this bitemporality cannot disambiguate when things happened, so they lose track of the current state of reality.
 
 **OS-style hierarchies** ([MemGPT](https://arxiv.org/abs/2310.08560), the
 theory behind [Letta](https://www.letta.com/)) model agent memory on how an
 operating system manages memory: the context window is RAM, the external
 store is disk, and the model pages data in and out through function calls as
-it needs it. The analogy is productive, but the hard part — deciding what to
-evict from the limited context when it fills up — comes down to rules of
-thumb rather than any principled policy.
+it needs it. The analogy is a useful way to think about how to simulate statefulness across stateless function calls, but the hard part — deciding what to
+evict from the limited context when it fills up — isn't fully fleshed out. It comes down to heuristics rather than any principled policy, which are inconsistent and unreliable. 
 
 **Files plus agency**, the camp that grew fastest in 2026: give the agent a
 filesystem and file tools and let it curate its own notes
@@ -83,32 +80,26 @@ filesystem and file tools and let it curate its own notes
 [Anthropic's memory tool](https://docs.claude.com/en/docs/agents-and-tools/tool-use/memory-tool),
 [Claude Code auto-memory](https://code.claude.com/docs/en/memory),
 [Basic Memory](https://github.com/basicmachines-co/basic-memory)). In effect
-these are agent-maintained wikis, distilled from sessions on the fly: the same
-markdown pile, now curated by the agent instead of the human. What this
+these are agent-maintained wikis, distilled from sessions on the fly. It's still just a pile of markdown notes but now curated by the agent instead of the human. What this
 approach cannot answer is unchanged: what did we believe in March, is this a
 decision or an observation, what contradicts what.
 
 **Self-modifying note networks** ([A-MEM](https://arxiv.org/abs/2502.12110))
 let new notes rewrite their neighbors' content in place. This has its own
-problems: the store drifts under its own influence and destroys provenance as
-it goes.
+problems, the largest of which is that the store drifts under its own influence and destroys provenance as it goes.
 
 ## What the field measured in 2025 and 2026
 
 Agent memory has been an unusually active research area over the past two
 years, and many of the approaches the field settled on are now backed by
-measurement rather than intuition. The results below are the ones that shaped
-claimgraph most directly.
+real experimental results rather than intuition. The conclusions below, drawn from this research, are the ones that shaped claimgraph most directly.
 
 **Ambient context injection does not pay.** The
 [AGENTS.md study](https://arxiv.org/abs/2602.11988) (Gloaguen et al., an oral
 at the workshop) measured repository context files across SWE-bench tasks and
-a set of developer-committed ones. Its finding, verbatim:
-"Providing context files does not generally improve task success rates,
-while increasing inference cost by over 20% on average."
-The lesson is narrower than "context files are useless": always-injected
-context loses to selective retrieval at the moment of need. Any memory
-system whose read path is "dump everything into the prompt" is on the wrong
+a set of developer-committed ones. Its finding was that "Providing context files does not generally improve task success rates, while increasing inference cost by over 20% on average."
+The lesson is narrower than "context files are useless". The main takeaway is that always-injected context loses to selective retrieval at query time. Any memory
+system whose read path includes "dump everything into the prompt" is on the wrong
 side of this result.
 
 **The LLM should not adjudicate the write path.**
