@@ -171,7 +171,8 @@
 ;; ## The hook that runs it
 ;;
 ;; ```bash
-;; bin/claim hooks install            # SessionEnd: ingest-notes, compile-context,
+;; bin/claim hooks install            # SessionEnd: ingest-code-if-changed,
+;;                                       #   ingest-notes, compile-context,
 ;;                                       #   consolidate when due (default weekly)
 ;; bin/claim hooks install --coach    # also: a UserPromptSubmit gate that
 ;;                                       #   interrupts only when the graph holds a
@@ -180,8 +181,15 @@
 ;; bin/claim hooks run                # the same pass, by hand
 ;; ```
 ;;
-;; Stages report independently: an extractor failure never blocks the
-;; deterministic recompile. The coach is the push-side complement to the
+;; The first stage keeps the mechanical code tier fresh with the same
+;; zero-effort economics as the rest of the loop: it is delta-gated on
+;; `<git-sha>+<dirty-digest>` against the last code episode's ref, so it
+;; costs milliseconds when nothing changed and reconciles when anything
+;; did — including teammates' pulled changes, which no skill nudge would
+;; ever catch (the `code-ingest` setting opts it out for projects with
+;; expensive analyzers). Stages report independently: an analyzer or
+;; extractor failure never blocks the deterministic recompile. The coach is
+;; the push-side complement to the
 ;; skill's pull-side judgment, and it stays silent unless the gate fires;
 ;; always-on injection is the pattern the AGENTS.md study measured into the
 ;; ground, and the mutating-step evidence (SABER) says the moment worth

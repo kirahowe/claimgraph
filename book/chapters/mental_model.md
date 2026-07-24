@@ -203,12 +203,15 @@ harness session → auto-memory notes → ingest-notes (delta-detected,
 inject at session start  ←  compile-context  ←  graph (+ consolidate, judge)
 ```
 
-A SessionEnd hook runs capture then compile. The compiled view (standing
-decisions, open conflicts, recent supersessions, top current facts) is
-written into a marker-delimited managed section of the file the harness
-already injects. The managed section is stripped before ingestion hashes
-its input, so the graph never re-consumes its own view: compile, ingest,
-compile is a fixed point.
+A SessionEnd hook runs the loop: first a mechanical code-freshness pass
+(every detected language analyzer, delta-gated on the code episode's
+`<git-sha>+<dirty-digest>` ref, so it costs nothing when nothing changed
+and reconciles teammates' pulled changes when it did), then capture, then
+compile. The compiled view (standing decisions, open conflicts, recent
+supersessions, top current facts) is written into a marker-delimited
+managed section of the file the harness already injects. The managed
+section is stripped before ingestion hashes its input, so the graph never
+re-consumes its own view: compile, ingest, compile is a fixed point.
 
 ## The invariants
 

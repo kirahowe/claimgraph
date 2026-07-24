@@ -92,7 +92,7 @@ carries verbatim quote receipts, and judged-compatible pairs are removed
 from the contradiction count. It never resolves anything, and exit code is
 0 even with findings: it is a diagnostic, not a gate. The audit chapter
 runs the whole pipeline executably; `--no-judge` and `--no-code` degrade it
-honestly when the LLM or the Clojure code ingester are unavailable.
+honestly when the LLM or the code analyzers are unavailable.
 
 ## The outcome signal
 

@@ -138,6 +138,7 @@
 ;; For a tour of the source: `logic.clj` first (every important decision is
 ;; there, pure and testable), then `core.clj` for how plans execute, then
 ;; one store backend, then the verticals (`oplog.clj`, `context.clj`,
-;; `ingest/notes.clj`, `consolidate.clj`, `audit.clj`, `mcp.clj`). The test
-;; suite mirrors that structure, 153 tests and 759 assertions across 23 test
-;; namespaces, and `bb test` runs it against both backends.
+;; `ingest/notes.clj`, `ingest/code.clj` and its per-language adapters,
+;; `consolidate.clj`, `audit.clj`, `mcp.clj`). The test suite mirrors that
+;; structure, 168 tests and 994 assertions across 24 test namespaces, and
+;; `bb test` runs it against both backends.
