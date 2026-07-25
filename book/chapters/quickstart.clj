@@ -10,6 +10,7 @@
 ;;
 ;; ```bash
 ;; scripts/setup.sh     # installs babashka (bb) and the Datalevin pod (dtlv)
+;;                      # — via Homebrew when available, else pinned downloads
 ;; bin/claim init    # creates ./.claimgraph/db, seeds the 23-predicate vocabulary
 ;; ```
 ;;

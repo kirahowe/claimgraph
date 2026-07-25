@@ -28,11 +28,14 @@ Onboarding is designed to be delegated. Tell your coding agent:
 
 **Prerequisites.** claimgraph runs on two native binaries — babashka (`bb`)
 and the Datalevin pod (`dtlv`), no JVM — and `scripts/setup.sh` installs
-both, so the prompt above is genuinely the whole setup. They are hard
-requirements: `claim` refuses to run without `bb`, and `claim setup` checks
-for `dtlv` before wiring anything (a SessionEnd hook without its pod binary
-would just be session-end noise, so a failed preflight blocks with the fix
-attached). The LLM tiers additionally want an authenticated `claude` CLI
+both, so the prompt above is genuinely the whole setup. With Homebrew on
+PATH it installs through each project's official tap (`borkdude/brew/babashka`,
+`huahaiy/brew/datalevin`); without brew it falls back to pinned GitHub
+release downloads into a user-writable dir — either way, no sudo. They are
+hard requirements: `claim` refuses to run without `bb`, and `claim setup`
+checks for `dtlv` before wiring anything (a SessionEnd hook without its pod
+binary would just be session-end noise, so a failed preflight blocks with
+the fix attached). The LLM tiers additionally want an authenticated `claude` CLI
 (or any command via `$CLAIMGRAPH_LLM_CMD`) — that one is optional: without
 it, extraction and judging sit out while every deterministic layer works.
 Likewise optional: the TypeScript/JavaScript code analyzer shells out to a
@@ -45,9 +48,11 @@ Or by hand — the same two binaries, then one command in your project:
 ```bash
 git clone https://github.com/kirahowe/claimgraph ~/tools/claimgraph
 ~/tools/claimgraph/scripts/setup.sh   # babashka (bb) + the Datalevin pod (dtlv)
-                                      # + a global `claim` launcher
-                                      # (INSTALL_DIR=~/.local/bin to avoid sudo)
+                                      # via Homebrew (falls back to pinned GitHub
+                                      # downloads) + a global `claim` launcher
 cd ~/your-project
+claim audit                           # start here: score the memory pile you
+                                      # already have — read-only, no store
 claim setup                           # the whole onboarding, one idempotent command
 ```
 

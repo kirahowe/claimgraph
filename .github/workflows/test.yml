@@ -18,14 +18,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The project's own installer, so CI uses the pinned bb + dtlv versions
-      # (and gets covered by every run). Installs to a user dir to avoid sudo.
+      # The project's own installer. USE_BREW=0 keeps CI on the pinned GitHub
+      # downloads (the runner image ships Homebrew, which would otherwise win
+      # and float to latest) — reproducible versions, and the fallback path
+      # setup.sh's brew-less users take gets covered by every run.
       - name: Install babashka + the Datalevin pod (scripts/setup.sh)
         run: |
           mkdir -p "$HOME/.local/bin"
           export PATH="$HOME/.local/bin:$PATH"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          INSTALL_DIR="$HOME/.local/bin" scripts/setup.sh
+          USE_BREW=0 INSTALL_DIR="$HOME/.local/bin" scripts/setup.sh
 
       - name: Run the test suite (memory + datalevin stores)
         run: bb test

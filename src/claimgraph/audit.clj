@@ -291,11 +291,12 @@
                  :stale (count stale)
                  :disagreements (count disagreements)
                  :restatements (count restated)
-                 :name-clusters (count nclusters)}]
+                 :name-clusters (count nclusters)}
+        claims (reduce + 0 (map :claims files))]
     {:status "ok"
      :project project
      :files (mapv #(select-keys % [:path :bytes :claims :warning]) files)
-     :claims (reduce + 0 (map :claims files))
+     :claims claims
      :code code
      :judge (if no-judge
               {:status :skipped :note "raw report — mechanical flags only (--no-judge)"}
@@ -310,7 +311,9 @@
                 :extraction-noise noise}
      :injection (injection-report files)
      :summary summary
-     :next ["claim setup  # the graph tracks these instead of accumulating them"]}))
+     :next [(if (zero? claims)
+              "claim setup  # nothing to migrate — start the graph fresh"
+              "claim setup  # the graph tracks these instead of accumulating them")]}))
 
 ;; ---------------------------------------------------------------------------
 ;; Pure: human rendering
@@ -333,7 +336,8 @@
                                   (map claim-str claims)))))
 
 (defn render-pretty
-  "The §1 scorecard block plus per-finding detail — every number auditable."
+  "The §1 scorecard block plus per-finding detail — every number auditable.
+  An empty pile short-circuits to a plain answer instead of a wall of zeros."
   [{:keys [status claims files findings injection summary code next] :as sc}]
   (if (not= "ok" status)
     (str/join "\n" (remove nil? [(str "audit " (name status)
@@ -342,25 +346,37 @@
     (let [n (fn [k] (get summary k 0))
           plural (fn [c s] (if (= 1 c) s (str s "s")))
           kb (fn [b] (Math/round (/ b 1000.0)))
-          head [(format "%4d claims extracted from %d %s"
-                        claims (count files) (plural (count files) "file"))
-                (format "%4d %-15s (opposed claims coexisting in the pile)"
-                        (n :contradictions) (plural (n :contradictions) "contradiction"))
-                (format "%4d %-15s (same subject, different values — the last one read silently wins)"
-                        (n :disagreements) (plural (n :disagreements) "disagreement"))
-                (format "%4d %-15s (contradicted by what the code says today)"
-                        (n :stale) "stale")
-                (format "%4d %-15s (the same fact maintained in more than one place)"
-                        (n :restatements) (plural (n :restatements) "restatement"))
-                (format "%4d %-15s %s"
-                        (n :name-clusters) (plural (n :name-clusters) "name cluster")
-                        (if-let [c (first (:name-clusters findings))]
-                          (str "(" (str/join " / " c) ")")
-                          "(no drift detected)"))
-                (format "%4d KB injected per session against a ~%d KB window%s"
-                        (kb (:pile-bytes injection))
-                        (kb (:window-bytes injection))
-                        (if (:over-budget injection) "  ** over budget **" ""))]
+          code-line (when (= :ok (:status code))
+                      (format "%4d code facts from %d files (%s) — the baseline stale claims are checked against"
+                              (:facts code) (:files code)
+                              (str/join ", " (map pred-str (:languages code)))))
+          head (if (empty? files)
+                 (remove nil?
+                         ["no memory pile found — nothing to audit"
+                          (str "     (scanned " (str/join ", " default-scan-set) ",")
+                          "      .cursor/rules/*, and the harness auto-memory notes)"
+                          code-line])
+                 (remove nil?
+                         [(format "%4d claims extracted from %d %s"
+                                  claims (count files) (plural (count files) "file"))
+                          (format "%4d %-15s (opposed claims coexisting in the pile)"
+                                  (n :contradictions) (plural (n :contradictions) "contradiction"))
+                          (format "%4d %-15s (same subject, different values — the last one read silently wins)"
+                                  (n :disagreements) (plural (n :disagreements) "disagreement"))
+                          (format "%4d %-15s (contradicted by what the code says today)"
+                                  (n :stale) "stale")
+                          (format "%4d %-15s (the same fact maintained in more than one place)"
+                                  (n :restatements) (plural (n :restatements) "restatement"))
+                          (format "%4d %-15s %s"
+                                  (n :name-clusters) (plural (n :name-clusters) "name cluster")
+                                  (if-let [c (first (:name-clusters findings))]
+                                    (str "(" (str/join " / " c) ")")
+                                    "(no drift detected)"))
+                          (format "%4d KB injected per session against a ~%d KB window%s"
+                                  (kb (:pile-bytes injection))
+                                  (kb (:window-bytes injection))
+                                  (if (:over-budget injection) "  ** over budget **" ""))
+                          code-line]))
           details (concat (map finding-line (:contradictions findings))
                           (map finding-line (:stale findings))
                           (map finding-line (:disagreements findings))

@@ -14,7 +14,8 @@
 
 (def ^:private global-spec
   {:db {:desc "Database path (default: $CLAIMGRAPH_DB, .claimgraph/config.json, or ./.claimgraph/db)"}
-   :pretty {:coerce :boolean :desc "Pretty-print JSON output"}})
+   :pretty {:coerce :boolean :desc "Pretty-print JSON output"}
+   :json {:coerce :boolean :desc "Force JSON output (audit defaults to the human scorecard at a terminal)"}})
 
 (defn- db-path [opts]
   (config/value :db opts))
@@ -27,6 +28,15 @@
 
 (defn- emit [opts data]
   (println (json/generate-string data {:pretty (boolean (:pretty opts))})))
+
+(defn- tty?
+  "True when stdout is an interactive terminal — a human at a prompt, not a
+  pipe, a script, or an agent capturing output. Pre-JDK-22 a non-nil console
+  already implies a terminal; isTerminal refines that where it exists."
+  []
+  (if-let [c (System/console)]
+    (try (.isTerminal c) (catch Throwable _ true))
+    false))
 
 (defn- evidence-dir [opts]
   (or (config/value :evidence-dir opts)
@@ -405,9 +415,13 @@
                    :extractor (:extractor opts)})]
     (when-let [f (:out opts)]
       (spit f (str (json/generate-string r {:pretty true}) "\n")))
-    (if (:pretty opts)
+    ;; A human at a terminal gets the scorecard; a pipe, script, or agent
+    ;; gets JSON. --pretty and --json force either way.
+    (cond
+      (:json opts) (emit opts r)
+      (or (:pretty opts) (tty?))
       (println ((requiring-resolve 'claimgraph.audit/render-pretty) r))
-      (emit opts r))))
+      :else (emit opts r))))
 
 (def ^:private setup-persist-keys
   "Settings a `claim setup` invocation may persist to .claimgraph/config.json —
@@ -458,7 +472,9 @@
 Usage: claim <command> [options]
 
 All commands accept --db PATH and --pretty. All output is JSON on stdout;
-errors are JSON on stderr with exit code 1.
+errors are JSON on stderr with exit code 1. One exception: audit prints its
+human scorecard when stdout is a terminal (--json forces JSON there; piped
+or captured output is always JSON).
 
 Nothing about file locations is assumed. Every setting resolves through one
 precedence chain — CLI flag > environment variable > .claimgraph/config.json
@@ -503,7 +519,8 @@ Commands:
                         [--no-code] (skip the staleness-vs-code prong)
                         [--no-judge] (skip the LLM verdict pass; report raw)
                         [--extractor CMD] [--out FILE] (also write the JSON
-                        scorecard to FILE) [--pretty] (human scorecard)
+                        scorecard to FILE) [--pretty|--json] (human scorecard
+                        is the default at a terminal, JSON when piped)
   init                Create the store and seed the predicate vocabulary
                         (setup calls this; use directly for a bare store)
   assert              Assert a fact through validation + conflict resolution

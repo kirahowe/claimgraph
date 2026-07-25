@@ -292,6 +292,33 @@
         (is (str/includes? out "We decided against GraphQL"))
         (is (str/includes? out "claim setup"))))))
 
+(deftest render-pretty-empty-pile-is-a-plain-answer
+  (let [out (audit/render-pretty
+             {:status "ok" :claims 0 :files []
+              :findings {} :summary {}
+              :injection {:pile-bytes 0 :window-bytes 25000 :over-budget false}
+              :code {:status :ok :files 83 :facts 538
+                     :languages [:clojure :typescript]}
+              :next ["claim setup  # nothing to migrate — start the graph fresh"]})]
+    (testing "no wall of zeros — says what was scanned and what was found"
+      (is (str/includes? out "no memory pile found"))
+      (is (str/includes? out "CLAUDE.md"))
+      (is (not (str/includes? out "contradiction"))))
+    (testing "the code baseline still shows its work"
+      (is (str/includes? out "538 code facts from 83 files (clojure, typescript)")))
+    (testing "the funnel hint adapts"
+      (is (str/includes? out "start the graph fresh")))))
+
+(deftest render-pretty-carries-the-code-baseline
+  (let [out (audit/render-pretty
+             {:status "ok" :claims 3 :files [{:path "CLAUDE.md" :claims 3}]
+              :findings {} :summary {}
+              :injection {:pile-bytes 1200 :window-bytes 25000 :over-budget false}
+              :code {:status :ok :files 12 :facts 90 :languages [:clojure]}
+              :next ["claim setup  # the graph tracks these instead of accumulating them"]})]
+    (is (str/includes? out "3 claims extracted from 1 file"))
+    (is (str/includes? out "90 code facts from 12 files (clojure)"))))
+
 (deftest audit-no-judge-reports-raw-flags
   (let [proj (write-fixture!)
         r (audit/audit! {:project proj

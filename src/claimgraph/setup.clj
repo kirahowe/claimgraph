@@ -50,7 +50,7 @@
       :extractor {:command extractor-cmd :found (boolean (which extractor-bin))}}
      (when-not dtlv
        {:error "the Datalevin pod binary (dtlv) is not installed"
-        :hint "run scripts/setup.sh from the claimgraph checkout (or point $CLAIMGRAPH_DTLV at the binary)"})
+        :hint "brew install huahaiy/brew/datalevin — or run scripts/setup.sh from the claimgraph checkout, or point $CLAIMGRAPH_DTLV at the binary"})
      (when-not (which extractor-bin)
        {:note (str "extractor '" extractor-bin "' not on PATH — LLM stages "
                    "(session-extract, ingest-notes, judge, consolidate summaries) "
