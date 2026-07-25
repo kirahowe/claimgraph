@@ -1,0 +1,478 @@
+-- allium: 3
+-- ingestion.allium
+--
+-- Scope: How knowledge gets INTO the graph — episodes as provenance
+-- bundles, raw evidence retention, admission control, and the ingestion
+-- tiers: mechanical code analysis (with reconciliation and the delta
+-- gate), LLM session extraction, harness auto-memory notes, failure
+-- lessons, decision records (ADRs), and batch JSONL. Every tier feeds the
+-- same write path: claims.allium's AssertFact, one fact at a time, full
+-- conflict machinery.
+--
+-- Includes: Episode, EvidenceArtifact; the admission screen; the six
+--   tiers and their per-tier caps, source types and epistemic rules; code
+--   reconciliation and the code-freshness delta gate.
+-- Excludes:
+--   - The assert decision itself (claims.allium)
+--   - Entity resolution and the extractor's roster prior mechanics
+--     (entities.allium governs resolution; the roster is described here
+--     only as a prompt input)
+--   - Episode SUMMARIZATION and closure by consolidation
+--     (maintenance.allium; tiers that close their own episodes do so with
+--     mechanical summaries, noted per rule)
+--   - `claim audit` (a diagnostic that reuses these tiers against a
+--     throwaway store with two deliberate deviations — commitments kept,
+--     code first; candidate for its own spec)
+--   - Language analyzer internals (edamame / line parse /
+--     dependency-cruiser) — each adapter is a black box that emits the
+--     interchange format; the config seam lets a project add a language
+--     with a ten-line script
+--
+-- Conventions:
+--   - Extraction is pluggable and optional: the LLM command defaults to an
+--     already-authenticated agent CLI; without one, extraction tiers sit
+--     out while every deterministic tier still works.
+--   - Source-type caps are enforced BY THE TIERS at preparation time (and
+--     preserved afterwards by claims.allium's per-source reinforcement
+--     ceilings); the store itself trusts callers.
+--   - Session-derived facts are second-class evidence BY DESIGN:
+--     extraction confidence is capped, and notes can never mint a
+--     commitment.
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+external entity Agent {
+    name: String
+}
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- The interchange format: the ONLY thing that crosses the analyzer
+-- boundary. One record per source unit; external commands emit it as JSONL
+-- or a JSON array. Everything past it — fact derivation, reconciliation,
+-- the pass — is shared and identical for every language.
+value InterchangeUnit {
+    unit: String                     -- e.g. "shoply.auth"
+    file: String
+    requires: Set<String>            -- "external:" prefix marks known-external
+    language: String
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum EpisodeSource { decision_record | user_assertion | code | session_log | failure_report | agent_note }
+
+enum EpisodeStatus { open | closed }
+
+-- Per-analyzer outcome of a code pass. skipped (missing tooling) carries a
+-- hint and never blocks; error isolates a broken tool to its adapter.
+enum AnalyzerStatus { ok | skipped | error }
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- The provenance bundle: which ingestion, of what, at what state, said
+-- these facts. Also the delta state: the newest code episode's ref IS the
+-- code-freshness gate, and agent-note episode refs ARE the per-file
+-- ingestion memory — no extra bookkeeping surface anywhere.
+entity Episode {
+    source: EpisodeSource
+    ref: String                      -- code: <git-sha>[+<dirty-digest>][+partial]
+                                     -- notes: <harness>:<path>@<content-hash>
+    opened_at: Timestamp
+    status: EpisodeStatus
+    summary: String when status = closed
+    closed_at: Timestamp when status = closed
+    evidence: EvidenceArtifact?
+
+    transitions status {
+        open -> closed
+        terminal: closed
+    }
+}
+
+-- Raw input kept past extraction (the write-before-query barrier:
+-- extraction decides what to keep before knowing what a future query will
+-- hinge on). Write-once by construction — the identity IS the sha-256 of
+-- the content, so identical content is a no-op and nothing can be edited
+-- in place. Local audit trail only: artifacts do not ride the dump; the
+-- episode's pointer does.
+entity EvidenceArtifact {
+    hash: String                     -- sha-256 of content; the identity
+    content: String
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    code_confidence: Decimal = 0.95      -- mechanical derivation, near the top
+    session_cap: Decimal = 0.7           -- LLM extraction ceiling
+    session_default: Decimal = 0.6       -- when the extractor omits confidence
+    notes_cap: Decimal = 0.65            -- notes rank below transcripts
+    notes_default: Decimal = 0.55
+    admission_floor: Decimal = 0.3       -- extracted candidates below this drop
+    max_subject_chars: Integer = 80      -- a subject longer than this is a
+                                         -- sentence, not a name
+    max_literal_chars: Integer = 250
+    roster_limit: Integer = 200          -- known-entity slice shown to extractors
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- Black box functions (pure, deterministic):
+--
+--   sha256(content)                  content hash (artifact identity;
+--                                    12-hex prefix for note deltas)
+--   current_code_ref(root)           <git-sha>, plus +<digest of the dirty
+--                                    working-tree status> when uncommitted
+--                                    edits exist — sessions that end dirty
+--                                    still gate correctly. Outside git:
+--                                    the root path, which the gate treats
+--                                    as ALWAYS stale.
+--   latest_code_episode_ref()        the newest code episode's ref
+--   gate_satisfied(current, latest)  true only when both are git-shaped
+--                                    refs and equal; a +partial ref never
+--                                    satisfies (a degraded pass retries)
+--   detected_adapters(root)          analyzer adapters whose detect glob
+--                                    matches files under root (built-ins:
+--                                    clojure, kotlin, typescript; plus the
+--                                    project's code-analyzers config —
+--                                    override, disable, or add a language)
+--   run_adapter(root, adapter)       {status, units}: ok with interchange
+--                                    units; skipped with a hint when its
+--                                    prerequisite tool is missing; error
+--                                    isolated to this adapter
+--   units_to_facts(units, scope)     the derived fact set:
+--                                      unit  defined-in  file   (one file
+--                                        per unit — file-grained only)
+--                                      file  written-in  "language"
+--                                      unit  depends-on  target
+--                                    An unprefixed require resolving to no
+--                                    emitted unit — and every "external:"
+--                                    one — lands scope "external": a
+--                                    resolution miss can create an
+--                                    external-scoped fact, never a wrong
+--                                    local edge.
+--   stale_code_facts(new_facts, languages)
+--                                    currently-valid code-sourced facts
+--                                    (this scope + "external") the new
+--                                    analysis no longer produces. With a
+--                                    language set (a PARTIAL pass: an
+--                                    adapter skipped or errored, or one
+--                                    language requested), only facts
+--                                    attributable to those languages are
+--                                    eligible — a pass never invalidates
+--                                    what it didn't look at.
+--   extract(command, prompt)         the pluggable LLM extraction: JSONL
+--                                    candidate claims out of a transcript,
+--                                    note file, or failure material. The
+--                                    prompt carries the stable predicate
+--                                    vocabulary and a bounded roster of
+--                                    known entities (top by fact count,
+--                                    with aliases) as a PRIOR — "use these
+--                                    exact names when you mean them",
+--                                    never "only these exist".
+--   admission_signals(candidate)     the rule-based screen, no LLM:
+--                                    confidence >= admission_floor,
+--                                    subject within max_subject_chars,
+--                                    literal within max_literal_chars are
+--                                    HARD; unknown subject / coined
+--                                    predicate / class weight only inform
+--                                    the logged score, not the verdict —
+--                                    extraction is already source-capped
+--                                    and the evidence tier keeps the raw
+--                                    input, so admission only screens
+--                                    shape and floor
+--   admitted(candidates)             candidates passing the hard rules
+--   inadmissible(candidates)         the rest, each carrying its signals —
+--                                    gate the graph, keep the log
+--   stripped_of_managed_section(content)
+--                                    the note minus the marker-delimited
+--                                    block compile-context wrote (the
+--                                    echo-loop guard), trimmed
+--   parsed(files)                    the mechanical MADR-flavored ADR parse
+--                                    of each file: id, status, supersedes /
+--                                    superseded-by, considered options,
+--                                    chosen option, explicit rejections —
+--                                    every considered-but-unchosen option
+--                                    counts as rejected
+--   run_all(adapters, language?)     one run per detected adapter (or just
+--                                    the requested language): its status
+--                                    and, when ok, its interchange units
+--   ok_units(runs)                   the units of the adapters that ran ok
+--   pass_ref(ref, runs, language?)   the episode ref for this pass: the
+--                                    code ref, suffixed +partial when an
+--                                    adapter errored or only one language
+--                                    ran — so the delta gate retries
+--   partial_languages(runs, language?)
+--                                    null for a COMPLETE pass (absence
+--                                    means deletion everywhere); for a
+--                                    partial one, the languages that
+--                                    actually ran — the reconciliation
+--                                    guard set
+--   clamped(candidates, cap, default)
+--                                    extracted candidates with confidence
+--                                    capped (missing confidence takes the
+--                                    default) and incomplete triples
+--                                    dropped to the rejected report
+--   demoted_to_inference(candidates) the notes tier's epistemic demotion:
+--                                    preference stays, everything else —
+--                                    including any "commitment" the
+--                                    extractor emitted despite the
+--                                    prompt — becomes observation, counted
+--                                    as demoted
+--   changed_notes(notes)             the note files whose current
+--                                    stripped-content hash has no
+--                                    agent-note episode yet (the episode
+--                                    log IS the delta state)
+--   note_ref(harness, note)          <harness>:<path>@<content-hash>
+
+-- Batch JSONL under one episode. Each line goes through the full conflict
+-- machinery; per-fact isolation — applying conflict policy fact-by-fact
+-- takes precedence over batch atomicity, and one bad line lands in the
+-- error report, never aborts the batch.
+rule IngestBatch {
+    when: IngestBatch(agent, source, ref, lines, evidence_content?)
+    ensures:
+        let ep = Episode.created(source: source, ref: ref, opened_at: now, status: open)
+        if evidence_content != null:
+            let ev = EvidenceArtifact.created(hash: sha256(evidence_content), content: evidence_content)
+            ep.evidence = ev
+        for line in lines:
+            AssertFact(agent: agent, subject: line.subject, predicate: line.predicate,
+                       object: line.object, episode: ep)
+}
+
+-- One code-analysis pass: every detected language, one episode, no LLM.
+-- Asserting what the analysis produces reinforces what the code still
+-- says; invalidating what it no longer produces reconciles the store
+-- against the code (deleted files, removed requires, dropped units); a
+-- unit that moved files supersedes its old location through the ordinary
+-- one_value machinery on defined-in. Reconciliation is language-guarded:
+-- a skipped or failed analyzer's facts are exempt, so degradation never
+-- invalidates what it didn't look at. An analyzer error marks the episode
+-- ref +partial so the ambient gate retries next run.
+rule IngestCode {
+    when: IngestCode(agent, root, scope, language?)
+    ensures:
+        let runs = run_all(detected_adapters(root), language)
+        let units = ok_units(runs)
+        if units.count > 0:
+            let facts = units_to_facts(units, scope)
+            let ref = pass_ref(current_code_ref(root), runs, language)
+            let ep = Episode.created(source: code, ref: ref, opened_at: now, status: open)
+            for id in stale_code_facts(facts, partial_languages(runs, language)):
+                InvalidateFact(agent: agent, fact: id, reason: "code-invalidation: absent from the current analysis")
+            for f in facts:
+                AssertFact(agent: agent, subject: f.subject, predicate: f.predicate,
+                           object: f.object, confidence: config.code_confidence,
+                           source_type: "code", episode: ep)
+            ep.status = closed
+            ep.summary = "code-analysis pass: files, facts, invalidations (mechanical digest)"
+            ep.closed_at = now
+        -- No adapter produced units (all skipped or errored): report
+        -- without touching the store — no episode, so the gate stays
+        -- stale and the next run retries.
+
+    @guidance
+        -- The full per-analyzer report (ok / skipped-with-hint / error)
+        -- rides the result; missing tooling must read as degradation with
+        -- a fix attached, never as failure.
+}
+
+-- The ambient code-freshness stage: run the pass only when the code moved.
+-- Same ref as the newest code episode -> milliseconds; changed ref -> the
+-- reconciling pass, which also picks up teammates' pulled changes with no
+-- agent judgment in the loop.
+rule IngestCodeIfChanged {
+    when: IngestCodeIfChanged(agent, root, scope)
+    requires: not gate_satisfied(current_code_ref(root), latest_code_episode_ref())
+    ensures: IngestCode(agent: agent, root: root, scope: scope)
+}
+
+-- LLM extraction of durable knowledge from a session transcript (plain
+-- text or harness session JSONL, flattened to role-text turns). Extracted
+-- candidates are clamped — confidence capped at session_cap, source type
+-- forced to session_log — screened by admission, and ingested under a
+-- session_log episode. The raw transcript is kept as evidence when the
+-- evidence tier is configured. Incomplete triples are reported as
+-- rejected; inadmissible ones ride the report with their signals.
+rule ExtractSession {
+    when: ExtractSession(agent, transcript, ref)
+    ensures:
+        let candidates = clamped(extract("session", transcript), config.session_cap, config.session_default)
+        let ev = EvidenceArtifact.created(hash: sha256(transcript), content: transcript)
+        let ep = Episode.created(source: session_log, ref: ref, opened_at: now, status: open,
+                                 evidence: ev)
+        for c in admitted(candidates):
+            AssertFact(agent: agent, subject: c.subject, predicate: c.predicate,
+                       object: c.object, confidence: c.confidence,
+                       source_type: "session-log", episode: ep)
+}
+
+-- The ambient tier: consume the harness's own auto-memory notes — already
+-- LLM-distilled by the model that watched the session — as an extraction
+-- substrate. Delta-detected per file (hash of the managed-section-stripped
+-- content, matched against agent_note episode refs), so only changed notes
+-- reach the extractor and a compile-context rewrite alone never
+-- re-triggers ingestion. One episode per (file, revision), closed with a
+-- mechanical summary, so provenance answers "which note file, at which
+-- state, said this".
+--
+-- Epistemic treatment: notes flatten who-said-what, so everything ingests
+-- as agent inference — source agent_note, capped at notes_cap, and NEVER a
+-- commitment: a "commitment" the extractor emits despite the prompt is
+-- demoted to observation (and counted), so a commitment-defaulting
+-- predicate can never mint one from a note; stated preferences stay
+-- preferences. Genuine decisions arrive via the direct assert path.
+--
+-- NO reconciliation: the harness compacts notes under space pressure, and
+-- absence-by-compaction is not falsity — facts that stop being restated
+-- simply stop being reinforced and fade by disuse decay.
+rule IngestNotes {
+    when: IngestNotes(agent, harness, notes)
+    ensures:
+        for note in changed_notes(notes):
+            let content = stripped_of_managed_section(note.content)
+            let candidates = demoted_to_inference(clamped(extract("notes", content), config.notes_cap, config.notes_default))
+            let ev = EvidenceArtifact.created(hash: sha256(content), content: content)
+            let ep = Episode.created(source: agent_note,
+                                     ref: note_ref(harness, note),
+                                     opened_at: now, status: open,
+                                     evidence: ev)
+            for c in admitted(candidates):
+                AssertFact(agent: agent, subject: c.subject, predicate: c.predicate,
+                           object: c.object, confidence: c.confidence,
+                           source_type: "agent-note", episode: ep)
+            ep.status = closed
+            ep.summary = "notes ingest: facts, demotions, rejections (mechanical digest)"
+            ep.closed_at = now
+
+    @guidance
+        -- A note file that is blank once stripped (e.g. a MEMORY.md holding
+        -- only the compiled view) is skipped before hashing: nothing to
+        -- extract, and the compile -> ingest -> compile fixed point must
+        -- not depend on the extractor's judgment.
+}
+
+-- Failure lessons: when work is rejected or reverted, extract WHY — the
+-- LESSON, not the diff (heuristics transfer; raw traces cause negative
+-- transfer), preferring lessons about MUTATING actions, where deviations
+-- kill outcomes. Lessons land as failure-mode facts (subject = the
+-- tool/namespace/action, object = the lesson literal), corrective
+-- practices as prefers, explicit human rulings as decided-against. Same
+-- clamps and admission as the session tier; the episode is typed
+-- failure_report — the valence signal outcome tracking consumes.
+rule ExtractFailure {
+    when: ExtractFailure(agent, material, context, ref)
+    ensures:
+        let candidates = clamped(extract("failure", material), config.session_cap, config.session_default)
+        let ev = EvidenceArtifact.created(hash: sha256(material), content: material)
+        let ep = Episode.created(source: failure_report, ref: ref, opened_at: now, status: open,
+                                 evidence: ev)
+        for c in admitted(candidates):
+            AssertFact(agent: agent, subject: c.subject, predicate: c.predicate,
+                       object: c.object, confidence: c.confidence,
+                       source_type: "session-log", episode: ep)
+}
+
+-- Decision records: the highest-authority source, parsed MECHANICALLY —
+-- structured enough to parse, and the one source that warrants
+-- decision_record confidence. Per record: its status as has-status
+-- (superseding on conflict — the record is the source of truth for its
+-- own status, and status history accumulates bi-temporally), supersedes /
+-- superseded-by entity edges, and every considered-but-unchosen or
+-- explicitly rejected option as a decided-against COMMITMENT. Re-runs
+-- reinforce; nothing here is ever reconciled away — decision records
+-- outlive code state by design.
+rule IngestDecisionRecords {
+    when: IngestDecisionRecords(agent, files)
+    ensures:
+        let ep = Episode.created(source: decision_record, ref: "adr", opened_at: now, status: open)
+        for adr in parsed(files):
+            if adr.status != null:
+                AssertFact(agent: agent, subject: adr.id, predicate: "core/has-status",
+                           object: adr.status, source_type: "decision-record",
+                           confidence: 1.0, on_conflict: "supersede", episode: ep)
+            for other in adr.supersedes:
+                AssertFact(agent: agent, subject: adr.id, predicate: "core/supersedes",
+                           object: other, source_type: "decision-record",
+                           confidence: 1.0, episode: ep)
+            for other in adr.superseded_by:
+                AssertFact(agent: agent, subject: adr.id, predicate: "core/superseded-by",
+                           object: other, source_type: "decision-record",
+                           confidence: 1.0, episode: ep)
+            for r in adr.rejected:
+                AssertFact(agent: agent, subject: adr.id, predicate: "core/decided-against",
+                           object: r, epistemic: "commitment",
+                           source_type: "decision-record", confidence: 1.0, episode: ep)
+        ep.status = closed
+        ep.summary = "ADR pass: records and facts (mechanical digest)"
+        ep.closed_at = now
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant EvidenceIsContentAddressed {
+    for a in EvidenceArtifacts:
+        a.hash = sha256(a.content)
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface Ingestion {
+    facing agent: Agent
+
+    provides:
+        IngestBatch(agent, source, ref, lines, evidence_content?)
+        IngestCode(agent, root, scope, language?)
+        IngestCodeIfChanged(agent, root, scope)
+        ExtractSession(agent, transcript, ref)
+        IngestNotes(agent, harness, notes)
+        ExtractFailure(agent, material, context, ref)
+        IngestDecisionRecords(agent, files)
+
+    @guarantee EveryTierSameMachinery
+        -- No tier bypasses the conflict machinery: every derived fact is
+        -- one AssertFact, so supersession, flags, trust defenses and
+        -- reinforcement behave identically regardless of origin.
+
+    @guarantee DegradedNeverWrong
+        -- Missing tooling (no LLM authenticated, an analyzer's binary
+        -- absent) degrades a tier to a skip with a hint. A partial code
+        -- pass never invalidates facts belonging to files it did not
+        -- analyze, and a degraded pass leaves the delta gate unsatisfied
+        -- so the next run retries.
+
+    @guarantee DryRunEverywhere
+        -- Every extraction tier can report what it WOULD ingest —
+        -- admitted, inadmissible with signals, rejected, demoted — while
+        -- writing nothing.
+
+    @guarantee RawInputRecoverable
+        -- When the evidence tier is configured, the exact bytes each
+        -- extraction consumed are retrievable through the episode's
+        -- pointer; nothing an extractor drops is unrecoverable.
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "Failure-tier FACTS carry source type session_log (only their episode is failure_report), because the tier reuses the session clamp. The trust table ranks failure_report, but no fact path ever produces a failure_report-typed fact — and the ceiling table has no failure_report entry at all (such a fact would fall back to the 0.9 default ceiling, ABOVE its 0.7 cap). Should failure facts be source-typed failure_report with an explicit 0.7 ceiling?"
+open question "The session and failure tiers leave their episodes OPEN for consolidation to summarize and close, while code, notes and ADR passes close their own with mechanical summaries. Intended split, or should the extraction tiers close mechanically too so an un-consolidated store has no dangling episodes?"

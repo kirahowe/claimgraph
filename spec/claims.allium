@@ -1,0 +1,588 @@
+-- allium: 3
+-- claims.allium
+--
+-- Scope: The fact store at the heart of claimgraph — every fact a reified
+-- edge carrying valid time, transaction time, confidence, epistemic class,
+-- source type, scope, and provenance. This spec owns the write path (the
+-- assert decision: reinforce / insert / supersede / flag, with the trust
+-- defenses), disuse decay as a read-time view, manual invalidation, and the
+-- predicate registry lifecycle (curated core vocabulary, x/* staging,
+-- promotion, deprecation).
+--
+-- Includes: Fact, Predicate; the assert decision tree; exclusion groups;
+--   reinforcement; effective (decayed) confidence; invalidation; the
+--   open-conflicts view; predicate coinage, promotion and deprecation.
+-- Excludes:
+--   - Entity identity, resolution and curation (entities.allium; this spec
+--     consumes already-resolved GraphEntity references)
+--   - Episodes, evidence, and the ingestion tiers that feed AssertFact
+--     (ingestion.allium)
+--   - The LLM judge, sweep, consolidation, compiled context, and outcome
+--     reinforcement (maintenance.allium)
+--   - Multi-writer oplogs, the write lease, reconcile, dump/load
+--     (replication.allium)
+--   - The storage engine, CLI/JSON wire shapes, and the MCP front-end
+--     (implementation; every front-end drives this same behaviour)
+--
+-- Conventions carried across the whole system:
+--   - Nothing is ever hard-deleted: a contradiction closes a validity
+--     interval; the predecessor stays queryable in history.
+--   - Bi-temporal, modeled not engine-native: valid time is settable on
+--     BOTH ends of every write ("true Jan through March" is one fact);
+--     recorded_at (transaction time) is append-only. Correction history of
+--     beliefs about the past (XTDB-style) is deliberately out of scope.
+--   - Objects are entities or literals (RDF-style): traversal only follows
+--     entity objects; preferences live as literal facts without minting
+--     junk nodes.
+--   - Inverse directions are computed at query time, never stored as twin
+--     facts — nothing to keep consistent on invalidation.
+--   - The default scope is "project"; scope "external" marks facts about
+--     things outside the repo (unresolvable imports, other systems).
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- Whoever drives a front-end: the human at the CLI, the coding agent via
+-- the skill, or an ingestion tier acting on their behalf.
+external entity Agent {
+    name: String
+}
+
+-- A node in the graph. Governed by entities.allium: resolution (exact >
+-- alias > unique normalized, type-guarded, self-healing), ambiguity
+-- refusal, and the curation verbs live there. AssertFact receives subjects
+-- and entity objects already resolved-or-created.
+external entity GraphEntity {
+    name: String
+    scope: String
+
+    assertions: Fact with subject = this
+    current_assertions: assertions where is_currently_valid
+}
+
+-- Provenance bundle for a batch of writes. Governed by ingestion.allium.
+external entity Episode {
+    ref: String
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- What kind of thing a fact's object is. Entity objects are traversable
+-- graph edges; literal objects are free text (preferences, versions,
+-- lessons) that never mint a node.
+enum ObjectKind { entity | literal }
+
+-- What a predicate's registry row permits as object kind. Predicates
+-- declaring `either` decide per fact: an explicit caller choice wins, else
+-- entity when a matching entity already exists, else literal.
+enum ObjectKindRule { entity_only | literal_only | either }
+
+-- The epistemic class drives conflict policy: observations and preferences
+-- supersede cleanly; a commitment on either side of a conflict flags — a
+-- human decision is never silently overwritten by new evidence.
+enum EpistemicClass { observation | commitment | preference }
+
+-- Where a fact came from. Ranked by trust and capped by ceiling (see the
+-- black box functions): human decisions and mechanical code derivation at
+-- the top, LLM extraction in the middle, agent inference at the bottom.
+enum SourceType { decision_record | user_assertion | code | session_log | failure_report | agent_note | inferred }
+
+-- Caller override of the epistemic-class-derived conflict policy.
+enum ConflictOverride { supersede | flag | ignore }
+
+-- Predicate lifecycle: core/* rows are born stable (curated seed); x/*
+-- coinages are born testing and either earn promotion (a NEW stable core
+-- row is minted; the staging row deprecates with a forwarding pointer) or
+-- rot in staging.
+enum PredicateStatus { testing | stable | deprecated }
+
+enum PredicateCategory { structural | procedural | decision | provenance | experimental }
+
+-- one_value: a new value for (subject, predicate) contradicts the current
+-- one. many_values: values accumulate (e.g. depends-on).
+enum Cardinality { one_value | many_values }
+
+-- Exclusion groups widen conflict detection across predicates: rows in the
+-- same group declare mutually-exclusive stances toward the same object.
+-- prefers / decided-against share stance; supersedes / superseded-by share
+-- revision. Groups are deliberately conservative — a false conflict nags
+-- the human, so only clearly-opposed pairs are declared; everything
+-- fuzzier goes to the judge sweep (maintenance.allium).
+enum ExclusionGroup { stance | revision }
+
+-- Marks a predicate whose multiple values on one subject tend to be
+-- alternatives rather than accumulation (prefers) — the judge sweep's
+-- first candidate generator.
+enum ValueExclusivity { exclusive | accumulating }
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- A registry row: every predicate is a first-class queryable row in the
+-- same store, with a maps_to anchor to an established standard (PROV-O /
+-- SPDX / DOAP / Dublin Core). ~22 curated core/* rows are seeded; unknown
+-- predicates are refused with a did-you-mean suggestion — the cheap
+-- defense against LLM-driven predicate proliferation.
+entity Predicate {
+    name: String                     -- namespaced: "core/depends-on", "x/uses-pattern"
+    label: String
+    definition: String
+    category: PredicateCategory
+    object_kinds: ObjectKindRule
+    cardinality: Cardinality
+    default_epistemic: EpistemicClass?
+    value_exclusivity: ValueExclusivity?
+    exclusion_group: ExclusionGroup?
+    inverse_of: Predicate?           -- documentation of the pair; inverses are
+                                     -- computed at query time, never stored
+    maps_to: String?                 -- anchor to the established standard
+    status: PredicateStatus
+    replaced_by: Predicate when status = deprecated
+
+    transitions status {
+        testing -> deprecated
+        terminal: stable, deprecated
+    }
+}
+
+-- The reified edge. Immutable in meaning once recorded: later writes may
+-- close its validity interval, reset its reinforcement clock, raise its
+-- ceiling-capped base confidence, or link conflicts — never rewrite what
+-- it claimed.
+entity Fact {
+    subject: GraphEntity
+    predicate: Predicate
+    object_kind: ObjectKind
+    object_entity: GraphEntity?      -- exactly one of these two is set,
+    object_literal: String?          -- per object_kind (see ObjectMatchesKind)
+
+    t_valid: Timestamp               -- valid time: when it became true
+    t_invalid: Timestamp?            -- valid time: when it stopped; open when null
+    recorded_at: Timestamp           -- transaction time: append-only
+    last_reinforced_at: Timestamp    -- the disuse clock's anchor
+
+    confidence: Decimal              -- the stored BASE; reads decay it (below)
+    epistemic: EpistemicClass
+    scope: String
+    source_type: SourceType
+    episode: Episode?                -- provenance: which ingestion produced it
+
+    conflicts_with: Set<Fact>        -- links live on the NEWER fact of each pair
+    superseded_by: Fact?             -- set when a successor closed this interval,
+                                     -- so "what replaced it" survives invalidation
+    invalidation_reason: String?
+
+    is_currently_valid: t_valid <= now and (t_invalid = null or t_invalid > now)
+
+    -- Disuse decay is a VIEW, never stored and never a job: the base halves
+    -- per half-life since last reinforcement, floored at
+    -- config.confidence_floor. Commitments and decision-record facts never
+    -- fade. as-of reads evaluate this at the queried instant, so time
+    -- travel sees period-appropriate decay.
+    effective_confidence: if epistemic = commitment or source_type = decision_record: confidence else: decayed(confidence, last_reinforced_at, now)
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    default_confidence: Decimal = 0.8    -- when the caller supplies none
+    half_life: Duration = 90.days        -- disuse decay half-life
+    confidence_floor: Decimal = 0.05     -- decay never goes below this
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- Black box functions (pure, deterministic):
+--
+--   decayed(base, anchor, at)      base * 0.5 ^ (days between anchor and at
+--                                  / config.half_life), floored at
+--                                  config.confidence_floor
+--   trusted(source_type)           true for the top trust tier —
+--                                  decision_record, user_assertion, code
+--                                  (an absent source_type defaults to
+--                                  user_assertion). The full ranking:
+--                                  3: decision_record, user_assertion, code
+--                                  2: session_log, failure_report
+--                                  1: agent_note, inferred
+--   outranks(a, b)                 source a sits strictly above source b in
+--                                  that ranking (an absent b defaults to
+--                                  user_assertion). Drives the defense: a
+--                                  weaker source never silently supersedes
+--                                  a stronger one.
+--   reinforced(base, incoming, source_type)
+--                                  the new base after a re-assertion:
+--                                  max(base, min(ceiling(source_type),
+--                                  incoming)) — never lowered by weaker
+--                                  evidence, raised only up to the
+--                                  EXISTING fact's source ceiling, and a
+--                                  base already above its ceiling is
+--                                  preserved, not clawed back. Ceilings:
+--                                  decision_record 1.0, code 0.95,
+--                                  user_assertion 0.9, session_log 0.7,
+--                                  agent_note 0.65, inferred 0.6 — a fact
+--                                  re-derived 500 times stays
+--                                  distinguishable from a human decision.
+--   resolved_class(explicit, pred) caller's class > the predicate's
+--                                  default_epistemic > observation
+--   resolved_kind(explicit, pred, object)
+--                                  the object kind per the registry row:
+--                                  entity_only / literal_only are forced
+--                                  (an explicit mismatch is refused);
+--                                  either takes the explicit choice, else
+--                                  entity when a GraphEntity of that name
+--                                  exists, else literal
+--   filter(facts, p)               facts satisfying p
+--   find_duplicate(facts, kind, object)
+--                                  the fact among these whose object is
+--                                  the same one (entity identity for
+--                                  entity objects, string equality for
+--                                  literals), or null
+--   different_valued(facts, kind, object)
+--                                  the complement: facts whose object is a
+--                                  DIFFERENT one — the rivals a one_value
+--                                  predicate contradicts
+--   loosely_same_object(fact, object)
+--                                  the same object across the entity /
+--                                  literal divide: normalized
+--                                  name-or-literal equality, so
+--                                  decided-against "GraphQL" collides with
+--                                  prefers GraphQL. Over-matching is safe —
+--                                  it produces a flag the judge can rule
+--                                  compatible.
+--   is_experimental(name)          the name is in the x/* staging namespace
+--   revenant_of(subject, pred, object)
+--                                  this (subject, predicate) already lived
+--                                  through this object value and closed
+--                                  its interval — the value is a revenant
+
+-- THE write path. Every fact from every tier — direct assert, batch
+-- ingest, code analysis, session extraction, notes, failures, ADRs
+-- (reconcile has its own replay path) — arrives here and gets the same
+-- treatment.
+--
+-- The decision, in order:
+--   1. An exact duplicate of a currently-valid fact REINFORCES it: the
+--      world (or the user) just confirmed the fact, so its disuse clock
+--      resets and its base may rise toward the source ceiling — never
+--      above it, never down, and never by repetition alone.
+--   2. A conflicting set is gathered: for one_value predicates, the other
+--      currently-valid values of (subject, predicate); plus, for any
+--      predicate in an exclusion group, currently-valid facts on the
+--      subject's group-mate predicates aimed at loosely the same object.
+--      If non-empty, the policy decides (see the branches below).
+--   3. With no conflict, a low-trust source re-asserting a value this
+--      (subject, predicate) already lived through and invalidated — a
+--      revenant, either stale or adversarial — flags against the live
+--      rivals instead of quietly coexisting.
+--   4. Otherwise the fact inserts cleanly.
+--
+-- An unknown x/* predicate auto-registers on first use (status testing);
+-- an unknown core/* or un-namespaced predicate is refused with a
+-- did-you-mean suggestion. A deprecated predicate is refused with its
+-- replaced_by forwarding address.
+rule AssertFact {
+    when: AssertFact(agent, subject, predicate, object, object_kind?,
+                     epistemic?, confidence?, scope?, source_type?, episode?,
+                     on_conflict?, valid_from?, valid_until?)
+
+    let pred = Predicate{name: predicate}
+
+    requires: exists pred or is_experimental(predicate)
+    requires: not exists pred or pred.status != deprecated
+    -- A closed valid-time interval must run forward; an inverted one is
+    -- refused, never silently fixed.
+    requires: valid_until = null or valid_until > (valid_from ?? now)
+
+    let effective_at = valid_from ?? now
+    let overridden = on_conflict != null
+
+    ensures:
+        if not exists pred:
+            -- First use of an x/* coinage: auto-registered at testing
+            -- status, object kinds open, values accumulating — so a fresh
+            -- coinage cannot conflict, and its fact inserts cleanly.
+            let coined = Predicate.created(
+                name: predicate,
+                label: predicate,
+                definition: "auto-registered on first use; promote to core/* once proven",
+                category: experimental,
+                object_kinds: either,
+                cardinality: many_values,
+                status: testing
+            )
+            Fact.created(
+                subject: subject, predicate: coined,
+                object_kind: resolved_kind(object_kind, coined, object),
+                t_valid: effective_at, t_invalid: valid_until,
+                recorded_at: now, last_reinforced_at: now,
+                confidence: confidence ?? config.default_confidence,
+                epistemic: resolved_class(epistemic, coined),
+                scope: scope ?? "project",
+                source_type: source_type ?? user_assertion,
+                episode: episode, conflicts_with: {}
+            )
+        else:
+            let klass = resolved_class(epistemic, pred)
+            let kind = resolved_kind(object_kind, pred, object)
+            let existing = filter(subject.current_assertions, f => f.predicate = pred)
+            let duplicate = find_duplicate(existing, kind, object)
+            let antagonists = filter(subject.current_assertions,
+                                     f => f.predicate != pred
+                                          and f.predicate.exclusion_group != null
+                                          and f.predicate.exclusion_group = pred.exclusion_group
+                                          and loosely_same_object(f, object))
+            let rivals = if pred.cardinality = one_value: different_valued(existing, kind, object) else: {}
+            let conflicting = rivals + antagonists
+
+            if duplicate != null:
+                -- Reinforcement: clock reset is the mechanism; base is a
+                -- ceiling-capped high-water mark.
+                duplicate.last_reinforced_at = now
+                duplicate.confidence = reinforced(duplicate.confidence, confidence, duplicate.source_type)
+                FactReinforced(fact: duplicate)
+            else if conflicting.count > 0 and overridden and on_conflict = ignore:
+                -- Caller opted out of the machinery entirely: plain
+                -- insert, values coexist unlinked.
+                Fact.created(
+                    subject: subject, predicate: pred, object_kind: kind,
+                    t_valid: effective_at, t_invalid: valid_until,
+                    recorded_at: now, last_reinforced_at: now,
+                    confidence: confidence ?? config.default_confidence,
+                    epistemic: klass, scope: scope ?? "project",
+                    source_type: source_type ?? user_assertion,
+                    episode: episode, conflicts_with: {}
+                )
+            else if conflicting.count > 0:
+                let wants_flag = (overridden and on_conflict = flag)
+                                 or (not overridden
+                                     and (klass = commitment
+                                          or conflicting.any(f => f.epistemic = commitment)))
+                let backdated = conflicting.any(f => f.t_valid > effective_at)
+                let outranked = conflicting.any(f => outranks(f.source_type, source_type))
+                if wants_flag or backdated or outranked:
+                    -- Flag: both sides stay valid, the conflict is linked
+                    -- (on the newer fact) and surfaces for review. Three
+                    -- roads in:
+                    --   * a commitment on either side (or the caller
+                    --     asked) — human decisions are never silently
+                    --     overwritten;
+                    --   * backdated overlap — a successor starting
+                    --     strictly BEFORE a predecessor is a valid-time
+                    --     contradiction, not a handoff; it is never
+                    --     silently inverted, even under an explicit
+                    --     supersede override;
+                    --   * outranked — a lower-trust source never silently
+                    --     closes a higher-trust fact's interval.
+                    let flagged = Fact.created(
+                        subject: subject, predicate: pred, object_kind: kind,
+                        t_valid: effective_at, t_invalid: valid_until,
+                        recorded_at: now, last_reinforced_at: now,
+                        confidence: confidence ?? config.default_confidence,
+                        epistemic: klass, scope: scope ?? "project",
+                        source_type: source_type ?? user_assertion,
+                        episode: episode, conflicts_with: conflicting
+                    )
+                    if wants_flag:
+                        ConflictFlagged(fact: flagged, reason: "policy")
+                    else if backdated:
+                        ConflictFlagged(fact: flagged, reason: "backdated-overlap")
+                    else:
+                        ConflictFlagged(fact: flagged, reason: "outranked")
+                else:
+                    -- Clean succession: each predecessor's interval closes
+                    -- at the successor's valid-from, so the new truth
+                    -- begins exactly where the old one ends and an as-of
+                    -- query between two versions returns exactly one.
+                    -- Equal starts leave the predecessor an empty
+                    -- interval — immediately replaced, never observably
+                    -- valid. Non-lossy: the predecessor stays in history.
+                    let successor = Fact.created(
+                        subject: subject, predicate: pred, object_kind: kind,
+                        t_valid: effective_at, t_invalid: valid_until,
+                        recorded_at: now, last_reinforced_at: now,
+                        confidence: confidence ?? config.default_confidence,
+                        epistemic: klass, scope: scope ?? "project",
+                        source_type: source_type ?? user_assertion,
+                        episode: episode, conflicts_with: {}
+                    )
+                    for f in conflicting:
+                        f.t_invalid = effective_at
+                        f.superseded_by = successor
+                        f.invalidation_reason = "superseded"
+            else if not trusted(source_type)
+                    and revenant_of(subject, pred, object)
+                    and existing.count > 0
+                    and (not overridden or (on_conflict != ignore and on_conflict != supersede)):
+                -- The revenant defense: a non-trusted source re-asserting
+                -- a dead value is either stale or adversarial — it flags
+                -- against the currently-live rivals instead of quietly
+                -- coexisting. Overridable, like everything here, with an
+                -- explicit on_conflict.
+                let revenant = Fact.created(
+                    subject: subject, predicate: pred, object_kind: kind,
+                    t_valid: effective_at, t_invalid: valid_until,
+                    recorded_at: now, last_reinforced_at: now,
+                    confidence: confidence ?? config.default_confidence,
+                    epistemic: klass, scope: scope ?? "project",
+                    source_type: source_type ?? user_assertion,
+                    episode: episode, conflicts_with: existing
+                )
+                ConflictFlagged(fact: revenant, reason: "revenant")
+            else:
+                Fact.created(
+                    subject: subject, predicate: pred, object_kind: kind,
+                    t_valid: effective_at, t_invalid: valid_until,
+                    recorded_at: now, last_reinforced_at: now,
+                    confidence: confidence ?? config.default_confidence,
+                    epistemic: klass, scope: scope ?? "project",
+                    source_type: source_type ?? user_assertion,
+                    episode: episode, conflicts_with: {}
+                )
+}
+
+-- Close a fact's validity interval by hand. The timestamp is the
+-- VALID-time end — when it stopped being true, not merely when we noticed.
+rule InvalidateFact {
+    when: InvalidateFact(agent, fact, reason?, at?)
+    requires: (at ?? now) >= fact.t_valid
+    ensures:
+        fact.t_invalid = at ?? now
+        fact.invalidation_reason = reason ?? "manually invalidated"
+}
+
+-- Explicit coinage (the CLI's predicates register): only x/* may be coined
+-- at runtime; core/* is curated in the seed vocabulary.
+rule RegisterPredicate {
+    when: RegisterPredicate(agent, name, definition?, object_kinds?, cardinality?, default_epistemic?)
+    requires: is_experimental(name)
+    ensures: Predicate.created(
+        name: name,
+        label: name,
+        definition: definition ?? "auto-registered on first use; promote to core/* once proven",
+        category: experimental,
+        object_kinds: object_kinds ?? either,
+        cardinality: cardinality ?? many_values,
+        default_epistemic: default_epistemic,
+        status: testing
+    )
+}
+
+-- Graduate a staging predicate: mint the stable core/* twin (fields
+-- carried from the staging row, overridable), rewrite every fact onto it —
+-- a rename of the TERM, not a belief change: validity and transaction time
+-- are untouched — and deprecate the staging term with a forwarding
+-- pointer, so further writes to it fail with the replacement's address.
+-- Promotion mints a NEW core term; merging into an existing one is a
+-- curation decision, not a promotion.
+rule PromotePredicate {
+    when: PromotePredicate(agent, staging, core_name)
+    requires: staging.status = testing
+    requires: not exists Predicate{name: core_name}
+    ensures:
+        let core = Predicate.created(
+            name: core_name,
+            label: staging.label,
+            definition: staging.definition,
+            category: staging.category,
+            object_kinds: staging.object_kinds,
+            cardinality: staging.cardinality,
+            status: stable
+        )
+        for f in Facts:
+            if f.predicate = staging:
+                f.predicate = core
+        staging.status = deprecated
+        staging.replaced_by = core
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- Closed intervals never run backwards. Equality is permitted: an
+-- equal-start supersession leaves the predecessor an empty interval
+-- (immediately replaced, never observably valid) by design.
+invariant IntervalRunsForward {
+    for f in Facts:
+        f.t_invalid != null implies f.t_invalid >= f.t_valid
+}
+
+invariant ObjectMatchesKind {
+    for f in Facts:
+        (f.object_kind = entity implies f.object_entity != null)
+        and (f.object_kind = literal implies f.object_literal != null)
+}
+
+-- Conflict links live on the newer fact of each pair, so the open-conflicts
+-- view can always present newer-vs-established.
+invariant ConflictLinksPointBackward {
+    for f in Facts:
+        f.conflicts_with.all(c => c.recorded_at <= f.recorded_at)
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- The one behavioural surface every front-end shares: the CLI verbs, the
+-- project skill, and the MCP tools (memory_assert and friends) all drive
+-- exactly this contract. MCP is a latency optimization, not a second
+-- behaviour.
+surface ClaimStore {
+    facing agent: Agent
+
+    provides:
+        AssertFact(agent, subject, predicate, object, object_kind?,
+                   epistemic?, confidence?, scope?, source_type?, episode?,
+                   on_conflict?, valid_from?, valid_until?)
+        InvalidateFact(agent, fact, reason?, at?)
+        RegisterPredicate(agent, name, definition?, object_kinds?, cardinality?, default_epistemic?)
+        PromotePredicate(agent, staging, core_name)
+
+    @guarantee NothingHardDeleted
+        -- No operation removes a fact. Contradiction and reconciliation
+        -- close validity intervals; history — including invalidation
+        -- reasons and successors — remains queryable forever.
+
+    @guarantee TimeTravel
+        -- Reads accept an as-of instant and answer from facts valid at
+        -- that instant, with decay evaluated at that instant. Between a
+        -- supersession's two versions, exactly one fact is valid.
+
+    @guarantee HistoryIsComplete
+        -- The history of (subject, predicate) returns every version, valid
+        -- and invalidated, time-ordered — the single best demonstration of
+        -- why this beats a markdown pile.
+
+    @guarantee DecayIsAView
+        -- Effective confidence is computed at read time from the stored
+        -- base and the reinforcement anchor; no batch job ever rewrites
+        -- confidence. Minimum-confidence filters and search ranking use
+        -- the effective value; invalidated facts never surface in
+        -- current-truth reads.
+
+    @guarantee UnknownPredicatesRefusedHelpfully
+        -- An unknown non-x/* predicate is refused with the closest
+        -- registered names attached (did-you-mean); a deprecated one is
+        -- refused with its replaced_by forwarding address.
+
+    @guarantee ConflictsSurfaceForHumans
+        -- Open conflicts (flagged fact vs still-valid candidate) are
+        -- always listable; flagged facts are excluded from the compiled
+        -- current-truth view (maintenance.allium) until resolved.
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "Confidence is never range-validated on the direct assert path — the extraction tiers clamp to their caps, but a CLI assert or batch ingest line can store confidence above 1.0 (or a session_log-typed fact above the 0.7 tier cap). Should build-time validation clamp to [0,1] and per-source ceilings, or is trusting the caller intended?"
+open question "Reinforcement caps the base at the EXISTING fact's source ceiling, so a human re-assertion of a code-derived fact can never raise it above 0.95 nor upgrade its source type. Intended asymmetry, or should stronger evidence be able to re-source a fact?"

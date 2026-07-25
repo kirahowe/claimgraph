@@ -1,0 +1,421 @@
+-- allium: 3
+-- maintenance.allium
+--
+-- Scope: What keeps the graph healthy and useful without a human in the
+-- loop — the LLM conflict judge and the deferred sweep, the offline
+-- consolidation pass, the deterministic compiled-context write-back, the
+-- ambient session-end loop that strings the stages together, the gated
+-- per-prompt coach, and outcome-driven reinforcement.
+--
+-- Includes: verdicts and resolution plans; sweep candidate generation;
+--   episode summarization with mechanical fallback; alias enrichment;
+--   promotion review; the compiled view (priority order, budget, echo
+--   guard); the SessionEnd stage chain; the coach gate; the retrieval log
+--   and outcome marks.
+-- Excludes:
+--   - The write path the resolutions execute against (claims.allium)
+--   - The ingestion tiers the loop invokes (ingestion.allium)
+--   - Hook WIRING into harness settings files (installer mechanics; the
+--     behaviour specified here is what runs once wired)
+--   - Retrieval internals (hybrid rank fusion, the guided walk, recall's
+--     tier escalation) — read-side algorithms; their spec-level
+--     obligations appear as guarantees on the surfaces here and in
+--     claims.allium
+--
+-- Conventions:
+--   - The LLM is pluggable everywhere and every LLM stage has a
+--     deterministic fallback or a skip: the ambient loop must always leave
+--     the freshest view the graph can produce.
+--   - LLM verdicts and summaries are modelled as delivered stimuli
+--     (VerdictDelivered, ...): the machine decision that ACTS on a verdict
+--     is specified exactly; the verdict itself is an external input.
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+external entity Agent {
+    name: String
+}
+
+-- The LLM on the other side of every judged decision: pluggable (any
+-- command; defaults to an already-authenticated agent CLI), consulted off
+-- the write path only.
+external entity Judge {
+    command: String
+}
+
+-- The coding harness whose session lifecycle drives the ambient loop.
+external entity Harness {
+    name: String
+}
+
+-- Governed by claims.allium. The fields declared here are the ones
+-- maintenance touches: interval closure on judged resolutions, the
+-- reinforcement clock on accepted outcomes, conflict links.
+external entity Fact {
+    confidence: Decimal
+    t_invalid: Timestamp?
+    invalidation_reason: String?
+    last_reinforced_at: Timestamp
+    conflicts_with: Set<Fact>
+}
+
+-- Governed by ingestion.allium; consolidation closes the open ones.
+external entity Episode {
+    ref: String
+    status: open | closed
+    summary: String?
+    closed_at: Timestamp?
+}
+
+external entity GraphEntity {
+    name: String
+    aliases: Set<String>
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- What a flag actually means, judged: mechanical detection flags;
+-- semantics classify.
+enum Verdict { contradicts | duplicate | supersedes | compatible | unparseable }
+
+-- Why the sweep proposed a pair the write path could not see.
+enum SweepReason { exclusive_values | cross_predicate }
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    judge_min_confidence: Decimal = 0.8   -- gate for ACTING on a verdict
+    consolidate_every: Duration = 7.days
+    context_budget_bytes: Integer = 25000 -- the harness's injection window
+    max_context_facts: Integer = 50
+    supersession_window: Duration = 30.days
+    max_enrichment_entities: Integer = 20
+    max_aliases_per_entity: Integer = 3
+    promotion_min_usage: Integer = 3
+    coach_max_per_section: Integer = 3
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- Black box functions (pure, deterministic):
+--
+--   open_conflict_pairs()          flagged fact + linked candidate, both
+--                                  currently valid: newer side vs
+--                                  established side
+--   sweep_candidates()             the judgeable pairs the write path
+--                                  can't see, generated per subject over
+--                                  its currently-valid facts (bounded per
+--                                  subject, never O(graph²)), skipping
+--                                  already-linked pairs:
+--                                    exclusive_values — multiple values of
+--                                      a value-exclusive predicate (two
+--                                      prefers on one subject tend to be
+--                                      alternatives, not accumulation)
+--                                    cross_predicate — same subject,
+--                                      loosely the same object, different
+--                                      predicates, at least one side a
+--                                      decision-category predicate
+--                                      (depends-on X while decided-against
+--                                      X stands)
+--   open_fact_bearing_episodes()   open episodes that contain facts; the
+--                                  open-but-EMPTY ones are excluded — they
+--                                  may belong to a session still in flight
+--   summary_or_mechanical_digest(episode)
+--                                  the judge's 1-3 sentence summary when
+--                                  one arrived, else the no-LLM digest
+--                                  (source, ref, fact count, predicate
+--                                  frequencies) — the pass always makes
+--                                  progress
+--   enrichment_candidates()        alias-less, fact-bearing entities,
+--                                  most-used first, at most
+--                                  max_enrichment_entities per pass
+--   promotion_candidates()         testing-status predicates used at least
+--                                  promotion_min_usage times — worth
+--                                  promoting to core/* (or pruning)
+--   compiled_view(budget)          the deterministic managed-section
+--                                  content (see CompileContext)
+--   due_for_consolidation(at)      the consolidation stamp is absent or
+--                                  older than consolidate_every
+--   retrieved_since_last_mark(agent)
+--                                  the facts the read verbs surfaced since
+--                                  the previous outcome mark (the local
+--                                  retrieval log; losing it costs nothing
+--                                  but reinforcement opportunities)
+--   authoritative_hits(query)      what clears the coach gate for a task:
+--                                  standing commitments touching it, known
+--                                  failure-mode facts, open conflicts on
+--                                  the entities in play
+
+-- Ask the judge about every open conflict. Enrich-only by default: the
+-- verdicts and plans are reported, nothing is acted on unless resolve was
+-- requested.
+rule JudgeConflicts {
+    when: JudgeConflicts(agent, resolve, min_confidence?)
+    ensures:
+        for pair in open_conflict_pairs():
+            VerdictRequested(newer: pair.fact, established: pair.candidate,
+                             resolve: resolve,
+                             min_confidence: min_confidence ?? config.judge_min_confidence)
+}
+
+-- Act on one delivered verdict. A contradicts verdict is NEVER
+-- auto-resolved — surfacing genuine contradictions to the human is the
+-- point of the flag machinery. Everything else acts only when resolve was
+-- requested AND the verdict clears the confidence gate; otherwise the
+-- pair stays open and the verdict merely enriches the report.
+rule ApplyVerdict {
+    when: VerdictDelivered(judge, newer, established, verdict, confidence, resolve, min_confidence)
+    ensures:
+        if verdict = contradicts:
+            HumanReviewRequired(newer: newer, established: established)
+        else if resolve and confidence >= min_confidence:
+            if verdict = duplicate:
+                -- the newer fact restates the established one; it adds
+                -- nothing and closes
+                newer.t_invalid = now
+                newer.invalidation_reason = "judged duplicate"
+            else if verdict = supersedes:
+                -- the newer fact is the legitimate successor; the
+                -- established one closes
+                established.t_invalid = now
+                established.invalidation_reason = "judged superseded"
+            else if verdict = compatible:
+                -- not actually in conflict: unlink, both stand
+                newer.conflicts_with.remove(established)
+}
+
+-- The deferred sweep: generate candidates, judge each once, and LINK the
+-- genuine hits into the same conflict pipeline the write path feeds.
+-- Compatible and unparseable verdicts are dropped silently — a noisy
+-- generator can't mutate anything. The LLM never runs on the write path.
+rule SweepConflicts {
+    when: SweepConflicts(agent, resolve, min_confidence?)
+    ensures:
+        for c in sweep_candidates():
+            SweepVerdictRequested(newer: c.fact, established: c.candidate,
+                                  reason: c.reason, resolve: resolve,
+                                  min_confidence: min_confidence ?? config.judge_min_confidence)
+}
+
+rule ApplySweepVerdict {
+    when: SweepVerdictDelivered(judge, newer, established, verdict, confidence, resolve, min_confidence)
+    requires: verdict = contradicts or verdict = duplicate or verdict = supersedes
+    ensures:
+        newer.conflicts_with.add(established)
+        VerdictDelivered(judge: judge, newer: newer, established: established,
+                         verdict: verdict, confidence: confidence, resolve: resolve,
+                         min_confidence: min_confidence)
+}
+
+-- The Dreaming-style offline pass, at consolidation cadence: close open
+-- fact-bearing episodes with summaries (summaries are full-text indexed,
+-- so episodic history becomes searchable — "why did we do X" is a query),
+-- judge and sweep, enrich retrieval, report promotion candidates.
+-- Open-but-EMPTY episodes are left alone — they may belong to a session
+-- still in flight.
+rule Consolidate {
+    when: Consolidate(agent, resolve)
+    ensures:
+        for ep in open_fact_bearing_episodes():
+            EpisodeSummaryRequested(episode: ep)
+        JudgeConflicts(agent: agent, resolve: resolve)
+        SweepConflicts(agent: agent, resolve: resolve)
+        for e in enrichment_candidates():
+            -- alias-less, fact-bearing entities, most-used first, bounded
+            -- per pass — aliases are the training-free path to
+            -- semantic-ish retrieval (full-text indexed; the entity
+            -- resolution route honours them)
+            AliasSuggestionsRequested(entity: e)
+        PromotionReview(candidates: promotion_candidates())
+}
+
+-- An episode summary lands (LLM, or the mechanical digest when the LLM is
+-- unavailable or returned nothing — the pass always makes progress).
+rule CloseEpisodeWithSummary {
+    when: EpisodeSummaryRequested(episode)
+    requires: episode.status = open
+    ensures:
+        episode.status = closed
+        episode.summary = summary_or_mechanical_digest(episode)
+        episode.closed_at = now
+}
+
+-- Suggested aliases funnel through entities.allium's AliasEntity, so a
+-- clash with another entity's name is refused there and skipped here —
+-- enrichment must never create ambiguity. Failures skip silently:
+-- enrichment is a bonus, never a blocker.
+rule ApplyAliasSuggestions {
+    when: AliasSuggestionsDelivered(judge, entity, suggestions)
+    ensures:
+        for a in suggestions:
+            AliasEntity(agent: judge, entity: entity, alias: a)
+}
+
+-- Recompile the graph's current view into the marker-delimited managed
+-- section at the head of the file the harness auto-injects, so every
+-- session starts with it for free. Deterministic by construction — no LLM
+-- anywhere; same graph + same clock = byte-identical output. Everything
+-- around the managed section is untouched.
+--
+-- Priority order under the byte budget:
+--   1. Standing commitments — the do-not-relitigate list
+--   2. Open conflicts awaiting the human
+--   3. Recent supersessions ("Heroku -> Fly on 2026-06-02") — the
+--      what-changed-since-you-last-looked briefing
+--   4. Top currently-valid facts by decay-aware effective confidence,
+--      capped at max_context_facts, EXCLUDING code-sourced facts (the
+--      injected view carries only what the code cannot say) and EXCLUDING
+--      flagged facts (a disputed claim must not read as settled truth —
+--      it appears in the conflicts section instead)
+-- A truncated section always announces how much the graph holds beyond
+-- the cut; a section that cannot fit even its announcement is dropped
+-- whole.
+rule CompileContext {
+    when: CompileContext(agent, target_file)
+    ensures: ManagedSectionWritten(file: target_file,
+                                   content: compiled_view(config.context_budget_bytes))
+}
+
+-- The SessionEnd pass: the whole ambient loop in one verb. Stages are
+-- attempted INDEPENDENTLY — an analyzer or extractor failure must never
+-- stop the deterministic recompile; a failed stage is an error entry in
+-- the report, not an abort. Code runs FIRST so extraction's entity roster
+-- and conflict ground truth are fresh, and it is delta-gated (free when
+-- nothing changed); the code-ingest setting opts a project with an
+-- expensive analyzer out. Consolidation runs at lower frequency, gated by
+-- a stamp: due when the stamp is absent or older than the window.
+rule AmbientSessionEnd {
+    when: SessionEnded(harness, agent, project)
+    ensures:
+        IngestCodeIfChanged(agent: agent, root: project, scope: "code")
+        IngestNotes(agent: agent, harness: project, notes: project)
+        CompileContext(agent: agent, target_file: project)
+        if due_for_consolidation(now):
+            Consolidate(agent: agent, resolve: false)
+}
+
+-- The gated push: given what the agent is about to do, decide WHETHER the
+-- graph holds something worth interrupting with; stay silent otherwise.
+-- Always-on injection measurably doesn't pay — the gate is the feature.
+-- What clears it, in order of authority: standing commitments touching
+-- the task, known failure modes, open conflicts on the entities in play —
+-- at most coach_max_per_section each. Precondition failure here is
+-- SILENCE, not an error: the hook prints nothing and the agent's context
+-- stays clean.
+rule CoachBriefing {
+    when: PromptSubmitted(harness, agent, prompt)
+    requires: authoritative_hits(prompt).count > 0
+    ensures: BriefingPushed(hits: authoritative_hits(prompt))
+}
+
+-- Usefulness reaches the store without learned components: read verbs log
+-- what they surfaced; when the work's outcome is known, an accepted mark
+-- reinforces every fact retrieved since the last mark — DISUSE CLOCK RESET
+-- ONLY, never a confidence raise: retrieval-in-accepted-work is evidence
+-- of aliveness, not of truth.
+rule OutcomeAccepted {
+    when: OutcomeAccepted(agent)
+    ensures:
+        for f in retrieved_since_last_mark(agent):
+            f.last_reinforced_at = now
+        RetrievalWindowConsumed(valence: "accepted")
+}
+
+-- A rejected mark reinforces NOTHING and reports the facts that were in
+-- play — the review candidates. The rejection's LESSON arrives separately
+-- through the failure tier (ingestion.allium) — the two halves of the
+-- valence signal.
+rule OutcomeRejected {
+    when: OutcomeRejected(agent)
+    ensures:
+        ReviewCandidatesReported(facts: retrieved_since_last_mark(agent))
+        RetrievalWindowConsumed(valence: "rejected")
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface Maintenance {
+    facing agent: Agent
+
+    provides:
+        JudgeConflicts(agent, resolve, min_confidence?)
+        SweepConflicts(agent, resolve, min_confidence?)
+        Consolidate(agent, resolve)
+        CompileContext(agent, target_file)
+        OutcomeAccepted(agent)
+        OutcomeRejected(agent)
+
+    @guarantee ContradictionsAlwaysReachHumans
+        -- No maintenance path auto-resolves a contradicts verdict, at any
+        -- confidence, with any flags set.
+
+    @guarantee EnrichOnlyByDefault
+        -- Judge and sweep report; invalidation and unlinking happen only
+        -- under an explicit resolve request, gated by verdict confidence.
+
+    @guarantee DeterministicCompile
+        -- The compiled view involves no LLM and depends only on the graph
+        -- and the clock; compile -> ingest -> compile is a fixed point
+        -- because ingestion strips the managed section before hashing and
+        -- extraction (the echo-loop guard) — the graph never re-consumes
+        -- its own compiled view.
+
+    @guarantee StagesFailIndependently
+        -- In the ambient pass, each stage's failure is contained to its
+        -- report entry; later stages still run, and the deterministic
+        -- compile always gets its chance.
+
+    @guarantee SilenceIsTheDefault
+        -- The coach pushes only when something authoritative is at stake;
+        -- otherwise the hook contributes nothing to the agent's context.
+}
+
+-- The LLM boundary: every judged decision arrives through here, off the
+-- write path, and the machine reaction to each delivery is specified by
+-- the Apply* rules above.
+surface JudgeIntegration {
+    facing judge: Judge
+
+    provides:
+        VerdictDelivered(judge, newer, established, verdict, confidence, resolve, min_confidence)
+        SweepVerdictDelivered(judge, newer, established, verdict, confidence, resolve, min_confidence)
+        AliasSuggestionsDelivered(judge, entity, suggestions)
+
+    @guarantee VerdictsNeverBlockWrites
+        -- The LLM never runs on the write path; a slow, absent or
+        -- unparseable judge degrades maintenance, never assertion. An
+        -- unparseable response counts as a zero-confidence verdict — one
+        -- bad judgment never kills a batch.
+}
+
+-- The harness boundary: the two hook events the ambient loop hangs off.
+surface HarnessIntegration {
+    facing harness: Harness
+
+    provides:
+        SessionEnded(harness, agent, project)
+        PromptSubmitted(harness, agent, prompt)
+
+    @guarantee ZeroBehaviourChangeRequired
+        -- Capture in, injection out: once the hooks are wired, the loop
+        -- feeds the graph at session end and starts the next session with
+        -- the compiled view — with no change to how anyone works.
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "The consolidation stamp is written whenever the pass itself completes, even when its judge, sweep or enrichment sub-stages errored internally (each catches its own failure into the report) — so a broken LLM postpones those stages a full consolidation window rather than retrying next session. Intended cadence, or should sub-stage failure leave the pass due?"
+open question "A rejected outcome consumes the retrieval window, so facts surfaced before the rejection can never be reinforced by a later acceptance of the same work after fixes. Intended (the fixed work's own reads re-log), or should rejection leave the window open?"
+open question "Sweep links a hit into the conflict pipeline at ANY verdict confidence (only the RESOLUTION is confidence-gated), so a low-confidence duplicate verdict still creates an open conflict a human must clear. Intended tilt toward surfacing?"

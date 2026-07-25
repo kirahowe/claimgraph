@@ -1,0 +1,234 @@
+-- allium: 3
+-- entities.allium
+--
+-- Scope: Identity of the graph's nodes — naming, layered resolution,
+-- ambiguity refusal, and the curation verbs (rename, alias, merge, split,
+-- duplicate detection). The one law: a detected name collision never
+-- guesses AND never creates; minting an accidental third entity is the one
+-- outcome that must never happen silently.
+--
+-- Includes: GraphEntity; resolve-or-create with self-healing aliases;
+--   rename / alias / merge / split; duplicate-cluster reporting.
+-- Excludes:
+--   - Facts, conflict machinery, predicate registry (claims.allium; merge
+--     leans on its duplicate-collapse behaviour but the fact lifecycle
+--     lives there)
+--   - The LLM alias enrichment pass (maintenance.allium; it feeds
+--     AliasEntity and inherits its clash refusal)
+--   - Cross-machine entity remapping by name (replication.allium)
+--
+-- Conventions:
+--   - Entities are open-world: an unmatched name is genuinely new and
+--     creating it is correct. The defenses aim at NEAR-matches.
+--   - Normalization is the equivalence class for near-match lookup:
+--     lowercase, separators stripped — "AuthService", "auth-service" and
+--     "auth_service" are one normalized form.
+--   - Type is a guard, not a taxonomy: resolution only crosses the
+--     normalized bridge when types are compatible (either side untyped, or
+--     equal) — a namespace must never silently match a class.
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+external entity Agent {
+    name: String
+}
+
+-- The reified edges touching an entity. Governed by claims.allium; merge
+-- repoints these references and closes intervals, never deletes.
+external entity Fact {
+    subject: GraphEntity
+    object_entity: GraphEntity?
+    scope: String
+    t_invalid: Timestamp?
+    invalidation_reason: String?
+}
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+entity GraphEntity {
+    name: String                     -- the display name; exact-unique per scope
+    type: String?                    -- namespace, class, file, tool, person, ...
+    scope: String                    -- default "project"
+    aliases: Set<String>             -- alternative names resolution honours
+
+    subject_facts: Fact with subject = this
+    object_facts: Fact with object_entity = this
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- Black box functions (pure, deterministic):
+--
+--   normalized(name)               lowercase, whitespace/-/_/./ separators
+--                                  stripped: the near-match equivalence class
+--   resolved(name, type, scope)    the layered lookup over that scope's
+--                                  entities, in precedence order:
+--                                    1. exact name match
+--                                    2. exact alias match
+--                                    3. a UNIQUE normalized match against
+--                                       name-or-aliases, type-guarded
+--                                  Null when nothing matches: genuinely new.
+--   ambiguous(name, type, scope)   two or more normalized matches — a
+--                                  DETECTED COLLISION; the refusal carries
+--                                  the candidates so the caller can surface
+--                                  them (ingestion routes such facts to its
+--                                  error bucket instead of minting a third
+--                                  entity)
+--   duplicate_groups(facts)        currently-valid facts identical in
+--                                  (subject, predicate, object, scope,
+--                                  epistemic class), grouped — the exposure
+--                                  a merge's repointing creates
+--   all_but_earliest_recorded(group)
+--                                  every fact in the group except the one
+--                                  with the earliest transaction time
+
+-- Resolve-or-create: the entry point every write path uses (assert
+-- subjects and entity objects, ingestion, reconcile's cross-machine name
+-- remapping).
+--
+--   * An exact or alias hit resolves.
+--   * A unique normalized hit resolves AND self-heals: the queried
+--     spelling is recorded as an alias, so the next lookup is exact. A
+--     resolved entity with no type picks up the caller's type.
+--   * A detected collision refuses with the candidates attached.
+--   * No match at all creates: entities are open-world.
+rule EnsureEntity {
+    when: EnsureEntity(agent, name, type?, scope?)
+    requires: not ambiguous(name, type, scope ?? "project")
+    ensures:
+        let found = resolved(name, type, scope ?? "project")
+        if found = null:
+            GraphEntity.created(name: name, type: type, scope: scope ?? "project", aliases: {})
+        else:
+            if name != found.name and name not in found.aliases:
+                found.aliases.add(name)
+            if type != null and found.type = null:
+                found.type = type
+}
+
+-- Rename in place: same entity, same facts, same history; the old name is
+-- kept as an alias so references through it keep resolving. A clash with
+-- another entity's exact name is refused — combining them is `merge`, a
+-- deliberate act.
+rule RenameEntity {
+    when: RenameEntity(agent, entity, new_name)
+    requires: not exists GraphEntity{name: new_name, scope: entity.scope}
+    ensures:
+        entity.aliases.add(entity.name)
+        entity.name = new_name
+}
+
+-- Record an additional name. Refused when another entity already owns it
+-- as its exact name (merge them instead). The LLM enrichment pass
+-- (maintenance.allium) funnels through this same rule, so enrichment can
+-- never create ambiguity either.
+rule AliasEntity {
+    when: AliasEntity(agent, entity, alias)
+    requires: not exists GraphEntity{name: alias, scope: entity.scope}
+    ensures: entity.aliases.add(alias)
+}
+
+-- Two entities that turn out to be the same thing: every fact repoints
+-- from the source onto the survivor, the merged-away names live on as the
+-- survivor's aliases, the empty husk is removed — the ONE entity removal
+-- in the system, and facts are never deleted — and the exact duplicates
+-- the repointing exposed are collapsed non-lossily: in each group of
+-- now-identical currently-valid claims, the earliest-recorded survives
+-- and the rest close their intervals.
+rule MergeEntities {
+    when: MergeEntities(agent, source, target)
+    requires: source != target
+    ensures:
+        for f in source.subject_facts:
+            f.subject = target
+        for f in source.object_facts:
+            f.object_entity = target
+        if source.name != target.name:
+            target.aliases.add(source.name)
+        for a in source.aliases:
+            if a != target.name:
+                target.aliases.add(a)
+        not exists source
+        for group in duplicate_groups(target.subject_facts):
+            for f in all_but_earliest_recorded(group):
+                f.t_invalid = now
+                f.invalidation_reason = "duplicate after merge"
+}
+
+-- Record that an entity split into successors: a derived-from lineage fact
+-- per successor (asserted through claims.allium, so it rides the normal
+-- machinery). Facts on the source stay put — which successor inherits a
+-- preference or a decision is a judgment call, left for review rather
+-- than redistributed mechanically.
+rule SplitEntity {
+    when: SplitEntity(agent, source, successor_names)
+    requires: successor_names.count > 0
+    ensures:
+        for n in successor_names:
+            EnsureEntity(agent: agent, name: n, scope: source.scope)
+            AssertFact(agent: agent, subject: n, predicate: "core/derived-from",
+                       object: source.name, object_kind: "entity")
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- Exact display names are unique per scope: creation goes through
+-- exact-match-or-create, and rename/alias refuse clashes. (Normalized
+-- collisions CAN exist — entities created under different spellings before
+-- either knew of the other; they surface as duplicate clusters and refuse
+-- resolution until merged.)
+invariant ExactNameUniquePerScope {
+    for a in GraphEntities:
+        for b in GraphEntities:
+            a != b implies not (a.scope = b.scope and a.name = b.name)
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface EntityCuration {
+    facing agent: Agent
+
+    provides:
+        EnsureEntity(agent, name, type?, scope?)
+        RenameEntity(agent, entity, new_name)
+        AliasEntity(agent, entity, alias)
+        MergeEntities(agent, source, target)
+        SplitEntity(agent, source, successor_names)
+
+    @guarantee NeverGuessNeverCreateOnCollision
+        -- Two or more normalized matches refuse with the candidates and a
+        -- hint (use the exact name; merge if they are duplicates). No
+        -- write path ever resolves an ambiguous name by picking one, and
+        -- none ever responds by minting another entity.
+
+    @guarantee LookupsSelfHeal
+        -- A resolution that crossed the normalized bridge records the
+        -- queried spelling as an alias, so the graph converges toward
+        -- exact hits instead of paying the fuzzy lookup forever.
+
+    @guarantee DuplicateClustersReportable
+        -- Entities sharing a normalized form within a scope are listable
+        -- as merge candidates for human review (entity duplicates).
+
+    @guarantee MergeIsNonLossy
+        -- Merge repoints and collapses by closing validity intervals;
+        -- every claim either side ever made stays in history.
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "Two entities can hold the SAME alias (AliasEntity only refuses a clash with another entity's exact NAME, not its aliases). Resolution's alias layer then silently picks one of them — the only name-collision the ambiguity defense does not catch. Should alias clashes be refused or resolved as ambiguous?"
+open question "Renaming an entity back to a previous name leaves that name as BOTH display name and alias (update-entity dedupes aliases against each other, not against the new name). Harmless for resolution (exact wins first), but should the rename verb scrub the new name from the alias list?"
+open question "EnsureEntity backfills a missing type from the caller but never verifies an existing one — a caller asserting type namespace against an entity typed class resolves anyway (the type guard applies only to the normalized layer). Intended leniency?"

@@ -1,0 +1,295 @@
+-- allium: 3
+-- replication.allium
+--
+-- Scope: More than one writer, on one machine or many — the single-machine
+-- write lease, per-writer append-only effect logs, cross-machine
+-- reconciliation, and dump/load portability. The design stance throughout:
+-- this is deliberately NOT a CRDT. A CRDT forces agreement by
+-- construction; claimgraph wants disagreement made VISIBLE — two machines
+-- asserting contradictory things must end as an open conflict for a
+-- human, which is what the whole system is for.
+--
+-- Includes: the lease; the oplog and its clock; reconcile; dump and load.
+-- Excludes:
+--   - The conflict machinery reconciliation feeds (claims.allium)
+--   - Entity resolution used for cross-machine name remapping
+--     (entities.allium)
+--   - File transport itself: each machine only ever appends to its OWN
+--     log file, so any file syncer (git, rsync, Syncthing) moves logs
+--     between machines and a merge conflict cannot occur in transport —
+--     by construction, not by protocol
+--
+-- Conventions:
+--   - The live store is a materialized view; the logs are the record.
+--   - Entity ids are internal to a machine: identity crosses machines by
+--     NAME, and each machine keeps its own display name, learning the
+--     other's as an alias through ordinary resolution.
+--   - Reads never take the lease.
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+external entity Agent {
+    name: String
+}
+
+-- Governed by claims.allium; reconcile closes cross-writer duplicates'
+-- intervals, never deletes.
+external entity Fact {
+    scope: String
+    t_invalid: Timestamp?
+    invalidation_reason: String?
+}
+
+external entity GraphEntity {
+    name: String
+}
+
+external entity Episode {
+    ref: String
+}
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- One store mutation, as data: the effect vocabulary mirrors the store's
+-- primitive writes (entity ensured/updated/deleted, fact inserted /
+-- invalidated / reinforced / conflict-linked, facts repointed, episode
+-- opened/closed, predicate registered/repointed).
+value Effect {
+    kind: String
+    payload: String
+}
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- This machine's write lease: one file next to the store, atomically
+-- created. A lease, not a queue, on purpose: coding-agent writers are
+-- short-lived CLI invocations, so waiting a few seconds covers real
+-- contention, and anything longer deserves a loud store-locked error
+-- naming the holder.
+entity Lease {
+    holder: String
+    token: String                    -- release is token-guarded: only the
+                                     -- acquirer's token releases, so a
+                                     -- broken-and-reacquired lease is never
+                                     -- released by the previous holder
+    acquired_at: Timestamp
+    expires_at: Timestamp            -- TTL: a crashed writer expires instead
+                                     -- of wedging the store
+}
+
+-- One writer's append-only log. Every mutation the writer performs appends
+-- one effect line here — and only here: a writer never touches another
+-- writer's log.
+entity WriterLog {
+    writer: String                   -- stable per machine/agent identity
+    entries: LogEntry with log = this
+}
+
+entity LogEntry {
+    log: WriterLog
+    seq: Integer                     -- per-writer, strictly increasing
+    hlc: Integer                     -- hybrid logical clock: wall time, but
+                                     -- never backwards and never repeating
+                                     -- within a writer
+    effect: Effect
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    lease_ttl: Duration = 30.seconds
+    lease_wait: Duration = 5.seconds     -- how long an acquirer retries before
+                                         -- the loud store-locked error
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- Black box functions (pure, deterministic):
+--
+--   current_lease()               the lease on file, or null
+--   expired(lease, at)            the TTL has passed: the lease may be
+--                                 broken and re-acquired
+--   fresh_token(owner)            an unguessable token for this acquisition
+--   next_seq(log)                 the writer's next sequence number
+--   next_hlc(log)                 the writer's next hybrid-logical-clock
+--                                 stamp: max(wall clock, last + 1)
+--   unapplied_foreign_entries()   every entry in every OTHER writer's log
+--                                 beyond this store's per-writer
+--                                 high-water mark
+--   canonical_order(entries)      sorted by (hlc, writer, seq) — one total
+--                                 order every machine agrees on
+--   applicable(entry)             false when the entry's target is unknown
+--                                 or already present here: a fact id never
+--                                 seen, an entity id absent from the
+--                                 foreign-id map, an already-inserted fact
+--                                 or episode (idempotence) — such entries
+--                                 SKIP, counted, never error
+--   remapped(entry)               the effect with foreign entity
+--                                 references resolved to LOCAL entities by
+--                                 name (via entities.allium resolution,
+--                                 which learns the foreign display name as
+--                                 an alias), cached in a persistent
+--                                 foreign-id map so later entries carrying
+--                                 only the foreign id still resolve
+--   touched_subjects(entries)     the local subjects the applied inserts
+--                                 landed on
+--   duplicate_claims(subjects)    claims both writers made independently:
+--                                 identical (subject, predicate, object,
+--                                 scope, epistemic) among those subjects'
+--                                 currently-valid facts
+--   all_but_earliest_recorded(group)
+--                                 every fact in a duplicate group except
+--                                 the earliest-recorded survivor
+--   sweep_candidate_count()       how many judgeable pairs the post-apply
+--                                 store holds (maintenance.allium's sweep
+--                                 generator)
+--   all_records()                 every predicate, entity, episode and
+--                                 fact, as typed records
+
+-- Serialize whole write operations at the operation boundary: the
+-- conflict machinery is a read-decide-write cycle, and two concurrent
+-- writers could both read "no conflict" and insert a contradiction the
+-- engine would happily hold. An expired lease is broken and re-acquired;
+-- a live one makes later acquirers wait up to lease_wait, then fail loud,
+-- naming the holder.
+rule AcquireLease {
+    when: AcquireLease(agent, owner)
+    let held = current_lease()
+    requires: held = null or expired(held, now)
+    ensures: Lease.created(holder: owner, token: fresh_token(owner),
+                           acquired_at: now, expires_at: now + config.lease_ttl)
+}
+
+rule ReleaseLease {
+    when: ReleaseLease(agent, token)
+    let held = current_lease()
+    requires: held != null and held.token = token
+    ensures: not exists held
+}
+
+-- Every mutation, logged: the store decorator appends one effect to THIS
+-- writer's log before the write lands, stamped with the next (seq, hlc).
+rule LogEffect {
+    when: MutationPerformed(writer_log, effect)
+    ensures: LogEntry.created(log: writer_log,
+                              seq: next_seq(writer_log),
+                              hlc: next_hlc(writer_log),
+                              effect: effect)
+}
+
+-- Apply every foreign effect this store hasn't seen, in canonical order,
+-- against the RAW store — reconciliation must never re-log foreign
+-- effects as ours. Then make the seams visible: collapse the claims both
+-- writers made independently (closed, not erased), and count the conflict
+-- candidates the judge should look at — contradictions neither writer
+-- could see locally become ordinary open conflicts here.
+rule Reconcile {
+    when: Reconcile(agent)
+    let entries = canonical_order(unapplied_foreign_entries())
+    ensures:
+        for e in entries:
+            if applicable(e):
+                EffectApplied(effect: remapped(e))
+            else:
+                EffectSkipped(effect: e)
+        for f in all_but_earliest_recorded(duplicate_claims(touched_subjects(entries))):
+            f.t_invalid = now
+            f.invalidation_reason = "duplicate across writers"
+        SweepRecommended(candidates: sweep_candidate_count())
+        HighWaterAdvanced(entries: entries)
+}
+
+-- Export everything as typed records: predicates, entities, episodes,
+-- facts — with ids, validity intervals, invalidation reasons and conflict
+-- links intact. The dump is the COMMITTABLE artifact (the live store
+-- directory is gitignored); multi-machine users of the ambient loop
+-- converge through it. Evidence artifacts stay local — the episode's
+-- pointer rides the dump, the bytes do not.
+rule DumpStore {
+    when: DumpStore(agent)
+    ensures: DumpProduced(records: all_records())
+}
+
+-- The other half of portability: a RAW restore, deliberately NOT
+-- re-assertion — the dump already went through the conflict machinery
+-- once, so fact and episode ids, validity intervals, invalidation
+-- reasons, and conflict links round-trip exactly and no policy re-runs.
+-- Entity ids are re-minted (they are internal); facts re-point through an
+-- identity map keyed on the dumped id. Refuses a store that already holds
+-- data: load restores, it does not merge.
+rule LoadDump {
+    when: LoadDump(agent, records)
+    requires: GraphEntities.count = 0 and Facts.count = 0 and Episodes.count = 0
+    ensures: RestoreApplied(records: records)
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant LeaseIntervalRunsForward {
+    for l in Leases:
+        l.expires_at >= l.acquired_at
+}
+
+invariant SeqUniquePerWriter {
+    for a in LogEntries:
+        for b in LogEntries:
+            (a != b and a.log = b.log) implies a.seq != b.seq
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface Replication {
+    facing agent: Agent
+
+    provides:
+        AcquireLease(agent, owner)
+        ReleaseLease(agent, token)
+        Reconcile(agent)
+        DumpStore(agent)
+        LoadDump(agent, records)
+
+    @guarantee AppendOnlyOwnLog
+        -- A writer appends to its own log only; foreign logs are read,
+        -- never written. Transport-level merge conflicts are impossible
+        -- by construction.
+
+    @guarantee ReplayIsIdempotent
+        -- Re-running reconcile applies nothing new: per-writer high-water
+        -- marks skip seen entries, and effects targeting already-present
+        -- facts or episodes skip rather than duplicate.
+
+    @guarantee DisagreementSurfaces
+        -- Cross-writer contradictions are never auto-merged away; they
+        -- land in the same open-conflict pipeline as local ones, for the
+        -- judge and the human.
+
+    @guarantee RoundTripExact
+        -- dump then load into a fresh store preserves fact and episode
+        -- ids, validity intervals, invalidation reasons and conflict
+        -- links exactly.
+
+    @guarantee ReadsNeverBlock
+        -- Only whole write operations take the lease; reads proceed
+        -- against the live store regardless of who holds it.
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "Oplog append failures are swallowed silently (a failed append never blocks the write it records) — a full disk quietly forks the log from the store, and later reconciles from this writer under-replay. Should append failure at least surface a warning on the write's report?"
+open question "A foreign entity RENAME (update-entity) reaches other machines only if the entity's id is already in their foreign-id map; otherwise the entry skips silently. Two machines that renamed the same entity divergently keep both names as mutual aliases — intended convergence-by-alias, or should renames reconcile more strongly?"
