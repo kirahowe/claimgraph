@@ -77,6 +77,68 @@
         "the default location is not touched when overridden")))
 
 ;; ---------------------------------------------------------------------------
+;; The consolidation stamp
+;; ---------------------------------------------------------------------------
+
+(deftest consolidate-due-reads-the-stamp-not-its-mtime
+  ;; The assertions that matter are the ones where payload and mtime DISAGREE:
+  ;; they are what a silent revert to mtime-only would break. Negative day
+  ;; counts here mean "ahead of now" — a foreign clock in a synced store.
+  (let [dir (str (fs/create-temp-dir {:prefix "claimgraph-hooks-stamp-test"}))
+        db (str dir "/db")
+        stamp (str db ".last-consolidate")
+        now (core/now)
+        days-ago (fn [n] (- (.getTime now) (long (* n 86400000))))
+        at (fn [n] (java.util.Date. (days-ago n)))
+        stamp! (fn [payload mtime-days-ago]
+                 (spit stamp payload)
+                 (fs/set-last-modified-time stamp (days-ago mtime-days-ago)))
+        recorded (fn [n] (str (.toInstant (at n))))]
+    (testing "an absent stamp is due"
+      (is (hooks/consolidate-due? db 7 now)))
+
+    (testing "a recent recorded instant is not due, however old the mtime"
+      (stamp! (recorded 1) 400)
+      (is (not (hooks/consolidate-due? db 7 now))))
+
+    (testing "an old recorded instant is due, however fresh the mtime"
+      ;; what rsync, a fresh checkout or a restore does to a travelling store
+      (stamp! (recorded 30) 0)
+      (is (hooks/consolidate-due? db 7 now)))
+
+    (testing "a payload we cannot believe hands the decision to the mtime"
+      ;; unparseable, empty, and dated ahead of us all fall back the same way:
+      ;; the mtime alone decides, in BOTH directions
+      (doseq [payload ["not an instant" "" "  \n" (recorded -21)]]
+        (stamp! payload 0)
+        (is (not (hooks/consolidate-due? db 7 now))
+            (str "a fresh mtime governs: " (pr-str payload)))
+        (stamp! payload 30)
+        (is (hooks/consolidate-due? db 7 now)
+            (str "an old mtime governs: " (pr-str payload)))))
+
+    (testing "a stamp dated ahead of us cannot suppress its whole skew window"
+      ;; another machine wrote now+21d into a synced store; our mtime is honest
+      (stamp! (recorded -21) 0)
+      (is (not (hooks/consolidate-due? db 7 now))
+          "the mtime says we consolidated just now")
+      (is (hooks/consolidate-due? db 7 (at -10))
+          "ten days on the mtime says due — the future payload must not veto it"))
+
+    (testing "days 0 is every run, even when the clock itself is ahead"
+      (stamp! (recorded -5) -5)
+      (is (hooks/consolidate-due? db 0 now))
+      (is (not (hooks/consolidate-due? db 7 now))))
+
+    (testing "a stamp that vanishes mid-read is due, never a crash"
+      ;; exists? → slurp → mtime: a concurrent `hooks run` or a syncer
+      ;; replacing the file can delete it between any two of those
+      (stamp! "not an instant" 0)
+      (with-redefs [fs/last-modified-time
+                    (fn [& _] (throw (java.nio.file.NoSuchFileException. stamp)))]
+        (is (hooks/consolidate-due? db 7 now))))))
+
+;; ---------------------------------------------------------------------------
 ;; Shell: the SessionEnd pass
 ;; ---------------------------------------------------------------------------
 
@@ -104,6 +166,14 @@
         (is (fs/exists? (str db ".last-consolidate")))
         (is (str/includes? (slurp (str dir "/MEMORY.md")) harness/begin-marker)
             "the compiled view landed in the inject file")))
+
+    (testing "the stamp run! writes is read back as its payload, not its mtime"
+      ;; age the mtime out from under a stamp written moments ago: nothing else
+      ;; ties the writer's format to the reader, and a garbage payload would
+      ;; hand the decision to a fresh mtime and look identical
+      (fs/set-last-modified-time (str db ".last-consolidate")
+                                 (- (.getTime (core/now)) (* 400 86400000)))
+      (is (not (hooks/consolidate-due? db 7 (core/now)))))
 
     (testing "within the window, consolidation is skipped"
       (let [r (hooks/run! s base)]

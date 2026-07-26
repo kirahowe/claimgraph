@@ -26,6 +26,7 @@
             [clojure.string :as str]
             [claimgraph.context :as context]
             [claimgraph.core :as core]
+            [claimgraph.logic :as logic]
             [claimgraph.ingest.notes :as notes]))
 
 (def default-consolidate-days 7)
@@ -43,15 +44,41 @@
 
 (defn- stamp-path [db] (str db ".last-consolidate"))
 
+(defn- stamped-at
+  "The instant the stamp records, falling back to its mtime when the payload
+  is unreadable, unparseable, or implausible (dated after `now`). nil when
+  neither can be read — the caller reads that as due."
+  ^java.util.Date [stamp ^java.util.Date now]
+  (try
+    (let [recorded (try (logic/parse-instant (slurp stamp))
+                        (catch Exception _ nil))]
+      (if (and recorded (<= (.getTime ^java.util.Date recorded) (.getTime now)))
+        recorded
+        (java.util.Date. (.toMillis (fs/last-modified-time stamp)))))
+    (catch Exception _ nil)))
+
 (defn consolidate-due?
-  "Due when the stamp is absent or older than the window. The stamp lives
-  next to the db directory (<db>.last-consolidate), so per-store cadence
-  follows the store."
+  "Due when the stamp is absent, when it cannot be resolved at all, or when
+  the instant it records is at least `days` old. The stamp lives next to the
+  db directory (<db>.last-consolidate), so per-store cadence follows the
+  store.
+
+  The payload is the authority, not the mtime: a store is expected to travel
+  (rsync, a fresh checkout, a backup restore, the file syncer this project
+  supports for the oplog) and every one of those rewrites the mtime without
+  any consolidation having happened. The mtime is the fallback for a payload
+  we cannot believe — missing, truncated, hand-edited, or dated ahead of us,
+  which is another machine's clock writing into a synced store and not
+  evidence that anything ran. Never the later of the two, and never a hard
+  failure: the stamp can vanish under us mid-read (a concurrent `hooks run`,
+  a syncer replacing the file), and \"cannot tell\" has to mean due — a
+  consolidation run twice costs a pass, one skipped costs the cadence.
+  Elapsed time still floors at zero so a future mtime cannot outvote days=0."
   [db days now]
-  (let [stamp (stamp-path db)]
-    (or (not (fs/exists? stamp))
-        (>= (- (.getTime ^java.util.Date now)
-               (.toMillis (fs/last-modified-time stamp)))
+  (let [stamp (stamp-path db)
+        at (when (fs/exists? stamp) (stamped-at stamp now))]
+    (or (nil? at)
+        (>= (max 0 (- (.getTime ^java.util.Date now) (.getTime at)))
             (* days 86400000)))))
 
 (defn run!
