@@ -56,7 +56,15 @@
                    "(session-extract, ingest-notes, judge, consolidate summaries) "
                    "won't run until it is; deterministic stages are unaffected")}))))
 
+;; Same contract as claimgraph.harness's managed section, in .gitignore's
+;; comment syntax: what sits between the markers is ours to rewrite, and the
+;; markers are how a later version that adds an artifact updates the block
+;; instead of appending a second copy of it.
+(def gitignore-begin-marker "# claimgraph:managed:begin")
+(def gitignore-end-marker "# claimgraph:managed:end")
+
 (def gitignore-header "# claimgraph live store + local artifacts (the committable artifacts are")
+(def gitignore-header-tail "# `claim dump` output and .claimgraph/config.json)")
 
 (defn gitignore-entries
   "The db-derived local artifacts that must never be committed. The config
@@ -72,8 +80,97 @@
    (str db-rel ".last-consolidate")])
 
 (defn gitignore-block [db-rel]
-  (str gitignore-header "\n# `claim dump` output and .claimgraph/config.json)\n"
-       (str/join "\n" (gitignore-entries db-rel)) "\n"))
+  (str/join "\n" (concat [gitignore-begin-marker gitignore-header gitignore-header-tail]
+                         (gitignore-entries db-rel)
+                         [gitignore-end-marker])))
+
+(defn- artifact-line?
+  "Is this line one of the db-derived ignores for db-rel — `<db>/` or `<db>.x`?
+  Matched by shape, never against the current gitignore-entries: a release that
+  drops or renames an entry still has to recognise the whole block an older one
+  wrote, or the lines it no longer knows about orphan below the marked region."
+  [db-rel line]
+  (let [l (str/trim line)]
+    (and (seq db-rel)
+         (str/starts-with? l db-rel)
+         (let [tail (subs l (count db-rel))]
+           (or (= tail "/")
+               (and (str/starts-with? tail ".") (> (count tail) 1)))))))
+
+(defn- unmarked-block-end
+  "Last index of a block with no end marker — one written before the markers
+  existed, or one a user has half-edited. It is the header comments plus the
+  artifact lines they introduce and NOT one line further: users append their
+  own ignores directly under the block (this repo's .gitignore does exactly
+  that), and those lines are not ours to touch.
+
+  The db path is read back from the block's own first line rather than
+  assumed, because the db may have been relocated since it was written. One
+  lone directory line is likelier to be a user's ignore than a block of ours,
+  so it takes two matching entries to claim the run."
+  [lines start]
+  (let [ours? #{gitignore-begin-marker gitignore-header gitignore-header-tail}
+        after-comments (loop [i start]
+                         (if (and (< i (count lines)) (ours? (str/trim (nth lines i))))
+                           (recur (inc i))
+                           i))
+        first-entry (some-> (get lines after-comments) str/trim)
+        db-rel (when (and first-entry
+                          (str/ends-with? first-entry "/")
+                          (not (str/starts-with? first-entry "#")))
+                 (subs first-entry 0 (dec (count first-entry))))
+        run (if db-rel
+              (count (take-while #(artifact-line? db-rel %) (drop after-comments lines)))
+              0)]
+    (dec (+ after-comments (if (>= run 2) run 0)))))
+
+(defn- managed-extents
+  "Every inclusive [start end] region of these lines that claimgraph wrote, in
+  order: the marked one plus every unmarked block an earlier version left.
+  There can be more than one — a version before the markers appended a fresh
+  block whenever the db moved — and all of them are ours to collapse into the
+  single managed region, or the strays below the first survive every later run."
+  [lines]
+  (let [n (count lines)
+        marker-end (fn [from]
+                     (first (keep-indexed
+                             (fn [i l] (when (and (>= i from) (= (str/trim l) gitignore-end-marker)) i))
+                             lines)))]
+    (loop [i 0 acc []]
+      (if (>= i n)
+        acc
+        (let [l (str/trim (nth lines i))
+              end (cond (= l gitignore-begin-marker)
+                        (or (marker-end (inc i)) (unmarked-block-end lines i))
+                        (= l gitignore-header)
+                        (unmarked-block-end lines i))]
+          (if end
+            (let [end (max end i)]      ; a zero-width region would never advance
+              (recur (inc end) (conj acc [i end])))
+            (recur (inc i) acc)))))))
+
+(defn splice-gitignore
+  "Content with the managed block written into whatever region already holds
+  it — the marked one, else an unmarked block from an earlier version, which
+  is upgraded where it stands rather than duplicated beside a marked one —
+  and appended at the end when there is none. A file carrying several of our
+  blocks keeps the first and loses the rest, so the region stays singular.
+  Every other line comes back verbatim: the rest of the file is the user's."
+  [content db-rel]
+  (let [content (str content)
+        block (str/split-lines (gitignore-block db-rel))
+        ;; -1 keeps the empty element a trailing newline produces, so the
+        ;; file's own final-newline habit survives the round trip
+        lines (vec (str/split content #"\n" -1))
+        extents (managed-extents lines)]
+    (if-let [[start end] (first extents)]
+      (let [stale (into #{} (mapcat (fn [[s e]] (range s (inc e)))) (rest extents))
+            after (into [] (comp (remove stale) (map lines)) (range (inc end) (count lines)))]
+        (str/join "\n" (concat (subvec lines 0 start) block after)))
+      (str content
+           (when-not (or (str/blank? content) (str/ends-with? content "\n")) "\n")
+           (when-not (str/blank? content) "\n")
+           (str/join "\n" block) "\n"))))
 
 (defn skill-content
   "The agent skill, rendered for this project's claim executable."
@@ -113,8 +210,10 @@
                    dry-run))))
 
 (defn ensure-gitignore!
-  "Append the live-store ignore block once. Skips (with a note) when the db
-  lives outside the project or the entries are already covered."
+  "Write the live-store ignore block, rewriting the one we already manage
+  rather than appending another (see splice-gitignore). Skips (with a note)
+  when the db lives outside the project, and leaves a repo that ignores these
+  paths its own way alone — until it has a block of ours to keep current."
   [{:keys [project db dry-run]}]
   (let [db (or db ".claimgraph/db")
         target (fs/path project ".gitignore")
@@ -125,17 +224,19 @@
       {:status :skipped :note (str "db " db " lives outside the project — gitignore it where it lives")}
       (let [current (if (fs/exists? target) (slurp (str target)) "")
             lines (set (map str/trim (str/split-lines current)))
-            ;; the whole-directory ignore some repos use covers everything
+            ;; a repo that ignores the whole directory, or already lists these
+            ;; paths its own way, needs nothing from us — but once it holds a
+            ;; block of ours, that block is ours to keep current
             covered? (or (contains? lines (str (first (fs/components rel)) "/"))
-                         (every? lines (gitignore-entries rel)))]
+                         (every? lines (gitignore-entries rel)))
+            ours? (or (str/includes? current gitignore-begin-marker)
+                      (str/includes? current gitignore-header))
+            updated (splice-gitignore current rel)]
         (cond
-          covered? {:status :unchanged :file (str target)}
+          (= updated current) {:status :unchanged :file (str target)}
+          (and covered? (not ours?)) {:status :unchanged :file (str target)}
           dry-run {:status :dry-run :file (str target) :entries (gitignore-entries rel)}
-          :else (do (spit (str target)
-                          (str current
-                               (when-not (or (str/blank? current) (str/ends-with? current "\n")) "\n")
-                               (when-not (str/blank? current) "\n")
-                               (gitignore-block rel)))
+          :else (do (spit (str target) updated)
                     {:status :updated :file (str target) :entries (gitignore-entries rel)}))))))
 
 (defn install-skill!

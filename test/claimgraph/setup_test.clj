@@ -3,6 +3,7 @@
   dry-runnable, no real store backend (init-fn injected), no LLM, no real
   ~/.claude."
   (:require [babashka.fs :as fs]
+            [babashka.process :as process]
             [cheshire.core :as json]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
@@ -10,6 +11,22 @@
 
 (defn- temp-project []
   (str (fs/create-temp-dir {:prefix "claimgraph-setup-test"})))
+
+(defn- containing-checkout
+  "Nearest ancestor of p holding a bb.edn, or nil."
+  [p]
+  (loop [d (fs/absolutize p)]
+    (when d
+      (if (fs/exists? (fs/path d "bb.edn")) (str d) (recur (fs/parent d))))))
+
+(def repo-root
+  "This checkout, located from the test file itself rather than from the
+  runner's cwd. The repo-wide invariants below (installer vs bb.edn, the
+  dogfood skill) are exactly the ones that must not go quietly unchecked
+  because the suite happened to be started from somewhere else."
+  (containing-checkout (or *file* ".")))
+
+(def setup-sh (str (fs/path (or repo-root ".") "scripts" "setup.sh")))
 
 (def fake-init (constantly {:status :initialized :predicates 23}))
 
@@ -123,6 +140,233 @@
         (is (str/starts-with? content "node_modules/\n"))
         (is (str/includes? content ".claimgraph/db/"))))))
 
+(defn legacy-block-for
+  "Verbatim what versions before the markers wrote, for a given db path. Pinned
+  here because the upgrade path has to keep working against the shape users
+  already have on disk (this repo's own .gitignore among them)."
+  [db]
+  (str "# claimgraph live store + local artifacts (the committable artifacts are\n"
+       "# `claim dump` output and .claimgraph/config.json)\n"
+       db "/\n" db ".lock\n" db ".evidence/\n" db ".oplog/\n"
+       db ".retrievals\n" db ".last-consolidate\n"))
+
+(def legacy-gitignore-block (legacy-block-for ".claimgraph/db"))
+
+(deftest gitignore-block-stays-one-region-as-the-entries-grow
+  ;; a later version adding one sibling artifact used to flip "already
+  ;; covered" false and append a SECOND complete block, duplicate lines and all
+  (let [project (temp-project)
+        target (str (fs/path project ".gitignore"))
+        entries setup/gitignore-entries]
+    (spit target "node_modules/\n")
+    (setup/ensure-gitignore! {:project project})
+    (with-redefs [setup/gitignore-entries (fn [rel] (conj (entries rel) (str rel ".futures")))]
+      (is (= :updated (:status (setup/ensure-gitignore! {:project project}))))
+      (is (= :unchanged (:status (setup/ensure-gitignore! {:project project})))))
+    (let [content (slurp target)]
+      (is (= 1 (count (re-seq #"(?m)^# claimgraph:managed:begin$" content))))
+      (is (= 1 (count (re-seq #"(?m)^\.claimgraph/db/$" content))) "no duplicated entry")
+      (is (str/includes? content ".claimgraph/db.futures") "the new entry landed in the block")
+      (is (str/starts-with? content "node_modules/\n")))))
+
+(deftest legacy-gitignore-block-is-upgraded-in-place
+  (let [project (temp-project)
+        target (str (fs/path project ".gitignore"))
+        ;; users append their own ignores directly under our block, with no
+        ;; blank line between — this repo's .gitignore does exactly this
+        before "node_modules/\n\n"
+        after "*.dump.jsonl\nbench/results/\n\n# Book build artifacts\nbook/rendered/\n"]
+    (spit target (str before legacy-gitignore-block after))
+    (is (= :updated (:status (setup/ensure-gitignore! {:project project}))))
+    (let [content (slurp target)]
+      (testing "one block, now marked, standing where the unmarked one stood"
+        (is (= 1 (count (re-seq #"(?m)^# claimgraph:managed:begin$" content))))
+        (is (= 1 (count (re-seq #"(?m)^\.claimgraph/db/$" content))))
+        (is (str/starts-with? content (str before setup/gitignore-begin-marker "\n"))))
+      (testing "every other line survives verbatim, on both sides of the block"
+        (is (str/ends-with? content (str setup/gitignore-end-marker "\n" after)))))
+    (testing "the upgraded block is then stable"
+      (is (= :unchanged (:status (setup/ensure-gitignore! {:project project})))))))
+
+(deftest every-legacy-block-is-absorbed-not-just-the-first
+  ;; relocating the db under a pre-marker version appended a SECOND complete
+  ;; block, so .gitignores in the wild carry two. Adopting only the first
+  ;; leaves the other as a permanent orphan: from the next run on, the begin
+  ;; marker is found first and every pass reports :unchanged.
+  (let [project (temp-project)
+        target (str (fs/path project ".gitignore"))]
+    (spit target (str "node_modules/\n\n"
+                      (legacy-block-for ".claimgraph/db")
+                      (legacy-block-for "old/db")
+                      "\n# mine\nbuild/\n"))
+    (is (= :updated (:status (setup/ensure-gitignore! {:project project}))))
+    (let [content (slurp target)]
+      (is (= 1 (count (re-seq #"(?m)^# claimgraph:managed:begin$" content))))
+      (is (= 1 (count (re-seq #"(?m)^# claimgraph live store" content)))
+          "the stale block's header went with it")
+      (is (empty? (re-seq #"(?m)^old/db" content)) "no orphan left below the marked block")
+      (is (str/starts-with? content "node_modules/\n"))
+      (is (str/ends-with? content "\n# mine\nbuild/\n") "the user's own lines survive"))
+    (testing "and the orphan is gone for good, not merely skipped"
+      (is (= :unchanged (:status (setup/ensure-gitignore! {:project project})))))))
+
+(deftest legacy-block-is-absorbed-whole-when-an-entry-is-dropped
+  ;; the run used to be measured against the CURRENT entry list, so a release
+  ;; that removes or renames an entry stranded the lines it no longer knew
+  ;; about below the block it had just marked — one of them then duplicated
+  ;; inside and outside the managed region, permanently
+  (let [project (temp-project)
+        target (str (fs/path project ".gitignore"))
+        entries setup/gitignore-entries]
+    (spit target (str "node_modules/\n\n" legacy-gitignore-block "\n# mine\nbuild/\n"))
+    (with-redefs [setup/gitignore-entries
+                  (fn [rel] (vec (remove #(str/ends-with? % ".retrievals") (entries rel))))]
+      (is (= :updated (:status (setup/ensure-gitignore! {:project project}))))
+      (let [content (slurp target)]
+        (is (empty? (re-seq #"(?m)^\.claimgraph/db\.retrievals$" content))
+            "the dropped entry left with the block, rather than stranding below it")
+        (is (= 1 (count (re-seq #"(?m)^\.claimgraph/db\.last-consolidate$" content)))
+            "and nothing ended up both inside and outside the managed region"))
+      (is (= :unchanged (:status (setup/ensure-gitignore! {:project project})))))))
+
+(deftest bb-edn-pins-the-babashka-the-installer-installs
+  ;; scripts/setup.sh installs BB_VERSION and reads bb.edn's :min-bb-version as
+  ;; the floor it refuses to go under; that same value is what tells someone
+  ;; with an older bb why nothing works. Left to drift apart, the installer
+  ;; happily produces a bb the project rejects.
+  (is (some? repo-root) "the checkout has to be locatable — this check must never no-op")
+  (let [installed (second (re-find #"BB_VERSION=\"\$\{BB_VERSION:-([^}\"]+)\}\""
+                                   (slurp setup-sh)))
+        required (second (re-find #":min-bb-version\s+\"([^\"]+)\""
+                                  (slurp (str (fs/path repo-root "bb.edn")))))]
+    (is (some? installed) "setup.sh still pins a BB_VERSION")
+    (is (some? required) "bb.edn still sets :min-bb-version")
+    (is (= installed required))))
+
+;; ---------------------------------------------------------------------------
+;; scripts/setup.sh, run for real against a fabricated PATH
+;; ---------------------------------------------------------------------------
+
+(def ^:private borrowed-tools
+  "The real utilities setup.sh legitimately shells out to. Everything else a
+  scenario needs is a stub, so a run that reaches for a downloader it should
+  not have needed dies here rather than going to the network."
+  ["bash" "awk" "mktemp" "mkdir" "ln" "chmod" "dirname" "readlink" "rm" "sh" "mv" "uname"])
+
+(defn- stub! [path body]
+  (spit (str path) (str "#!/bin/sh\n" body "\n"))
+  (fs/set-posix-file-permissions path "rwxr-xr-x"))
+
+(defn- fake-bin
+  "A PATH directory granting exactly what the scenario allows: the borrowed
+  utilities, plus name -> sh-body stubs. curl/tar/unzip are absent unless a
+  scenario names them, which is what keeps these tests offline."
+  [dir stubs]
+  (fs/create-dirs dir)
+  (doseq [[n body] stubs] (stub! (fs/path dir n) body))
+  ;; borrowed second, and never over a stub: a scenario that pins `uname` owns it
+  (doseq [t borrowed-tools :when (not (contains? stubs t))
+          :let [p (fs/which t)] :when p]
+    (fs/create-sym-link (fs/path dir t) p))
+  (str dir))
+
+(defn- run-setup
+  "setup.sh in a scrubbed environment — no inherited PATH, so no brew, no curl
+  and no real bb leak in from the machine running the suite."
+  [path env]
+  (let [{:keys [exit out err]} (process/sh {:env (merge {"PATH" path "HOME" path} env)
+                                            :out :string :err :string}
+                                           (str (fs/which "bash")) setup-sh)]
+    {:exit exit :out (str out err)}))
+
+(def ^:private pinned-bb
+  ;; the installer's own pin, so these fixtures cannot drift out from under it
+  (second (re-find #"BB_VERSION=\"\$\{BB_VERSION:-([^}\"]+)\}\"" (slurp setup-sh))))
+
+(defn- bb-stub [version]
+  (str "case \"$1\" in --version) echo \"babashka v" version "\";; *) exit 0;; esac"))
+
+(def ^:private inert-downloaders
+  "Present so a scenario about something else cannot be short-circuited by the
+  tool guard, inert so a run that does try to download fails here."
+  {"curl" "exit 1" "tar" "exit 1" "unzip" "exit 1"})
+
+(deftest brewless-route-only-demands-downloaders-when-it-downloads
+  ;; a slim CI image with bb and dtlv baked in downloads nothing: gating the
+  ;; whole brew-less route on curl/tar/unzip fails a setup that used to succeed
+  (let [t (temp-project)
+        bin (fake-bin (fs/path t "bin") {"bb" (bb-stub pinned-bb) "dtlv" "echo help"})
+        r (run-setup bin {"USE_BREW" "0" "INSTALL_DIR" (str (fs/path t "target"))})]
+    (is (zero? (:exit r)) (:out r))
+    (is (not (str/includes? (:out r) "download needs"))
+        "nothing was downloaded, so nothing may be demanded"))
+  (testing "the guard still fires on the route that does download, naming that route"
+    (let [t (temp-project)
+          bin (fake-bin (fs/path t "bin") {"dtlv" "echo help"})
+          r (run-setup bin {"USE_BREW" "0" "INSTALL_DIR" (str (fs/path t "target"))})]
+      (is (= 1 (:exit r)))
+      (is (str/includes? (:out r) "the pinned babashka download needs")))))
+
+(deftest claimgraph-dtlv-override-is-honoured-end-to-end
+  ;; setup.sh's own remediation says to point $CLAIMGRAPH_DTLV at a dtlv you
+  ;; already have and re-run; a script that never reads the variable answers
+  ;; that with the identical error. uname is pinned to the one platform with no
+  ;; pinned dtlv build, so any attempt to install instead of honouring it fails.
+  (let [t (temp-project)
+        bin (fake-bin (fs/path t "bin") (merge inert-downloaders
+                                               {"bb" (bb-stub pinned-bb)
+                                                "uname" "echo \"Darwin x86_64\""}))
+        mine (fs/path t "opt" "dtlv")]
+    (fs/create-dirs (fs/parent mine))
+    (stub! mine "echo help")
+    (let [r (run-setup bin {"USE_BREW" "0" "INSTALL_DIR" (str (fs/path t "target"))
+                            "CLAIMGRAPH_DTLV" (str mine)})]
+      (is (zero? (:exit r)) (:out r))
+      (is (str/includes? (:out r) (str "dtlv OK (" mine ")"))
+          "the override is what gets verified, not whatever `dtlv` finds"))
+    (testing "set but unusable is refused, not silently ignored"
+      (let [r (run-setup bin {"USE_BREW" "0" "INSTALL_DIR" (str (fs/path t "target"))
+                              "CLAIMGRAPH_DTLV" (str (fs/path t "nowhere"))})]
+        (is (= 1 (:exit r)))
+        (is (str/includes? (:out r) "$CLAIMGRAPH_DTLV"))))))
+
+(deftest stale-bb-remediation-follows-the-binary-not-the-presence-of-brew
+  (let [t (temp-project)
+        prefix (fs/path t "brew")
+        tools (fake-bin (fs/path t "bin")
+                        {"brew" (str "case \"$1\" in --prefix) echo \"" prefix "\";; esac")})
+        elsewhere (fake-bin (fs/path t "elsewhere") {"bb" (bb-stub "1.10.0")})]
+    (fs/create-dirs (fs/path prefix "bin"))
+    (testing "a stale bb outside brew's prefix is not brew's to upgrade"
+      (let [r (run-setup (str elsewhere ":" tools) {})]
+        (is (= 1 (:exit r)))
+        (is (not (str/includes? (:out r) "brew upgrade"))
+            "brew upgrade borkdude/brew/babashka answers this bb with 'No available formula'")
+        (is (str/includes? (:out r) (str "remove " elsewhere "/bb")))))
+    (testing "brew's own stale bb still gets the brew fix"
+      (stub! (fs/path prefix "bin" "bb") (bb-stub "1.10.0"))
+      (let [r (run-setup tools {})]
+        (is (= 1 (:exit r)))
+        (is (str/includes? (:out r) "brew upgrade borkdude/brew/babashka"))))))
+
+(deftest bb-version-override-cannot-undercut-bb-edn
+  (let [t (temp-project)
+        bin (fake-bin (fs/path t "bin") (merge inert-downloaders
+                                               {"bb" (bb-stub pinned-bb) "dtlv" "echo help"}))
+        base {"USE_BREW" "0" "INSTALL_DIR" (str (fs/path t "target"))}]
+    (testing "a pin below bb.edn's floor is refused, not installed"
+      ;; it used to pass setup's own check and leave every later claim call
+      ;; printing bb's min-version warning — the outcome the check exists for
+      (let [r (run-setup bin (assoc base "BB_VERSION" "1.11.0"))]
+        (is (= 1 (:exit r)))
+        (is (str/includes? (:out r) "bb.edn requires"))))
+    (testing "an overridden pin is not reported as something bb.edn said"
+      (let [r (run-setup bin (assoc base "BB_VERSION" "99.0.0"))]
+        (is (= 1 (:exit r)))
+        (is (str/includes? (:out r) "$BB_VERSION set that bar"))
+        (is (not (str/includes? (:out r) "99.0.0 is bb.edn's"))
+            "bb.edn never said 99.0.0")))))
+
 (deftest skill-honors-bin-and-skills-dir
   (let [project (temp-project)
         skills-dir (str (fs/path project "custom-skills"))]
@@ -151,6 +395,6 @@
 (deftest repo-dogfood-skill-is-in-sync-with-the-template
   ;; the repo's own .claude/skills/claimgraph/SKILL.md is the template
   ;; rendered for its repo-local bin — regenerate via `claim setup` here
-  (when (fs/exists? ".claude/skills/claimgraph/SKILL.md")
-    (is (= (setup/skill-content "bin/claim")
-           (slurp ".claude/skills/claimgraph/SKILL.md")))))
+  (let [dogfood (fs/path (or repo-root ".") ".claude" "skills" "claimgraph" "SKILL.md")]
+    (is (fs/exists? dogfood) "the dogfood skill is checked in — this check must never no-op")
+    (is (= (setup/skill-content "bin/claim") (slurp (str dogfood))))))

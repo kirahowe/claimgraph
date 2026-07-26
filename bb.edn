@@ -1,4 +1,10 @@
 {:paths ["src" "resources" "test" "bench"]
+ ;; The floor scripts/setup.sh reads out of this file and refuses to install
+ ;; below, so an overridden BB_VERSION cannot hand the project a bb it rejects.
+ ;; bb warns on every invocation under this version, naming the version wanted
+ ;; — the alternative is a stale bb failing much later, as a missing var deep
+ ;; inside a task.
+ :min-bb-version "1.12.218"
  :tasks
  {test     {:doc  "Run the test suite against both stores"
             :task (do (require '[claimgraph.run-tests])
