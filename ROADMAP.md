@@ -33,7 +33,14 @@ measured wins), then retrieval (the 20-point axis), then hardening and scale.
 
 Standing constraints that shape every item: no LLM on the write path, no
 ambient injection built by us (compiled views into the harness's slot only),
-invalidate-don't-delete, and no LoCoMo/LongMemEval chasing (review §4.3).
+invalidate-don't-delete, and no LoCoMo/LongMemEval chasing (review §4.3). One
+more since 0.1.0-alpha: the persisted formats are stamped — `format-version`
+1 rides the dump's header record, every oplog line, the store's `<db>.version`
+sibling and `:config-version` in the project config — so an item that changes
+the *shape* of any of them owes a bump and a migration. Additive changes an
+old reader can ignore are free and deliberately do not move the integer; the
+rest are not, and bumping without writing the migration spends the promise the
+stamp exists to make.
 
 -----
 
@@ -70,6 +77,13 @@ Restore a store from the `dump` JSONL. Already on TODO; promoted into this
 phase because multi-machine users of the ambient loop converge through the
 committed dump, not through per-machine note files — which requires dump to
 be two-way. *(TODO; consuming-auto-memory §7 "path plumbing")*
+*Update (0.1.0-alpha): two-way, but not yet safe — an empty or truncated file
+loaded as `:status :loaded` with exit 0, and a dump written before the fix
+restored every entity untyped and reported success, because the record kind
+was stamped onto `:type`, the key an entity's own type already occupied. A
+dump now leads with a format header, the kind lives under `:record`, and
+`load` refuses before its first write anything it cannot read in full — naming
+which of the eight causes it hit, since they want different remedies.*
 
 -----
 
@@ -263,6 +277,16 @@ canonical order, unifies entities by name, collapses independent duplicate
 claims non-lossily, and queues cross-writer contradictions for the judge.
 Deliberately not a CRDT: divergence surfaces as open conflicts instead of
 being merged away. The lease remains for same-machine concurrency.*
+*Update (0.1.0-alpha): reconcile advanced a writer's high-water mark by
+folding over every unapplied effect regardless of outcome, so an effect verb
+the reader did not understand — an older binary against a newer peer — was
+skipped permanently; only `:applied` and `:duplicate` move the mark now, and
+everything else is retried. Lines carry the writer id and the format stamp, so
+a log survives being renamed or restored under another name and a machine
+recognises its own effects inside a foreign file. The lease heartbeats instead
+of expiring under its own longest operation — the 30s TTL against a
+consolidate pass's ~51 LLM calls was exactly how two writers both entered the
+read-decide-write cycle it exists to serialize.*
 
 ### 26. Scale tier for the benchmark ✅ *(2026-07-10)*
 Synthetic history at 10×/100× fixture size (AMA-Bench-style generation,
@@ -279,6 +303,12 @@ Thin second front-end over `claimgraph.core`. Stays trigger-gated as designed
 (handoff §3.4): build when issue 11's latency numbers show cold-start pain or
 per-turn call counts grow — the ambient loop's hook cadence may be what
 finally trips it. *(TODO; comparison §4)*
+*Update (0.1.0-alpha): thinner than the CLI in ways a wired client would have
+frozen in place — no neighbor tool, so graph expansion (the capability that
+most distinguishes this from a notes file) was CLI-only, and `memory_assert`
+could not express valid time at all in a project whose whole point is
+bi-temporality. Eight tools now, each `memory_` plus its CLI verb, with the
+argument names and error channels settled before a client exists to break.*
 
 ### 28. Codex notes adapter ✅ *(2026-07-10)*
 The second harness proves the `--harness` abstraction and its evidence files
@@ -288,11 +318,41 @@ consolidator story nothing else in the field has. *(consuming-auto-memory
 
 -----
 
-## Explicitly deferred (unchanged triggers)
+## Where this stands (0.1.0-alpha, 2026-07-26)
+
+Every numbered issue above is ticked except **12**, which is half done: the
+four-arm harness and a pilot exist, and growing to n≈20 task pairs with
+multiple runs for CIs does not. **18** shipped its fusion without vectors, so
+standalone vector search is still where the deferred list puts it. One deferred
+item moved on its own: `ingest-code` stopped being Clojure-only when the
+language-adapter registry landed (2026-07-24), which is not the tree-sitter
+generalization that entry imagined. The rest stand on their original triggers.
+
+Between that and this line sits a hardening pass — nineteen commits, no new
+roadmap item — that went back over work already ticked and found that several
+of these issues had shipped their mechanism without shipping its refusals. The
+portability loop accepted files it could not read and reported success. The
+effect log skipped effects it could not apply, leaving no trace but arithmetic
+that no longer added up. The second front-end was thinner than the first. The
+lease expired under the longest operation that takes it. Each is recorded
+against its issue above; the pattern is worth naming here, because a ✅ on this
+list has meant "the mechanism exists" and now has to mean "and it says so when
+it cannot".
+
+The version numbers date from that pass: `release` 0.1.0-alpha and
+`format-version` 1, which is where stamping starts rather than a bump. The
+alpha's formats are stamped but not frozen — the migration promise begins at
+1.0 — so a shape change before then is still cheap, and every one after is the
+constraint stated at the top of this document.
+
+## Explicitly deferred (triggers unchanged except where noted)
 
 - **ACL tier** — fields carried, unenforced; activate when multi-user. *(TODO)*
-- **Multi-language code ingesters** — tree-sitter generalization; when demand
-  is real. *(TODO)*
+- **Multi-language code ingesters** — no longer deferred ✅ *(2026-07-24)*: a
+  per-language adapter registry, not the tree-sitter generalization this entry
+  assumed it would take. Clojure, Kotlin and TypeScript/JavaScript ship; a
+  project adds its own under `code-analyzers` in `.claimgraph/config.json`.
+  *(TODO)*
 - **Multi-system benchmark harness** — only after the benchmark proves out
   here; a neutral codebase-memory benchmark is possibly the highest-leverage
   artifact in the field, but sequencing stands. *(TODO; comparison §5)*

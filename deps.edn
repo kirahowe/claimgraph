@@ -1,4 +1,10 @@
-{;; JVM Clojure classpath for the book build only. The tool itself runs on
+{;; Terms for the whole repo; LICENSE is the authority and this is the pointer.
+ ;; deps.edn has no official slot for it — the Clojure CLI reads the keys it
+ ;; knows and ignores the rest — so the shape is Leiningen's :license, which is
+ ;; where both tooling and people already look for a project's terms.
+ :license {:name "MIT" :url "https://opensource.org/license/mit"}
+
+ ;; JVM Clojure classpath for the book build only. The tool itself runs on
  ;; babashka (see bb.edn); this file exists so Clay can evaluate the book's
  ;; example namespaces against the real claimgraph source.
  :paths ["src" "resources"]

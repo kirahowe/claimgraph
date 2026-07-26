@@ -184,7 +184,7 @@ guaranteed honest.
 
 ### 3.8 Controlled predicate vocabulary with a self-describing registry
 
-**Decision.** A curated core of ~22 predicates (`:core/*`), each a first-class
+**Decision.** A curated core of 23 predicates (`:core/*`), each a first-class
 queryable row in the same store carrying its own definition, category, object-
 kind, cardinality, status, inverse, default epistemic class, and a `maps-to`
 projection note to an established standard (PROV-O / SPDX / DOAP / SKOS / Dublin
@@ -341,21 +341,30 @@ MCP wrapper.
 
 -----
 
-## 6. Predicate registry — seed vocabulary (~22)
+## 6. Predicate registry — seed vocabulary (23)
 
 Blessed `:core/*` predicates, by category, each with object-kind, cardinality,
-default epistemic class, and a `maps-to` standard mapping.
+default epistemic class, and a `maps-to` standard mapping. The two inverse
+rows named in passing below — `dependency-of` and `superseded-by` — are seeded
+predicates in their own right, which is how the four categories reach 23
+(structural 9, procedural 5, decision 6, provenance 3; see
+`claimgraph.predicates/seed`).
 
 **Structural:** `depends-on` (↔ `dependency-of`, SPDX DEPENDS_ON, observation),
-`imports` (CodeOntology, observation), `defined-in` (↔ `contains`, SPDX
-CONTAINED_BY, observation), `contains` (SPDX CONTAINS / dcterms:hasPart),
-`part-of` (dcterms:isPartOf), `implements` (DOAP/SEON, observation),
+`imports` (CodeOntology, observation), `defined-in` (SPDX
+CONTAINED_BY, observation), `contains` (↔ `part-of`, SPDX CONTAINS /
+dcterms:hasPart), `part-of` (dcterms:isPartOf), `implements` (DOAP/SEON, observation),
 `written-in` (DOAP programming-language; either), `has-version` (dcterms:hasVersion;
 literal).
 
+*(v0 correction: `defined-in` claimed `contains` as its inverse while
+`contains` claimed `part-of`, giving `contains` two claimants. `contains` ↔
+`part-of` is the one containment pair; `defined-in` has no true inverse here.)*
+
 **Procedural:** `tested-by` (SPDX hasTest, observation), `built-with` (SPDX
 BUILD_DEPENDENCY_OF), `generated-from` (SPDX GENERATED_FROM / prov:wasGeneratedBy),
-`deployed-via` (LOCAL).
+`deployed-via` (LOCAL), `failure-mode` (LOCAL, literal — added with the failure
+ingester).
 
 **Decision/preference:** `supersedes` (↔ `superseded-by`, prov:wasRevisionOf /
 dcterms:replaces, commitment), `decided-against` (LOCAL/ADR, either, commitment),

@@ -9,6 +9,23 @@ Remaining roadmap, in rough priority order. Rationale for most items lives in
 > `docs/consuming-auto-memory.md`). The "Next up" list below is kept for
 > history; the roadmap is the current ordering.
 
+> **Where this stands** (0.1.0-alpha, 2026-07-26). "Next up" is history in
+> full now. The auto-memory loop, the failure and ADR ingesters, the predicate
+> promotion command, `load` and the MCP front-end all shipped; the benchmark
+> grew but has not reached the n it wants (roadmap issue 12). Vector/semantic
+> search and the ACL tier are the two that did not move, on their original
+> triggers — the ACL fields are still carried and still unenforced. Multi-
+> language code ingestion is no longer future work: Kotlin and TypeScript/
+> JavaScript analyzers ship beside the Clojure one and a project can register
+> its own. Nothing below is ticked, because ticking a list the roadmap
+> replaced would suggest it is still the one being worked from.
+>
+> One constraint this file predates: the persisted formats are stamped from
+> 0.1.0-alpha — `format-version` 1 in the dump's header record, every oplog
+> line, the store's `<db>.version` sibling and `:config-version` in the
+> project config — so anything here that changes the shape of one of them now
+> owes a version bump and a migration alongside it.
+
 ## Review feedback round (2026-06-11) — being addressed in order
 
 - [x] 1. Traversal chattiness: BFS now hands its whole frontier to
