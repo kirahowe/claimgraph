@@ -234,6 +234,47 @@
       [:unknown rec])))
 
 ;; ---------------------------------------------------------------------------
+;; Source trust: what a source-type may overrule, and what it may claim
+;; ---------------------------------------------------------------------------
+
+(def source-trust
+  "Trust rank per source-type (review §3.6): human decisions and mechanical
+  derivation at the top, extraction in the middle, agent inference at the
+  bottom. Drives two write-time defenses — a weaker source never silently
+  supersedes a stronger one, and non-trusted sources resurrecting a dead
+  value get flagged, not believed."
+  {:decision-record 3
+   :user-assertion 3
+   :code 3
+   :session-log 2
+   :failure-report 2
+   :agent-note 1
+   :inferred 1})
+
+(defn trust-rank [source-type] (get source-trust source-type 2))
+
+(def source-ceilings
+  "The most a fact from each source-type may ever claim — a fact the ingester
+  re-derives 500 times must stay distinguishable from a human decision. Both
+  ends of a fact's life are capped here: build-fact clamps a new fact to its
+  source's ceiling, and reinforcement raises confidence toward that ceiling
+  rather than toward 1.0.
+
+  Birth has to be capped because nothing later brings a fact back down:
+  reinforced-confidence is a high-water mark by design, so a fact minted above
+  its ceiling (an `assert --source-type session-log --confidence 0.99`) sits
+  above it permanently, and the trust model is silently defeated for that row."
+  {:decision-record 1.0
+   :code 0.95
+   :user-assertion 0.9
+   :session-log 0.7
+   :agent-note 0.65
+   :inferred 0.6})
+
+(defn confidence-ceiling [source-type]
+  (get source-ceilings source-type 0.9))
+
+;; ---------------------------------------------------------------------------
 ;; Assertion decisions
 ;; ---------------------------------------------------------------------------
 
@@ -263,6 +304,15 @@
       (fail (str "Unknown epistemic class " e)
             {:type :invalid-epistemic :given e :allowed epistemic-classes}))))
 
+(def epistemic-strength
+  "How much a class binds, as an order: an observation supersedes silently on
+  the next contradiction and fades by disuse, a commitment flags for a human
+  and never fades. Only ever applied to the class a caller STATED — the
+  resolved class is unusable for this, because resolve-epistemic fills in the
+  registry default and every ingest pass would then read as an escalation of
+  the facts it wrote last time (see decide-assert)."
+  {:observation 1 :preference 2 :commitment 3})
+
 (defn valid-interval-ok?
   "A valid-time interval is open (:t-invalid nil) or strictly positive."
   [{:keys [t-valid t-invalid]}]
@@ -272,10 +322,17 @@
   "Assemble the candidate fact. :id and :now are supplied by the shell so
   this stays deterministic. :t-valid/:t-invalid make valid time first-class
   on both ends — a closed past interval (\"true Jan through March\") is one
-  fact. Inverted intervals fail here."
+  fact. Inverted intervals fail here.
+
+  Confidence is clamped to the source-type's ceiling, the default 0.8 included:
+  a fact cannot be born above the trust its own source declares. The ingest
+  tiers each clamp their own candidates already, so this is the direct-assert
+  hole and their belt — and it has to be closed at birth, because
+  reinforced-confidence never claws a base back down (see source-ceilings)."
   [{:keys [id now subject predicate object-kind object-ref object
            t-valid t-invalid confidence epistemic scope source-type episode]}]
-  (let [t-valid (or t-valid now)]
+  (let [t-valid (or t-valid now)
+        source-type (or source-type :user-assertion)]
     (when-not (valid-interval-ok? {:t-valid t-valid :t-invalid t-invalid})
       (fail "Invalid interval: valid-until must be after valid-from"
             {:type :invalid-interval :t-valid t-valid :t-invalid t-invalid}))
@@ -289,10 +346,11 @@
      :t-invalid t-invalid
      :recorded-at now
      :last-reinforced-at now
-     :confidence (double (or confidence 0.8))
+     :confidence (min (confidence-ceiling source-type)
+                      (double (or confidence 0.8)))
      :epistemic epistemic
      :scope (or scope default-scope)
-     :source-type (or source-type :user-assertion)
+     :source-type source-type
      :episode episode}))
 
 (defn- same-object-pred [fact]
@@ -300,21 +358,30 @@
     #(= (get-in % [:object-ref :id]) (get-in fact [:object-ref :id]))
     #(= (:object-lit %) (:object-lit fact))))
 
-(def source-trust
-  "Trust rank per source-type (review §3.6): human decisions and mechanical
-  derivation at the top, extraction in the middle, agent inference at the
-  bottom. Drives two write-time defenses — a weaker source never silently
-  supersedes a stronger one, and non-trusted sources resurrecting a dead
-  value get flagged, not believed."
-  {:decision-record 3
-   :user-assertion 3
-   :code 3
-   :session-log 2
-   :failure-report 2
-   :agent-note 1
-   :inferred 1})
+(defn- escalation?
+  "Did the caller state a class that binds harder than the fact they just
+  re-asserted? An unstated class is nil and never escalates; neither does an
+  equal or weaker one, nor a class epistemic-strength does not recognise on
+  either side."
+  [stated-epistemic existing]
+  (let [stated (epistemic-strength stated-epistemic)
+        held (epistemic-strength (:epistemic existing))]
+    (boolean (and stated held (> stated held)))))
 
-(defn trust-rank [source-type] (get source-trust source-type 2))
+(defn- escalation-plan
+  "Supersede the weaker row rather than mutate it: the point of the escalation
+  is that the fact stops behaving like an observation, and the history has to
+  show it was one until now. A backdated escalation takes the flag path for
+  the same reason a backdated supersede does — closing the predecessor at a
+  valid-from earlier than its own leaves it valid at no instant at all."
+  [fact existing]
+  (let [effective-at (:t-valid fact)]
+    (if (> (ms (:t-valid existing)) (ms effective-at))
+      {:action :flag :fact fact :reason :backdated-overlap
+       :link [(:id existing)] :candidates [existing]}
+      {:action :supersede :fact fact
+       :invalidate [(:id existing)]
+       :effective-at effective-at})))
 
 (defn conflict-policy
   "Default policy from epistemic class: a commitment on either side of the
@@ -344,6 +411,16 @@
   world (or the user) just confirmed it, so its disuse clock resets and its
   confidence may rise toward the source ceiling.
 
+  One kind of re-assertion is not reinforcement: when the caller STATES a
+  class stronger than the standing fact holds (:stated-epistemic, strength
+  order in epistemic-strength) they are escalating it — \"this isn't just an
+  observation, we decided it\" — and reinforcement would carry the old class
+  forward and report the escalation as recorded. That supersedes instead, so
+  history reads observation-then-commitment. It keys off what the caller
+  stated and nothing else: the resolved class carries the predicate registry's
+  default, so comparing resolved values would make ingest-code supersede its
+  own :core/defined-in facts on every pass, unboundedly and silently.
+
   Two trust defenses (review §3.6) sit in the decision, both overridable
   with an explicit :on-conflict:
   - outranked supersede: a lower-trust source never silently closes a
@@ -352,7 +429,8 @@
     predicate) already lived through and invalidated (:revenants, gathered
     by the shell) is either stale or adversarial — it flags against the
     currently-live rivals (:reason :revenant) instead of quietly coexisting."
-  [{:keys [fact pred existing exclusion revenants rivals on-conflict]}]
+  [{:keys [fact pred existing exclusion revenants rivals on-conflict
+           stated-epistemic]}]
   (let [same? (same-object-pred fact)
         duplicate (first (filter same? existing))
         conflicting (vec (concat (when (= :one (:cardinality pred))
@@ -361,7 +439,9 @@
         new-trust (trust-rank (:source-type fact))]
     (cond
       duplicate
-      {:action :reinforce :existing duplicate :fact fact}
+      (if (escalation? stated-epistemic duplicate)
+        (escalation-plan fact duplicate)
+        {:action :reinforce :existing duplicate :fact fact})
 
       (seq conflicting)
       (let [effective-at (:t-valid fact)
@@ -429,20 +509,6 @@
 ;; ---------------------------------------------------------------------------
 ;; Confidence: reinforcement and disuse decay
 ;; ---------------------------------------------------------------------------
-
-(def source-ceilings
-  "Reinforcement raises confidence toward a class-appropriate ceiling, never
-  toward 1.0 — a fact the ingester re-derives 500 times must stay
-  distinguishable from a human decision."
-  {:decision-record 1.0
-   :code 0.95
-   :user-assertion 0.9
-   :session-log 0.7
-   :agent-note 0.65
-   :inferred 0.6})
-
-(defn confidence-ceiling [source-type]
-  (get source-ceilings source-type 0.9))
 
 (defn reinforced-confidence
   "New base confidence after a re-assertion: never lowered by weaker

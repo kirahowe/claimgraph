@@ -75,6 +75,62 @@
                              {:fact (candidate {}) :pred (assoc version-pred :cardinality :many)
                               :existing [existing-v1]}))))))
 
+(deftest a-stated-stronger-class-escalates-instead-of-reinforcing
+  ;; Reinforcement carries the EXISTING fact forward, so an escalation that
+  ;; reinforced was an escalation discarded: the fact stayed an observation —
+  ;; superseding silently on the next contradiction, decaying by disuse — and
+  ;; the caller was told it had been recorded.
+  (let [decide (fn [{:keys [stated resolved existing]}]
+                 (logic/decide-assert
+                  {:fact (candidate {:object "1.0"
+                                     :epistemic (or resolved stated :observation)})
+                   :pred version-pred
+                   :existing [existing]
+                   :stated-epistemic stated}))
+        commitment (assoc existing-v1 :epistemic :commitment)]
+    (testing "\"we decided it\" over an observation supersedes"
+      (let [d (decide {:stated :commitment :existing existing-v1})]
+        (is (= :supersede (:action d)))
+        (is (= ["f-old"] (:invalidate d)))
+        (is (= t1 (:effective-at d))
+            "the observation closes exactly where the commitment starts")))
+    (testing "the order is a ladder, not a commitment special case"
+      (is (= :supersede (:action (decide {:stated :preference :existing existing-v1})))))
+    (testing "an equal or weaker stated class changes nothing"
+      (is (= :reinforce (:action (decide {:stated :observation :existing existing-v1}))))
+      (is (= :reinforce (:action (decide {:stated :observation :existing commitment})))))
+    (testing "an unstated class never escalates, whatever it resolved to"
+      ;; the regression that would hurt most, because it is silent and grows the
+      ;; store without bound: :core/decided-against DEFAULTS to :commitment, so
+      ;; comparing resolved values makes a tier that states :observation
+      ;; supersede its own facts on every pass
+      (is (= :reinforce (:action (decide {:stated nil :resolved :commitment
+                                          :existing existing-v1})))))
+    (testing "a backdated escalation flags rather than closing a row before it opened"
+      (let [d (logic/decide-assert
+               {:fact (candidate {:object "1.0" :epistemic :commitment
+                                  :t-valid #inst "2025-06-01T00:00:00Z"})
+                :pred version-pred :existing [existing-v1]
+                :stated-epistemic :commitment})]
+        (is (= :flag (:action d)))
+        (is (= :backdated-overlap (:reason d)))
+        (is (= ["f-old"] (:link d)))))))
+
+(deftest a-fact-is-born-no-higher-than-its-source-ceiling
+  (testing "an explicit confidence above the source's ceiling is clamped at birth"
+    (is (= 0.7 (:confidence (candidate {:source-type :session-log :confidence 0.95}))))
+    (is (= 0.65 (:confidence (candidate {:source-type :agent-note :confidence 1.0}))))
+    (is (= 0.9 (:confidence (candidate {:confidence 0.99})))
+        "no source-type means :user-assertion, capped like any other"))
+  (testing "the 0.8 default is not an exemption"
+    (is (= 0.6 (:confidence (candidate {:source-type :inferred})))))
+  (testing "sources that outrank the default keep what they claim"
+    (is (= 0.8 (:confidence (candidate {:source-type :code}))))
+    (is (= 0.95 (:confidence (candidate {:source-type :code :confidence 0.99}))))
+    (is (= 1.0 (:confidence (candidate {:source-type :decision-record :confidence 1.0}))))
+    (is (= 0.9 (:confidence (candidate {:source-type :failure-report :confidence 0.95})))
+        "a source-type with no ceiling row falls back to 0.9, not to no cap")))
+
 (deftest loose-object-matching
   (is (logic/same-object-loosely?
        {:object-kind :entity :object-ref {:name "GraphQL"}}

@@ -314,7 +314,12 @@
 
   Re-asserting an existing fact reinforces it: the disuse clock resets and
   base confidence rises toward the source ceiling (never above it, never
-  down)."
+  down). Re-asserting it with an explicitly stronger :epistemic supersedes
+  instead — escalating an observation to a commitment changes how the fact
+  behaves, and history keeps both rows rather than editing the class in place.
+
+  :confidence is capped at the :source-type's ceiling; a low-trust source
+  cannot mint a fact above the trust it declares."
   [s {:keys [subject subject-type subject-scope predicate
              object object-type object-scope object-kind
              epistemic scope confidence source-type episode on-conflict
@@ -323,6 +328,11 @@
     (logic/fail "Object required" {:type :missing-object}))
   (let [pred-id (resolve-predicate-id s predicate)
         pred (ensure-predicate! s pred-id)
+        ;; the caller's own word on the class, kept apart from the resolved
+        ;; value all the way to the decision: only a STATED class escalates a
+        ;; re-assertion, and the registry default resolve-epistemic supplies
+        ;; would make every ingest pass look like one
+        stated-epistemic (logic/->kw epistemic)
         obj-scope (or object-scope logic/default-scope)
         kind (logic/resolve-object-kind
               pred (logic/->kw object-kind)
@@ -341,7 +351,7 @@
                                 :t-valid t-valid
                                 :t-invalid t-invalid
                                 :confidence confidence
-                                :epistemic (logic/resolve-epistemic pred (logic/->kw epistemic))
+                                :epistemic (logic/resolve-epistemic pred stated-epistemic)
                                 :scope scope
                                 :source-type (logic/->kw source-type)
                                 :episode episode})
@@ -373,6 +383,7 @@
                                                                      (not (logic/fact-valid-at? % t-now)))
                                                                raw)
                                            :rivals same-pred-valid
+                                           :stated-epistemic stated-epistemic
                                            :on-conflict (logic/->kw on-conflict)}))))
 
 ;; ---------------------------------------------------------------------------

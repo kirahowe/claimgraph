@@ -185,6 +185,93 @@
         (is (= :superseded (:status r)))
         (is (= 1 (count (:facts (core/get-facts s {:entity "ADR-7"})))))))))
 
+(deftest stating-a-stronger-class-escalates-the-fact
+  ;; "This isn't just an observation, we decided it" used to come back
+  ;; :reinforced with the fact still an observation: still superseding silently
+  ;; on the next contradiction, still decaying by disuse. The escalation was
+  ;; dropped and the caller was told it had been recorded.
+  (with-stores [s]
+    (core/ingest s {:source-type :code :ref "ingest-code"}
+                 [{:subject "auth.core" :predicate :core/defined-in
+                   :object "src/auth/core.clj" :object-kind :entity
+                   :class "observation" :source-type :code :confidence 0.95}])
+    (let [r (core/assert-fact s {:subject "auth.core" :predicate :core/defined-in
+                                 :object "src/auth/core.clj" :epistemic :commitment})]
+      (is (= :superseded (:status r)))
+      (is (= :commitment (get-in r [:fact :epistemic])))
+      (is (= 1 (count (:superseded r)))))
+    (testing "the graph holds the commitment and nothing beside it"
+      (is (= [:commitment] (mapv :epistemic (:facts (core/get-facts s {:entity "auth.core"}))))))
+    (testing "non-lossy: history shows it was an observation until now"
+      (let [history (:history (core/get-history s {:subject "auth.core"
+                                                   :predicate :core/defined-in}))
+            retired (first (filter :t-invalid history))
+            live (first (remove :t-invalid history))]
+        (is (= 2 (count history)))
+        (is (= :observation (:epistemic retired)))
+        (is (= :superseded (:invalidation-kind retired)))
+        (is (= (:id live) (:successor retired))
+            "the escalated row names its successor like any other supersession")))
+    (testing "restating the same class reinforces — an escalation happens once"
+      (is (= :reinforced (:status (core/assert-fact
+                                   s {:subject "auth.core" :predicate :core/defined-in
+                                      :object "src/auth/core.clj"
+                                      :epistemic :commitment}))))
+      (is (= 2 (count (:history (core/get-history s {:subject "auth.core"
+                                                     :predicate :core/defined-in}))))
+          "no third row"))
+    (testing "and stating nothing reinforces, though the predicate defaults weaker"
+      (is (= :reinforced (:status (core/assert-fact
+                                   s {:subject "auth.core" :predicate :core/defined-in
+                                      :object "src/auth/core.clj"})))))))
+
+(deftest an-ingest-tier-never-escalates-its-own-facts
+  ;; The tiers state their class deliberately: ingest-code sets :observation,
+  ;; ingest-notes forces it onto everything — including :core/decided-against,
+  ;; whose registry default is :commitment. Key the escalation off the RESOLVED
+  ;; class and every pass supersedes what the last pass wrote: the store grows
+  ;; without bound, silently, and re-derivation stops meaning reinforcement.
+  (with-stores [s]
+    (let [pass #(core/ingest s {:source-type :agent-note :ref "notes"}
+                             [{:subject "api-layer" :predicate :core/decided-against
+                               :object "GraphQL" :object-kind :literal
+                               :class "observation" :source-type :agent-note
+                               :confidence 0.55}
+                              {:subject "auth.core" :predicate :core/defined-in
+                               :object "src/auth/core.clj" :object-kind :entity
+                               :class "observation" :source-type :code
+                               :confidence 0.95}])]
+      (is (= {:created 2} (:counts (pass))))
+      (is (= {:reinforced 2} (:counts (pass))) "the second pass only warms them")
+      (is (= {:reinforced 2} (:counts (pass))))
+      (is (= 2 (count (store/-all-facts s))) "three passes, two facts"))))
+
+(deftest a-fact-cannot-be-born-above-its-source-ceiling
+  (with-stores [s]
+    (testing "a low-trust source asking for high confidence is clamped, not believed"
+      (let [r (core/assert-fact s {:subject "svc" :predicate :core/prefers
+                                   :object "hot takes" :object-kind :literal
+                                   :source-type :session-log :confidence 0.99})]
+        (is (= :created (:status r)))
+        (is (= 0.7 (get-in r [:fact :confidence])))))
+    (testing "the clamp is what the store holds, not a view over it"
+      (is (= [0.7] (mapv :confidence (:facts (core/get-facts s {:entity "svc"}))))))
+    (testing "reinforcement cannot lift it past the ceiling either"
+      ;; the reason birth has to be capped: nothing downstream ever claws a
+      ;; base back down
+      (let [r (core/assert-fact s {:subject "svc" :predicate :core/prefers
+                                   :object "hot takes" :object-kind :literal
+                                   :source-type :session-log :confidence 0.99})]
+        (is (= :reinforced (:status r)))
+        (is (= 0.7 (get-in r [:fact :confidence])))))
+    (testing "sources at or above the default are untouched"
+      (is (= 1.0 (get-in (core/assert-fact s {:subject "ADR-3"
+                                              :predicate :core/decided-against
+                                              :object "GraphQL" :object-kind :literal
+                                              :source-type :decision-record
+                                              :confidence 1.0})
+                         [:fact :confidence]))))))
+
 (deftest conflict-links-round-trip
   (with-stores [s]
     (core/assert-fact s {:subject "ADR-9" :predicate :core/has-status :object "accepted"})
