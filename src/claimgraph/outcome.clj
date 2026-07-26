@@ -20,10 +20,18 @@
 
 (defn log-file [db] (str db ".retrievals"))
 
-(defn- append! [db m]
+(defn- append!
+  "One entry, stamped. The stamp is epoch millis rather than an encoded date
+  because this log never leaves the machine that wrote it — see
+  claimgraph.wire on which artifacts carry a Date and why. Without it an entry
+  cannot be aged out at all: the cap below is a line count, so a store that
+  goes quiet for a month keeps month-old retrievals as evidence of what was
+  useful, and `outcome accepted` reinforces on them."
+  [db m]
   (try
     (let [f (log-file db)]
-      (spit f (str (json/generate-string m) "\n") :append true)
+      (spit f (str (json/generate-string (assoc m :at (System/currentTimeMillis))) "\n")
+            :append true)
       ;; cap: keep the newest half when the log doubles the cap
       (let [lines (str/split-lines (slurp f))]
         (when (> (count lines) (* 2 max-log-entries))
