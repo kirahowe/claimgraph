@@ -9,11 +9,17 @@
   Reads feed the outcome signal exactly like the CLI; the one write tool
   takes the write lease per call, so CLI and MCP writers stay serialized.
 
+  Encoding is claimgraph.wire's, not cheshire's, for the same reason the CLI's
+  is: this is a SECOND surface onto the same facts, and an agent that reads a
+  fact here and diffs it against the committed dump (or against the CLI's
+  answer) must not find a different :recorded-at because cheshire's default
+  date encoder dropped the milliseconds on one of the two paths.
+
   Wire it up:  claude mcp add claimgraph -- bin/claim mcp
   (or any MCP client; --db as usual)."
-  (:require [cheshire.core :as json]
-            [claimgraph.core :as core]
-            [claimgraph.store :as store]))
+  (:require [claimgraph.core :as core]
+            [claimgraph.version :as version]
+            [claimgraph.wire :as wire]))
 
 (def protocol-version "2024-11-05")
 
@@ -136,7 +142,10 @@
     (= method "initialize")
     (result id {:protocolVersion protocol-version
                 :capabilities {:tools {}}
-                :serverInfo {:name "claimgraph" :version "0.1"}})
+                ;; the release, never a hand-kept literal: this string is what
+                ;; an MCP client shows and a bug report quotes, and one that
+                ;; drifts from `claim version` describes a build nobody has
+                :serverInfo {:name "claimgraph" :version version/release}})
 
     (= method "tools/list")
     (result id {:tools tool-defs})
@@ -145,11 +154,11 @@
     (try
       (let [r (call-tool s db (:name params) (:arguments params))]
         (result id {:content [{:type "text"
-                               :text (json/generate-string r)}]
+                               :text (wire/generate-string r)}]
                     :isError false}))
       (catch Exception e
         (result id {:content [{:type "text"
-                               :text (json/generate-string
+                               :text (wire/generate-string
                                       (merge {:error (ex-message e)}
                                              (dissoc (ex-data e) :claimgraph/error)))}]
                     :isError true})))
@@ -174,9 +183,9 @@
       (when-let [line (.readLine in)]
         (when-not (clojure.string/blank? line)
           (when-let [resp (try
-                            (handle s db (json/parse-string line true))
+                            (handle s db (wire/parse-string line))
                             (catch Exception _
                               (rpc-error nil -32700 "Parse error")))]
-            (println (json/generate-string resp))
+            (println (wire/generate-string resp))
             (flush)))
         (recur)))))

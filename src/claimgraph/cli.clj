@@ -5,12 +5,14 @@
   lazily so --help and tests don't pay the pod tax."
   (:require [babashka.cli :as cli]
             [babashka.fs :as fs]
-            [cheshire.core :as json]
+            [clojure.java.io :as io]
             [clojure.string :as str]
             [claimgraph.config :as config]
             [claimgraph.core :as core]
             [claimgraph.logic :as logic]
-            [claimgraph.store :as store]))
+            [claimgraph.store :as store]
+            [claimgraph.version :as version]
+            [claimgraph.wire :as wire]))
 
 (def ^:private global-spec
   {:db {:desc "Database path (default: $CLAIMGRAPH_DB, .claimgraph/config.json, or ./.claimgraph/db)"}
@@ -26,8 +28,13 @@
   [opts]
   (update opts :command #(or % (config/value :extractor {}))))
 
-(defn- emit [opts data]
-  (println (json/generate-string data {:pretty (boolean (:pretty opts))})))
+(defn- emit
+  "Every command's output, through the canonical encoder. Command output is
+  not a lesser artifact than the dump: `facts`, `history` and `episode list`
+  all hand a caller timestamps, and a caller that diffs them against the dump
+  or its own clock deserves the same millisecond truth the store holds."
+  [opts data]
+  (println (wire/generate-string data {:pretty (boolean (:pretty opts))})))
 
 (defn- tty?
   "True when stdout is an interactive terminal — a human at a prompt, not a
@@ -84,9 +91,16 @@
 (defn cmd-init [{:keys [opts]}]
   (with-write-store opts
     (fn [s]
-      (emit opts {:status "initialized"
-                  :db (str (fs/canonicalize (db-path opts)))
-                  :predicates (count (store/-list-predicates s {}))}))))
+      ;; unconditionally, not just on a fresh store: seed! reconciles a
+      ;; predicate row to the seed's shape including REMOVALS, and this is the
+      ;; only path that reaches it. open-store seeds an empty store, so without
+      ;; this an upgrade keeps whatever the old vocabulary said forever — which
+      ;; is how a store went on reporting the non-bijective :inverse-of that
+      ;; e154b6d removed. core/seed!'s docstring promises `claim init` does it.
+      (let [r (core/seed! s)]
+        (emit opts {:status "initialized"
+                    :db (str (fs/canonicalize (db-path opts)))
+                    :predicates (:predicates r)})))))
 
 (defn cmd-assert [{:keys [opts]}]
   (with-write-store opts
@@ -233,7 +247,7 @@
                 (line-seq (java.io.BufferedReader. *in*)))
         facts (into []
                     (comp (remove str/blank?)
-                          (map #(logic/normalize-keys (json/parse-string % true))))
+                          (map #(logic/normalize-keys (wire/parse-string %))))
                     lines)]
     (with-write-store opts
       (fn [s]
@@ -308,7 +322,7 @@
   (let [consult (requiring-resolve 'claimgraph.coach/consult)]
     (if (:hook opts)
       ;; hook mode: harness JSON on stdin; print injection JSON or nothing
-      (let [input (try (json/parse-string (slurp *in*) true) (catch Exception _ {}))
+      (let [input (try (wire/parse-string (slurp *in*)) (catch Exception _ {}))
             query ((requiring-resolve 'claimgraph.coach/hook-input->query) input)]
         (when-not (str/blank? (str query))
           (with-store opts
@@ -352,14 +366,25 @@
     (emit opts (install (select-keys opts [:project :harness :settings-file
                                            :consolidate-days :coach :bin])))))
 
-(defn cmd-dump [{:keys [opts]}]
+(defn cmd-dump
+  "Export to stdout, or to --out with a report of what landed there.
+
+  The report carries BOTH counts, because one number cannot answer both
+  questions a caller asks of a JSONL artifact: :records is the graph (what
+  `load` will report back), :lines is the file (what `wc -l` says, header
+  included). Reporting only :records made the cheapest integrity check there
+  is — compare the count against the line count — flag every dump as
+  truncated by exactly one line."
+  [{:keys [opts]}]
   (with-store opts
     (fn [s]
       (let [records (core/dump s)
-            out (map #(json/generate-string %) records)]
+            out (wire/dump-lines records)]
         (if-let [f (:out opts)]
           (do (spit f (str (str/join "\n" out) "\n"))
-              (emit opts {:status "dumped" :records (count records) :out f}))
+              (emit opts {:status "dumped" :records (count records)
+                          :lines (count out)
+                          :format version/format-version :out f}))
           (doseq [line out] (println line)))))))
 
 (defn cmd-load [{:keys [opts]}]
@@ -368,7 +393,7 @@
                 (line-seq (java.io.BufferedReader. *in*)))
         records (into []
                       (comp (remove str/blank?)
-                            (map #(json/parse-string % true)))
+                            (map wire/parse-string))
                       lines)]
     (with-write-store opts
       (fn [s] (emit opts (core/load-dump
@@ -414,7 +439,7 @@
                    :no-judge (:no-judge opts)
                    :extractor (:extractor opts)})]
     (when-let [f (:out opts)]
-      (spit f (str (json/generate-string r {:pretty true}) "\n")))
+      (spit f (str (wire/generate-string r {:pretty true}) "\n")))
     ;; A human at a terminal gets the scorecard; a pipe, script, or agent
     ;; gets JSON. --pretty and --json force either way.
     (cond
@@ -467,6 +492,44 @@
                   :skills-dir (str (or (:skills-dir opts+)
                                        (fs/path project ".claude" "skills")))}))))
 
+(defn- source-checkout
+  "claimgraph's OWN checkout as {:sha ... :dirty ...}, located from where this
+  namespace was loaded from and never from the cwd — `claim version` run
+  inside a user's project must not report that project's sha as the tool's.
+  nil when claimgraph isn't running out of a git checkout at all. Both the git
+  shell-out and the process namespace that makes it are behind this call, so
+  only the version verb pays for either.
+
+  :dirty is not a nicety here. bin/claim execs bb against this checkout, so
+  every alpha user IS running editable source, and a sha reported off a
+  modified tree sends the maintainer to code the reporter was not running —
+  the one failure a version verb exists to prevent. Dirty is `git status
+  --porcelain`, the same signal ingest/code's ref uses, and it counts
+  untracked files on purpose: an untracked src/claimgraph/*.clj is loaded code
+  that exists on no machine but the reporter's. A status call that fails at
+  all reads as dirty — an unvouched sha is exactly as misleading as a stale
+  one, and only the marker says so."
+  []
+  (try
+    (let [url (io/resource "claimgraph/cli.clj")
+          root (when (= "file" (.getProtocol url))
+                 ;; src/claimgraph/cli.clj -> src/claimgraph -> src -> checkout
+                 (-> url .toURI java.io.File. .getParentFile .getParentFile .getParentFile))
+          sh (requiring-resolve 'babashka.process/sh)
+          {:keys [exit out]} (when root (sh {:dir (str root)} "git" "rev-parse" "HEAD"))]
+      (when (= 0 exit)
+        (when-let [sha (not-empty (str/trim out))]
+          (let [status (try (sh {:dir (str root)} "git" "status" "--porcelain")
+                            (catch Exception _ nil))]
+            {:sha sha
+             :dirty (or (not= 0 (:exit status))
+                        (not (str/blank? (:out status))))}))))
+    (catch Exception _ nil)))
+
+(defn cmd-version [{:keys [opts]}]
+  (let [{:keys [sha dirty]} (source-checkout)]
+    (emit opts (version/describe sha dirty))))
+
 (def help-text "claimgraph — bi-temporal, epistemically-typed knowledge graph for coding-agent memory
 
 Usage: claim <command> [options]
@@ -498,6 +561,14 @@ Commands:
   config              Show every setting: resolved value, which layer set it
                         (flag/env/config-file/default), and the fully resolved
                         paths (db, notes dir, inject file, settings file, ...)
+  version             What is running here: the release version, the
+                        persisted-format version every dump/oplog/store stamps
+                        (a loader gates on that integer, not on the release),
+                        and the sha of claimgraph's own checkout when it runs
+                        from one — plus \"dirty\":true when that checkout has
+                        uncommitted or untracked changes, which means the sha
+                        alone does not describe the code that ran. Quote this
+                        in a bug report.
   audit               Consistency scorecard over the project's agent-memory
                         pile (CLAUDE.md, AGENTS.md, .cursorrules, .cursor/rules,
                         copilot instructions, auto-memory notes) — runs BEFORE
@@ -719,13 +790,24 @@ Commands:
                         rejected reinforces nothing and reports the facts
                         that were in play. Wire it to PR merge/close, or run
                         by hand; the rejection's lesson goes to ingest-failure.
-  dump                Export everything as JSONL [--out FILE]
+  dump                Export everything as JSONL [--out FILE]. The first line
+                        is a header record (\"record\":\"claimgraph-dump\", the
+                        persisted-format version, the claimgraph that wrote
+                        it), then the graph records one per line. Timestamps
+                        carry milliseconds, so validity intervals shorter than
+                        a second survive the file. --out reports :records (the
+                        graph) and :lines (the file, header included) — the
+                        second is what `wc -l` will say.
   load                Restore a store from a dump: --file F | stdin. The
                         two-way half of portability — fact/episode ids,
                         validity intervals, invalidation reasons, and
                         conflict links round-trip exactly (a raw restore;
                         the conflict machinery does NOT re-run). Refuses a
-                        store that already holds data.
+                        store that already holds data, and refuses a dump it
+                        cannot read in full rather than restoring the part it
+                        understands: a pre-alpha dump (no header, kinds keyed
+                        on \"type\") lost its entity types when it was written,
+                        so re-dump from the source store instead.
   mcp                 Serve the graph over MCP (stdio): the store opens once
                         per session instead of paying the ~350ms bb+pod cold
                         start per call. Tools: memory_facts, memory_search,
@@ -765,6 +847,7 @@ Commands:
     :spec {:file {:coerce []} :dir {:coerce []}
            :no-code {:coerce :boolean} :no-judge {:coerce :boolean}}}
    {:cmds ["config"] :fn cmd-config}
+   {:cmds ["version"] :fn cmd-version}
    {:cmds ["init"] :fn cmd-init}
    {:cmds ["assert"] :fn cmd-assert :spec {:confidence {:coerce :double}}}
    {:cmds ["facts"] :fn cmd-facts :spec {:min-confidence {:coerce :double}
@@ -826,7 +909,7 @@ Commands:
     (cli/dispatch table (vec args) {:spec global-spec})
     (catch clojure.lang.ExceptionInfo e
       (binding [*out* *err*]
-        (println (json/generate-string
+        (println (wire/generate-string
                   (merge {:error (ex-message e)}
                          (dissoc (ex-data e) :claimgraph/error))
                   {:pretty true})))
