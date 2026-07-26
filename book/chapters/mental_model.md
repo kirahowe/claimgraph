@@ -1,12 +1,10 @@
 # The mental model
 
-Everything in claimgraph follows from a handful of commitments. This chapter
-states them once, in order, so the executable chapters can move fast.
+Everything in claimgraph follows from a handful of commitments. This chapter goes over the mental model that's useful to keep in mind in order to understand how claimgraph works.
 
-## A fact is a claim with a biography
+## A fact is a claim with metadata
 
-The unit of storage is not a triple but a reified edge: a first-class record
-that says *subject, predicate, object* and then keeps talking.
+The unit of storage is not a plain triple, think of it more like a reified edge. Claims are first-class records in the shape of a *subject, predicate, object* triple, but each one also carries its own bundle of metadata that enable the various key features of claimgraph. It looks like this:
 
 ```clojure
 {:id          "f-1a2b..."
@@ -27,80 +25,53 @@ that says *subject, predicate, object* and then keeps talking.
  :conflicts   []}                 ; links to rival facts, when flagged
 ```
 
-The metadata bundle is the entire point. It is what a line of markdown
-cannot carry, and each field drives real behavior: the clocks drive time
-travel, the epistemic class drives conflict policy, the source type drives
-trust and confidence ceilings, the episode drives provenance and audit.
+These metadata are what lines of markdown can't carry. Each field drives a certain behaviour. The timestamps power the time travel features of the system, the epistemic class drives conflict policy, the source type drives trust and confidence ceilings, the episode drives provenance and audit.
 
-## Two clocks, and nothing is ever deleted
+## Two timestamps, and nothing is ever deleted
 
 Valid time (`t-valid` to `t-invalid`) is when a fact was true of the world.
-Transaction time (`recorded-at`) is when the store learned it. Temporal
-databases have kept these apart since the 1990s
-([Snodgrass](https://www2.cs.arizona.edu/~rts/tdbbook.pdf)); [Datomic](https://www.datomic.com/),
-[XTDB](https://xtdb.com/), and [Graphiti](https://github.com/getzep/graphiti) carried the pattern into modern stores, and claimgraph
-models it as explicit attributes so the logic is identical across storage
-backends.
+Transaction time (`recorded-at`) is when the store learned it. Temporal databases have existed since the 1990s (e.g. [Snodgrass](https://www2.cs.arizona.edu/~rts/tdbbook.pdf)). Modern databases like [Datomic](https://www.datomic.com/), [XTDB](https://xtdb.com/), and [Graphiti](https://github.com/getzep/graphiti) carried the pattern into modern stores, and claimgraph borrows this idea.
 
-The consequence with the most reach: **contradiction closes an interval, it
-does not erase a record.** When `has-version 2.0.0` supersedes
-`has-version 1.0.0`, the old fact's `t-invalid` is set to the new fact's
-`t-valid` and both remain queryable forever. Three query verbs fall out for
-free:
+The most consequential effect of modelling time this way is that the past is immutable. Contradiction closes an interval, it
+does not erase a record. When `has-version 2.0.0` supersedes `has-version 1.0.0`, the old fact's `t-invalid` is set to the new fact's
+`t-valid` and both remain queryable forever. Three query verbs fall out for free:
 
 - *current truth*: facts whose interval is open now,
 - *as-of*: facts whose interval contains an arbitrary timestamp,
-- *history*: every version of (subject, predicate), in order, with the
-  reasons intervals closed.
+- *history*: every version of (subject, predicate), in order, with the reasons intervals closed.
 
-"What did we believe in March, and why did it change" is a query, not an
-archaeology project.
+This enables queries like "What did we believe in March, and why did it change".
 
 ## Three kinds of claims, three revision behaviors
 
-Every fact carries an epistemic class, and the class decides what happens
-when a new fact contradicts a standing one:
+Every fact carries an epistemic class, and the class decides what happens when a new fact contradicts an existing one:
 
 | Class | What it is | On contradiction |
 |---|---|---|
-| `observation` | something derived or verifiable ("imports X") | supersede: close the old interval, keep it in history |
-| `preference` | a stylistic or tooling stance ("prefers small PRs") | supersede, history retained |
-| `commitment` | a human decision ("we decided against GraphQL") | **flag**: both facts stay valid, the conflict surfaces for a human |
+| `observation` | something derived or verifiable ("imports X") | supersede (close the old interval, keep it in history) |
+| `preference` | a stylistic or tooling stance ("prefers small PRs") | supersede |
+| `commitment` | a human decision ("we decided against GraphQL") | **flag**: both facts stay valid, the conflict surfaces for a human to review |
 
-Observations should update themselves when the world changes; that is what
-being an observation means. A commitment is different in kind: it is a
-decision someone made, often for reasons the code cannot show, and no
-quantity of new evidence should silently overwrite it. Flagged conflicts
-stay open until a human (or an offline judge, for the easy classes) rules.
-This is the practical shape of belief-revision theory's insistence that
-entrenched beliefs need more than a newer timestamp to displace
-([AGM 1985](https://doi.org/10.2307/2274239)).
+Observations update themselves when the world changes. A commitment is a different kind of fact. It's a decision someone made, often for reasons the code cannot show, and these should never be silently overwritten. Flagged conflicts stay open until a human (or an offline judge, for easy classes of contradictions) rules. This is one implementation of belief-revision theory's insistence that
+entrenched beliefs need more than a newer timestamp to displace (see [AGM 1985](https://doi.org/10.2307/2274239)).
 
-The predicate vocabulary encodes the defaults: 23 curated `core/*`
-predicates, each carrying its object kind, cardinality, default epistemic
-class, and an anchor into established vocabularies ([PROV-O](https://www.w3.org/TR/prov-o/), [SPDX](https://spdx.dev/), [DOAP](https://github.com/ewilderj/doap),
-[Dublin Core](https://www.dublincore.org/specifications/dublin-core/dcmi-terms/)). Unknown predicates are rejected with a did-you-mean
-suggestion; genuinely new relations go to an `x/*` staging namespace and
-earn promotion by use.
+## Fixed vocabulary
+
+The predicate vocabulary encodes 23 curated `core/*` predicates by default, each carrying its object kind, cardinality, default epistemic class, and an anchor into established vocabularies ([PROV-O](https://www.w3.org/TR/prov-o/), [SPDX](https://spdx.dev/), [DOAP](https://github.com/ewilderj/doap), [Dublin Core](https://www.dublincore.org/specifications/dublin-core/dcmi-terms/)). Unknown predicates are rejected with a did-you-mean suggestion; genuinely new relations go to an `x/*` staging namespace and earn promotion by use. This keeps the vocabulary from degrading into mess of similar but unharmonized predicates, but also from going stale as legitimately new predicates enter the system.
 
 ## Sources have rank, and confidence has ceilings
 
 Where a fact came from bounds how much weight it can ever carry:
 
-| Source | Trust rank | Confidence ceiling |
+| Source | Trust rank (higher is more) | Confidence ceiling (higher is more) |
 |---|---|---|
 | `decision-record`, `user-assertion`, `code` | 3 | 1.0 / 0.9 / 0.95 |
 | `session-log`, `failure-report` | 2 | 0.7 |
 | `agent-note`, `inferred` | 1 | 0.65 / 0.6 |
 
-Re-asserting an existing fact reinforces it: the disuse clock resets and
-base confidence rises toward the source's ceiling, never above it, and never
-by repetition alone. A fact the code ingester re-derives five hundred times
-stays distinguishable from a human decision.
+Re-asserting an existing fact reinforces it. Facts decay in confidence over time, but if they are re-asserted their disuse clock resets and base confidence rises toward the source's ceiling, but never above it, and never by repetition alone. This is how a fact the code ingester re-derives five hundred times stays distinguishable and always carries less weight than a human decision.
 
-Rank powers two write-path defenses that exist because memory poisoning is a
-demonstrated attack ([MINJA](https://arxiv.org/abs/2503.03704)), not a
-hypothetical:
+Rank powers two write-path defenses that exist because memory poisoning is a real problem now. Even in a non-adversarial system (like this one),  ([MINJA](https://arxiv.org/abs/2503.03704)), not a hypothetical:
 
 - **Outranked writes cannot supersede.** A session note cannot silently
   replace what a decision record established; it flags instead.
