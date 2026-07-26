@@ -127,11 +127,12 @@
 ;; | Path | Owner | Contents |
 ;; |---|---|---|
 ;; | `<db>/` | store backend | the LMDB directory (gitignored; the dump is the committable artifact) |
-;; | `<db>.evidence/` | evidence tier | immutable content-addressed raw inputs, named by sha-256 |
+;; | `<db>.evidence/` | evidence tier | immutable content-addressed raw inputs, named `sha256-<hex>` — the tag is what lets the hash function ever change |
 ;; | `<db>.oplog/` | multi-writer | `writer` (this machine's id), `<writer>.jsonl` per-writer effect logs, `applied.json` high-water marks and entity map |
 ;; | `<db>.retrievals` | outcome signal | append-only log of which facts reads surfaced |
 ;; | `<db>.lock` | lease | same-machine write serialization (token, TTL) |
-;; | `<db>.last-consolidate` | hooks | stamp gating the weekly consolidate |
+;; | `<db>.last-consolidate` | hooks | stamp gating the weekly consolidate; the instant it records is the authority, not the file's mtime, which any syncer rewrites |
+;; | `<db>.version` | store backend | the persisted-format version this store was written at; a store from a future format is refused rather than schema-merged |
 ;;
 ;; ## Reading order
 ;;

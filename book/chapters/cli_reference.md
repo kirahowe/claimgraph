@@ -1,11 +1,17 @@
 # CLI reference
 
-Every command accepts `--db PATH` and `--pretty`. Output is JSON on stdout;
-errors are JSON on stderr with exit code 1, so everything composes with
-shell tooling and the skill alike. Every setting resolves flag > env var >
-`.claimgraph/config.json` > default; `claim config` shows each one's value
-and provenance. `bin/claim help` is the authoritative, always-current
-version of this list.
+Every command accepts `--db PATH` and `--pretty`. Output is JSON on stdout —
+except `dump`, which writes JSONL, `mcp`, which speaks JSON-RPC, `coach
+--hook`, which prints nothing when the gate holds, and `audit`, which shows a
+human scorecard at a terminal. Errors are JSON on stderr, and there are three
+exit codes rather than one, because a typo and a failure want different
+responses: `0` succeeded, `1` ran and could not do what it was asked, `2` was
+a command line claimgraph could not act on at all. A judge that could not
+reach its model is worth retrying; a misspelled verb in a hook never is.
+
+Every setting resolves flag > env var > `.claimgraph/config.json` > default;
+`claim config` shows each one's value and provenance. `bin/claim help` is the
+authoritative, always-current version of this list.
 
 ## Onboarding and configuration
 
@@ -19,7 +25,8 @@ version of this list.
 
 | Command | Does |
 |---|---|
-| `init` | Create the store and seed the 23-predicate vocabulary (`setup` calls this) |
+| `init` | Create the store and seed the 23-predicate vocabulary (`setup` calls this). Re-seeding reconciles an existing store's rows to the current vocabulary, including fields the seed has dropped — this is the upgrade path |
+| `version` | The release, the persisted-format version, and the source sha when running from a checkout (marked `dirty` when the tree is modified) — what a bug report should quote |
 | `assert` | One fact through validation and conflict resolution: `--subject --predicate --object`, with `--class`, `--source-type`, `--confidence`, `--scope`, `--valid-from/--valid-until`, `--on-conflict` |
 | `invalidate` | Close a fact's validity interval: `--fact-id`, `--reason`, `--at` (when it stopped being true) |
 | `ingest` | Batch-assert JSONL (file or stdin) under one episode |
@@ -51,7 +58,7 @@ version of this list.
 | Command | Does |
 |---|---|
 | `ingest-code` | Mechanical multi-language analysis through the adapter registry (Clojure via edamame, Kotlin via line parse, TS/JS via pinned dependency-cruiser, `code-analyzers` config for your own); reconciling, no LLM, 0.95 confidence; `--language` filters to one analyzer; missing tooling skips with a hint |
-| `session-extract` | LLM extraction from transcripts; capped 0.7, `--dry-run`, pluggable `--extractor` |
+| `ingest-session` | LLM extraction from transcripts; capped 0.7, `--dry-run`, pluggable `--extractor`. `session-extract` is the older name and still works |
 | `ingest-notes` | The ambient tier: harness auto-memory, delta-detected, capped 0.65, never commitments |
 | `ingest-adr` | Mechanical decision-record parsing at full authority |
 | `ingest-failure` | Lessons from rejected work; failure modes, valence, evidence kept |

@@ -57,8 +57,11 @@ claim setup                           # the whole onboarding, one idempotent com
 ```
 
 `claim setup` creates and seeds the store (`./.claimgraph/db`), gitignores
-the live store (the committable artifacts are `claim dump` output and
-`.claimgraph/config.json`), installs the agent skill into
+it and every sibling it writes — the lock, the evidence dir, the oplog, the
+retrieval log, the consolidation stamp, the format stamp — in one
+marker-delimited block, so a later release that adds a sibling edits the
+block instead of appending a second one (the committable artifacts are
+`claim dump` output and `.claimgraph/config.json`), installs the agent skill into
 `.claude/skills/claimgraph/` (the judgment layer: when to consult, when to
 record, how to phrase facts), and wires the ambient loop — a SessionEnd hook
 so every session ends by feeding the graph and the next one starts with its
@@ -79,7 +82,7 @@ pile for internal consistency. `claim audit` points claimgraph's conflict
 machinery at it and prints a scorecard:
 
 ```
-$ bin/claim audit --pretty
+$ bin/claim audit --scorecard
   87 claims extracted from 4 files
    7 contradictions   (opposed claims coexisting in the pile)
   12 disagreements    (same subject, different values — the last one read silently wins)
@@ -94,7 +97,9 @@ real store is never opened, and `dtlv` isn't needed — the only
 prerequisites are `bb` and an extractor command (`claude -p` by default).
 Every finding carries verbatim quote receipts, an LLM judge pass filters
 the false positives (skip it with `--no-judge`), and `--out report.json`
-keeps the full JSON. The staleness-vs-code prong covers every language the
+keeps the full JSON. The scorecard is what a terminal gets and what
+`--scorecard` forces anywhere; piped or `--json` output is the findings as
+JSON, so `audit | jq` and `audit` read by a human are the same run. The staleness-vs-code prong covers every language the
 analyzer registry detects (Clojure, Kotlin, TypeScript/JavaScript, plus
 anything added via `code-analyzers`) and skips honestly when nothing is
 detected; every other finding class works on any repo. The findings are precisely the
@@ -131,8 +136,32 @@ bin/claim facts --entity AuthService --as-of 2026-03-01    # time travel
 bin/claim history --subject AuthService --predicate depends-on
 ```
 
-All commands emit JSON to stdout (`--pretty` for humans); errors are JSON on
-stderr with exit 1. Run `bin/claim help` for the full verb list.
+Scope is a namespace on the entity before it is a label on the fact. Every
+entity lives in one (`project` by default) and a name only resolves within
+it: `--subject-scope` / `--object-scope` place the entities an `assert`
+mints, `--entity-scope` (`--subject-scope` on `history`) picks the scope a
+read resolves in, and the `entity` verbs take `--scope`. A fact's own
+`--scope` is carried on the claim and filtered on read — asserting `--scope
+module:auth` alone leaves the subject and object in `project`, which is
+where the next read goes looking for them.
+
+A query is a bare word or a flag — `search "GraphQL"` and `search --query
+"GraphQL"` are the same call, as are `recall`, `coach`, and `outcome
+accepted` / `outcome --valence accepted`. Put flags *before* the bare word:
+option parsing stops at the first one, so `search "GraphQL" --db other/db`
+reads the query and silently ignores the store you named.
+
+Commands emit JSON to stdout (`--pretty` for humans) and JSON errors to
+stderr. Three exit codes, because a typo and a failure are different
+problems: **0** success, **1** the command ran and could not do what it was
+asked, **2** the command line itself was wrong (unknown verb, a verb missing
+its subcommand, a flag value that would not parse — the error names the
+option and the value). Four verbs answer with something other than one JSON
+object: `dump` writes JSONL, `mcp` speaks JSON-RPC over stdio, `audit`
+prints its scorecard at a terminal (above), and `coach --hook` prints
+nothing at all unless the gate fires. `bin/claim version` says which
+claimgraph and which persisted format is running; `bin/claim help` is the
+full verb list.
 
 ## Configuration
 
@@ -145,22 +174,35 @@ layer set it, and the fully resolved paths.
 |---|---|---|---|
 | store path | `--db` | `CLAIMGRAPH_DB` | `./.claimgraph/db` |
 | harness | `--harness` | `CLAIMGRAPH_HARNESS` | `claude-code` |
-| auto-memory notes dir | `--dir` | `CLAIMGRAPH_NOTES_DIR` | per harness, honoring `$CLAUDE_CONFIG_DIR` / `$CODEX_HOME` |
+| auto-memory notes dir | `--notes-dir` | `CLAIMGRAPH_NOTES_DIR` | per harness, honoring `$CLAUDE_CONFIG_DIR` / `$CODEX_HOME` |
 | inject file (write-back target) | `--inject-file` | `CLAIMGRAPH_INJECT_FILE` | per harness: `MEMORY.md` / `memory_summary.md` |
 | hook-settings file | `--settings-file` | `CLAIMGRAPH_SETTINGS_FILE` | `<project>/.claude/settings.json` |
 | skills dir (`setup`) | `--skills-dir` | `CLAIMGRAPH_SKILLS_DIR` | `<project>/.claude/skills` |
 | LLM command | `--extractor` / `--command` | `CLAIMGRAPH_LLM_CMD` | `claude -p` |
+| LLM call timeout (ms) | `--llm-timeout-ms` | `CLAIMGRAPH_LLM_TIMEOUT_MS` | `120000` |
 | raw-evidence dir | `--evidence-dir` | `CLAIMGRAPH_EVIDENCE_DIR` | `<db>.evidence` |
 | consolidation cadence (days) | `--consolidate-days` | `CLAIMGRAPH_CONSOLIDATE_DAYS` | `7` |
 | ambient code refresh | `--code-ingest` | `CLAIMGRAPH_CODE_INGEST` | `session-end` (or `manual`) |
+
+A setting's name is its flag, always: `--notes-dir` sets `notes-dir`. Where a
+flag was renamed the old spelling still works on the verbs that took it —
+`--dir` for the notes dir, and for `ingest-code`'s `--project`,
+`ingest-adr`'s `--adr-dir` and each of `audit`'s repeatable `--scan-dir`
+(both spellings add, neither shadows); `--min-confidence` for `judge` and
+`consolidate`'s `--min-verdict-confidence`, which gates a verdict's own
+confidence rather than filtering facts on read.
 
 The config file is JSON keyed by the kebab-case setting names
 (`{"harness": "codex", "notes-dir": "/mnt/notes"}`), lives at
 `$CLAIMGRAPH_CONFIG` or `./.claimgraph/config.json`, and is **committable**
 — `claim setup` writes the non-default choices you pass it, so one person's
-choices hold for every writer of the repo. Two more env vars sit below the
+choices hold for every writer of the repo. It carries a `config-version`
+stamp (see below), and a key claimgraph does not recognise — a misspelling
+resolves to nothing and changes nothing — is named on stderr and in `claim
+config` rather than silently ignored. Two more env vars sit below the
 settings layer: `$CLAIMGRAPH_DTLV` (path to the pod binary, default from
-`$PATH`) and `$CLAIMGRAPH_WRITER` (this machine's oplog writer id).
+`$PATH`) and `$CLAIMGRAPH_WRITER` (this machine's oplog writer id, and only
+until the store has one of its own — see Maintenance).
 
 One structured setting lives in the config file only (structured values
 don't fit flags/env): a `code-analyzers` map tunes the language-analyzer
@@ -170,6 +212,29 @@ interchange format (`{"rust": {"detect": "**.rs", "command": "my-rust-deps
 <roots>"}}` — one JSON object per source unit with `unit`, `file`,
 `requires`, `language`; JSONL or a JSON array). Rust or Python support is a
 ten-line script in your repo, no claimgraph change.
+
+## Versions and formats
+
+`claim version` says what is running — the release (`0.1.0-alpha`), the
+persisted-format version (`1`), and the sha of claimgraph's own checkout when
+it runs from one, with `"dirty": true` beside it when that checkout has
+uncommitted or untracked changes and the sha therefore doesn't describe the
+code that ran. That is the thing to quote in a bug report.
+
+Two numbers because they answer different questions. The release moves
+whenever anything ships; the format version moves only when an old reader
+would get a *new* file wrong, and it is the integer stamped into every
+artifact that crosses a machine or a version boundary: the dump's header
+line, every oplog line and `applied.json`, the store's `<db>.version`
+sibling, and `config-version` in `.claimgraph/config.json`. Each of those is
+gated on the integer, never on the release string. A stamp above this build's
+number is refused with "upgrade claimgraph"; a stamp that isn't a format
+number at all is refused differently and never overwritten, because no
+claimgraph wrote it and upgrading fixes nothing. The store's stamp is a
+sibling file rather than a row inside the store because Datalevin merges a
+schema as it opens: a stamp in the store would be written by the very call
+meant to check it. The known cost is that `cp -r db/` alone leaves the stamp
+behind — along with the oplog, which is the actual record.
 
 ## How conflicts resolve
 
@@ -191,6 +256,14 @@ from the epistemic class:
   **reinforce**: the world (or the user) just confirmed the fact, so its
   disuse clock resets and its confidence may rise toward a per-source ceiling
   — never above it, never down, and never by repetition alone.
+- **A stronger class escalates instead of reinforcing.** Re-asserting the same
+  claim with an explicitly stated stronger epistemic class (observation →
+  preference → commitment) supersedes, so "this isn't just something we
+  noticed, we decided it" reads as a change in history rather than another
+  reinforcement of an observation — which would keep the fact fading by
+  disuse and superseding silently. Only a class the caller *stated* counts:
+  the predicate registry's default is not a statement, or every mechanical
+  re-ingest would supersede its own facts and grow the store without bound.
 - **Exclusion groups** widen detection across predicates: registry rows can
   declare mutually-exclusive stances toward the same object (`prefers` /
   `decided-against` share the `:stance` group; `supersedes`/`superseded-by`
@@ -200,6 +273,15 @@ from the epistemic class:
   Groups are deliberately conservative: a false conflict nags the human, so
   only clearly-opposed pairs are declared; everything fuzzier goes to the
   sweep.
+
+An invalidated fact records what closed it, in fields rather than in prose:
+`invalidation-kind` (`superseded`, `judged-superseded`, `judged-duplicate`,
+`merge-duplicate`, `reconcile-duplicate`, `code-absent`, `manual`),
+`successor` (the fact-id that took its place — absent when nothing did, as
+when the code stopped saying it), and `invalidation-reason`, a sentence for
+humans that nothing parses. The kinds are an open set: a kind from a newer
+writer arrives verbatim and matches nothing, rather than being coerced into
+one this build happens to know.
 
 Flagged conflicts stay open until resolved. `claim conflicts` lists them;
 `claim judge` runs an LLM over each pair and classifies the relation —
@@ -309,7 +391,9 @@ CLI / skill front-end        src/claimgraph/cli.clj        arg parsing, JSON in/
    language-guarded: a skipped analyzer's facts are exempt, so degradation
    never invalidates what it didn't look at. The graph tracks the code with
    no LLM in the loop, and the ambient loop keeps it fresh (see Maintenance).
-2. **`session-extract`** — LLM extraction of durable knowledge (preferences,
+2. **`ingest-session`** (`session-extract` still dispatches, and always will
+   — the old name is in installed skills and hook command lines) — LLM
+   extraction of durable knowledge (preferences,
    decisions, gotchas, conventions) from a session transcript — plain text or
    Claude Code session JSONL. The extractor is pluggable: defaults to an
    already-authenticated `claude -p` (subscription-as-judge, ~$0 marginal),
@@ -347,10 +431,13 @@ CLI / skill front-end        src/claimgraph/cli.clj        arg parsing, JSON in/
 ## Raw evidence
 
 Extraction decides what to keep before knowing what a future query will
-hinge on (the write-before-query barrier), so `session-extract` and
+hinge on (the write-before-query barrier), so `ingest-session` and
 `ingest-notes` also keep their raw input: immutable, content-addressed
 artifacts in `<db>.evidence/`, pointed to by the episode they were extracted
-under. `bin/claim evidence --episode ID` returns the exact bytes —
+under. A pointer names the function that made it — `sha256-<64 hex>`, a
+hyphen because the string is a filename before it is an identifier — and
+pointers written before the tag existed still resolve. `bin/claim evidence
+--episode ID` returns the exact bytes —
 provenance past the summary, and nothing an extractor drops is
 unrecoverable. Notes-as-primary, transcripts-as-fallback: the artifacts are
 a local audit trail and don't ride the dump; the pointer does.
@@ -367,8 +454,13 @@ Commitments and decision-record facts never fade.
 Reinforcement is what counts as "use": re-asserting an existing fact (a
 session restates it, the code ingester re-derives it) resets its clock and
 raises its base toward a per-source ceiling (`decision-record` 1.0, `code`
-0.95, `user-assertion` 0.9, `session-log` 0.7, `inferred` 0.6) — so a fact
-re-derived 500 times stays distinguishable from a human decision. The
+0.95, `user-assertion` 0.9, `session-log` 0.7, `agent-note` 0.65, `inferred`
+0.6) — so a fact re-derived 500 times stays distinguishable from a human
+decision. The ceiling binds at birth too: `--confidence 0.99` on a
+`session-log` fact mints it at 0.7, because reinforcement is a high-water
+mark that never claws a base back down, so a fact born above its ceiling
+would sit there permanently. Raising a fact's confidence means raising the
+trust of the source it claims, not the number. The
 ingester synergy does most of the work: every code pass reinforces what the
 code still says, reconciliation invalidates what it stopped saying, and
 decay is left fading the session-derived facts nobody restates. Maintenance
@@ -425,26 +517,49 @@ scans never reinforce — only intent writes do.
   machines disagree, the job is to show a human the disagreement, and open
   conflicts are already how claimgraph does that.
 - On one machine, concurrent writers serialize through a **lease**
-  (`<db>.lock`: atomic, token-guarded, 30s TTL, so a crashed writer expires
-  instead of wedging the store). Reads never take it.
+  (`<db>.lock`: atomic, token-guarded). A holder renews it while it works, so
+  the 30s TTL bounds only how long a *dead* writer's lease outlives it — a
+  `consolidate` pass that shells out to a model fifty times no longer expires
+  under its own duration and hands a waiting writer a lease it was right to
+  think dead. A writer that loses the lease anyway (a suspended laptop, a
+  hand-deleted lock file) still finishes its work and then fails with
+  `lease-lost` and the report of what it wrote: nothing may report an
+  unserialized write as a serialized one. A blocked writer waits
+  `--lease-wait` ms (default 5000) before erroring with the holder's name.
+  Reads never take it.
 - `dump` / `load` — the portability story, two-way: `dump` exports everything
   as JSONL (the live LMDB directory is gitignored; the dump is the committable
   artifact), `load` restores a fresh store from it — fact/episode ids,
-  validity intervals, invalidation reasons, and conflict links round-trip
-  exactly (a raw restore; the conflict machinery does not re-run). Multi-
-  machine users of the ambient loop converge through the committed dump.
+  validity intervals, invalidations with their kind and successor, and
+  conflict links round-trip exactly (a raw restore; the conflict machinery
+  does not re-run). The first line is a header record naming the format
+  version, and `load` refuses anything it cannot read *in full* before it
+  writes a single row: a non-empty target, a file with no header and nothing
+  claimgraph stamped, a format above this build's, a pre-alpha dump (whose
+  entity types were destroyed at write time — re-dump from the source store).
+  Restoring the part it understood would leave a store that looks whole and
+  isn't. Multi-machine users of the ambient loop converge through the
+  committed dump.
 
 ## MCP front-end
 
 `bin/claim mcp` serves the graph over MCP stdio — the store (and the
 Datalevin pod) opens once per session instead of paying ~350ms of cold start
 per CLI call, which the ambient loop's per-prompt coach hook made worth
-fixing. Tools: `memory_facts`, `memory_search`, `memory_recall`,
-`memory_history`, `memory_conflicts`, `memory_coach`, and `memory_assert`
-(write-lease-guarded, full conflict machinery). Wire up: `claim setup --mcp`
-(writes the project's `.mcp.json`) or `claude mcp add claimgraph -- claim mcp`.
-The CLI and the skill remain the primary surface; MCP is the low-latency
-second front-end the handoff doc trigger-gated.
+fixing. Every tool is `memory_` plus its CLI verb — one rule instead of a
+list to memorize — so the eight are `memory_facts`, `memory_neighbor`,
+`memory_search`, `memory_recall`, `memory_history`, `memory_conflicts`,
+`memory_coach`, and `memory_assert` (write-lease-guarded, full conflict
+machinery, valid time on both ends like `assert`). Argument names are
+accepted in MCP's snake_case and claimgraph's kebab alike; results stay
+kebab, because they are the same records `claim facts` prints and `claim
+dump` commits. A tool name this server doesn't have fails at the transport,
+where the client's wiring is what's broken; a failure *inside* a tool comes
+back as a result carrying the CLI's exact error payload, so the model
+driving it reads the same hint a human would have seen on stderr. Wire up:
+`claim setup --mcp` (writes the project's `.mcp.json`) or `claude mcp add
+claimgraph -- claim mcp`. The CLI and the skill remain the primary surface;
+MCP is the low-latency second front-end the handoff doc trigger-gated.
 
 ## Benchmark
 
@@ -489,7 +604,7 @@ CLI uses, so an MCP front-end won't invalidate it.
 ## Tests
 
 ```bash
-bb test    # 168 tests / 994 assertions
+bb test    # 316 tests / 1925 assertions
 ```
 
 The core-semantics suite runs against BOTH store implementations (the proof of

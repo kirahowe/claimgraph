@@ -116,10 +116,12 @@ restated would fade identically to one nobody needs.
 
 `bin/claim mcp` serves the graph over stdio JSON-RPC. The store and the
 Datalevin pod open once per session instead of paying the cold start per
-CLI call, which matters once the coach hook runs on every prompt. Seven
+CLI call, which matters once the coach hook runs on every prompt. Eight
 tools: `memory_facts`, `memory_search`, `memory_recall`, `memory_history`,
-`memory_conflicts`, `memory_coach`, and `memory_assert` (lease-guarded,
-full conflict machinery). Wire it with:
+`memory_neighbor`, `memory_conflicts`, `memory_coach`, and `memory_assert`
+(lease-guarded, full conflict machinery). Arguments are accepted in either
+`snake_case` or `kebab-case`, since a model emits one and the CLI teaches
+the other; results are kebab throughout, matching the dump. Wire it with:
 
 ```bash
 claude mcp add claimgraph -- bin/claim mcp

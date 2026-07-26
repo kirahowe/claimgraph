@@ -58,9 +58,10 @@ Choose the epistemic class deliberately — it sets the conflict behavior:
 - **End of a substantial session**: extract durable knowledge from the
   transcript (preferred — review with `--dry-run` first):
   ```
-  bin/claim session-extract --file transcript.txt --ref <session-id> --dry-run
-  bin/claim session-extract --file transcript.txt --ref <session-id>
+  bin/claim ingest-session --file transcript.txt --ref <session-id> --dry-run
+  bin/claim ingest-session --file transcript.txt --ref <session-id>
   ```
+  (`session-extract` is the older name for this verb and still works.)
   Or batch hand-written facts under one episode (JSONL via stdin or file,
   snake_case or kebab-case keys, `class` = epistemic class):
   ```
