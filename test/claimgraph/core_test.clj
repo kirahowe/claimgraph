@@ -4,13 +4,91 @@
   test of the storage abstraction itself. Set CLAIMGRAPH_TEST_SKIP_DATALEVIN=1
   to run pod-free."
   (:require [babashka.fs :as fs]
+            [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [claimgraph.core :as core]
             [claimgraph.store :as store]
             [claimgraph.store.memory :as mem]))
 
-(def datalevin? (and (not (System/getenv "CLAIMGRAPH_TEST_SKIP_DATALEVIN"))
-                     (fs/which (or (System/getenv "CLAIMGRAPH_DTLV") "dtlv"))))
+(defn- skip-reason
+  "Which of the three ways the pod goes missing applies, as {:cause :detail},
+  or nil when nothing is missing. Takes the environment as data so every
+  branch — including the CLAIMGRAPH_DTLV override, which is the one no install
+  can repair — is reachable from a single test process."
+  [{:keys [skip-set? binary override? on-path?]}]
+  (cond
+    skip-set?
+    {:cause :opted-out :detail "CLAIMGRAPH_TEST_SKIP_DATALEVIN is set"}
+
+    (not on-path?)
+    {:cause (if override? :override-missing :not-installed)
+     :detail (str "no `" binary "` on PATH")
+     :binary binary}))
+
+(defn- env->skip-reason
+  "This process's environment folded into a skip reason. Split out so the
+  reading itself is testable: which variable means what, and that
+  CLAIMGRAPH_DTLV reroutes the lookup rather than just renaming the binary.
+  Get that wiring wrong and the banner prints a remedy for the wrong gap."
+  [env]
+  (let [override (get env "CLAIMGRAPH_DTLV")
+        binary   (or override "dtlv")]
+    (skip-reason {:skip-set? (some? (get env "CLAIMGRAPH_TEST_SKIP_DATALEVIN"))
+                  :binary    binary
+                  :override? (some? override)
+                  :on-path?  (some? (fs/which binary))})))
+
+(def datalevin-skip-reason
+  "Why this run is not exercising the Datalevin store, or nil when it is.
+  Resolved at load time from the same inputs as datalevin?, so the runner can
+  name the gap once the summary is printed: skipping is allowed, but a green
+  suite that only ever touched the in-memory store is not evidence about the
+  store the CLI actually writes to, and nothing else in the output says so.
+  Carries the cause and not just prose because the remedy differs by cause —
+  see datalevin-skip-warning."
+  (env->skip-reason (System/getenv)))
+
+(def datalevin? (nil? datalevin-skip-reason))
+
+(defn- skip-remedy
+  "The lines that close this particular gap. Per-cause because a remedy aimed
+  at the wrong cause costs more than none: an unset variable cannot be unset,
+  and no amount of installing helps while CLAIMGRAPH_DTLV points the lookup
+  somewhere else."
+  [{:keys [cause binary]}]
+  (case cause
+    :opted-out
+    ["    Unset CLAIMGRAPH_TEST_SKIP_DATALEVIN and re-run to close the gap."]
+
+    :not-installed
+    ["    Install the pod with scripts/setup.sh, which puts dtlv on PATH, to"
+     "    close the gap."]
+
+    :override-missing
+    [(str "    CLAIMGRAPH_DTLV points at `" binary "`, which is not on PATH.")
+     "    Point it at a dtlv binary that exists, or unset it and install the"
+     "    pod with scripts/setup.sh. Installing alone will not help: the"
+     "    override outranks PATH."]))
+
+(defn datalevin-skip-warning
+  "The banner claimgraph.run-tests prints after the summary when the pod half
+  of this suite was skipped; nil when there is nothing to warn about. Takes the
+  reason instead of reading it so every outcome stays testable in one process."
+  [reason]
+  (when reason
+    (str/join
+     "\n"
+     (concat
+      ["============================================================================"
+       (str "!!  DATALEVIN STORE NOT TESTED — " (:detail reason))
+       ""
+       "    claimgraph.core-test ran against the in-memory store only. Nothing in"
+       "    this run loaded claimgraph.store.datalevin, so every storage-level"
+       "    behaviour it owns — pod round-tripping, index reads, query"
+       "    translation — is untested, whatever the summary above says."
+       ""]
+      (skip-remedy reason)
+      ["============================================================================"]))))
 
 (when datalevin?
   (require '[claimgraph.store.datalevin]))
@@ -587,3 +665,66 @@
         (let [r (core/assert-fact s {:subject "svc" :predicate :core/has-version
                                      :object "3.0.0" :source-type :code})]
           (is (= :superseded (:status r))))))))
+
+;; ---------------------------------------------------------------------------
+
+(deftest datalevin-skip-is-announced
+  (testing "a skipped run names the store, the namespace and the reason"
+    (let [w (datalevin-skip-warning (skip-reason {:skip-set? true :binary "dtlv" :on-path? true}))]
+      (is (str/includes? w "DATALEVIN STORE NOT TESTED"))
+      (is (str/includes? w "claimgraph.store.datalevin") "names what went untested")
+      (is (str/includes? w "claimgraph.core-test") "names where the coverage was lost")
+      (is (str/includes? w "CLAIMGRAPH_TEST_SKIP_DATALEVIN is set") "names why")))
+
+  (testing "a full run says nothing — the banner is the exception, not decoration"
+    (is (nil? (skip-reason {:binary "dtlv" :on-path? true})))
+    (is (nil? (datalevin-skip-warning nil))))
+
+  (testing "the three ways the pod goes missing are told apart"
+    (is (= :opted-out (:cause (skip-reason {:skip-set? true :binary "dtlv" :on-path? true}))))
+    (is (= :not-installed (:cause (skip-reason {:binary "dtlv" :on-path? false}))))
+    (is (= :override-missing
+           (:cause (skip-reason {:binary "dtlv-nope" :override? true :on-path? false})))
+        "an override aimed at nothing is not the same gap as a missing install")
+    (is (= :opted-out (:cause (skip-reason {:skip-set? true :binary "dtlv-nope"
+                                            :override? true :on-path? false})))
+        "opting out is reported even when the pod would also have been unreachable"))
+
+  (testing "each remedy closes the gap it is printed for, and names no other"
+    (let [w (datalevin-skip-warning (skip-reason {:skip-set? true :binary "dtlv" :on-path? true}))]
+      (is (str/includes? w "Unset CLAIMGRAPH_TEST_SKIP_DATALEVIN"))
+      (is (not (str/includes? w "setup.sh"))
+          "nothing is missing to install — this run asked to skip"))
+    (let [w (datalevin-skip-warning (skip-reason {:binary "dtlv" :on-path? false}))]
+      (is (str/includes? w "scripts/setup.sh"))
+      (is (not (str/includes? w "CLAIMGRAPH_TEST_SKIP_DATALEVIN"))
+          "that variable is not what stopped this run, so unsetting it fixes nothing"))
+    (let [w (datalevin-skip-warning (skip-reason {:binary "dtlv-nope" :override? true
+                                                  :on-path? false}))]
+      (is (str/includes? w "CLAIMGRAPH_DTLV points at `dtlv-nope`")
+          "names the setting and the binary it actually points at")
+      (is (not (str/includes? w "CLAIMGRAPH_TEST_SKIP_DATALEVIN"))
+          "unsetting a variable that is not set is not the remedy")
+      (is (str/includes? w "override outranks PATH")
+          "installing dtlv cannot help while the override stands — say so")))
+
+  (testing "the environment is read the way the remedies assume"
+    (is (= :opted-out (:cause (env->skip-reason {"CLAIMGRAPH_TEST_SKIP_DATALEVIN" "1"}))))
+    (is (= :override-missing (:cause (env->skip-reason {"CLAIMGRAPH_DTLV" "dtlv-nope"})))
+        "CLAIMGRAPH_DTLV reroutes the lookup, so its failure is the one no install fixes")
+    (is (= "no `dtlv-nope` on PATH" (:detail (env->skip-reason {"CLAIMGRAPH_DTLV" "dtlv-nope"})))
+        "the binary the banner names is the one that was looked for")
+    (is (= (some? (fs/which "dtlv")) (nil? (env->skip-reason {})))
+        "with nothing set, the gap is exactly whether `dtlv` is on PATH"))
+
+  (testing "the banner's verdict matches the stores this run actually built"
+    (is (= datalevin? (some? (find-ns 'claimgraph.store.datalevin)))
+        "the banner claims nothing loaded the pod namespace; that must be true when it prints")
+    (let [stores (make-stores)]
+      (try
+        (is (= datalevin? (contains? stores :datalevin))
+            "a silent run must have opened the pod store; a warned run must not have")
+        (when datalevin?
+          (is (not= (type (:memory stores)) (type (:datalevin stores)))
+              "the :datalevin store must be the pod implementation, not memory wearing its key"))
+        (finally (run! store/-close (vals stores)))))))

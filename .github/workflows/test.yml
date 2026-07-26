@@ -2,7 +2,10 @@ name: Test
 
 # Runs the test suite on a runner with babashka + the Datalevin pod, so the
 # core-semantics suite exercises BOTH store implementations (memory + datalevin).
-# Complements publish-book.yml, which only builds the book.
+# Both installation routes scripts/setup.sh offers are covered, because a route
+# nobody runs is a route that quietly rots: Homebrew (the recommended one, and
+# what setup.sh picks by default) on macOS, the pinned GitHub downloads on
+# ubuntu. Complements publish-book.yml, which builds the book.
 on:
   push:
     branches: [main]
@@ -12,8 +15,21 @@ on:
 permissions:
   contents: read
 
+# A superseded PR push should not keep a macOS runner busy — it bills at ten
+# times the ubuntu rate. Runs on main are left to finish: each commit there
+# keeps its own verdict.
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
+  # `name:` is what the check run is called, so a required-status-check rule
+  # would have to match "ubuntu (pinned downloads)", not the `test` job id.
+  # Named anyway: two jobs run the same suite, and the ids alone say nothing
+  # about which install route each one covers. Renaming a job here means
+  # updating any branch protection rule that requires it.
   test:
+    name: ubuntu (pinned downloads)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -28,6 +44,41 @@ jobs:
           export PATH="$HOME/.local/bin:$PATH"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           USE_BREW=0 INSTALL_DIR="$HOME/.local/bin" scripts/setup.sh
+
+      - name: Run the test suite (memory + datalevin stores)
+        run: bb test
+
+  test-macos:
+    name: macOS (Homebrew)
+    runs-on: macos-latest
+    # A tap that loses its binary asset makes brew build from source; on a 10x
+    # runner that is worth failing over rather than paying for.
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      # Homebrew's downloads are deliberately not cached: the brew route installs
+      # unpinned formulae, so what gets fetched changes when a tap bumps and
+      # nothing in the repo moves with it. actions/cache writes only on a
+      # primary-key miss, so a key hashed from these files saves one bottle set
+      # and serves it forever, while a per-run key would re-upload both binaries
+      # every run to save downloading them once.
+
+      # No USE_BREW and no INSTALL_DIR: what this job exercises is the defaults
+      # a macOS contributor gets, brew and both project taps included. The
+      # HOMEBREW_* flags only drop work this job never uses — `brew install
+      # user/tap/formula` clones the taps fresh either way.
+      - name: Install babashka + the Datalevin pod (scripts/setup.sh, brew route)
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+          HOMEBREW_NO_ANALYTICS: "1"
+        run: |
+          scripts/setup.sh
+          # setup.sh's brew route installs into $(brew --prefix)/bin, which the
+          # runner image already has on PATH; exporting it anyway keeps the job
+          # working if an image ever stops doing that.
+          echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
 
       - name: Run the test suite (memory + datalevin stores)
         run: bb test

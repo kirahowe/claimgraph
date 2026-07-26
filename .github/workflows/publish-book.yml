@@ -2,9 +2,21 @@ name: Publish book
 
 # Builds the Clay/Quarto book on a runner and deploys it to GitHub Pages.
 # The published site tracks main; nothing pre-rendered is committed.
+#
+# The same build runs on pull requests that touch the book's inputs, because a
+# chapter that stops evaluating used to surface only after merge, on the deploy
+# path. A PR runs the real build — Clay evaluates every .clj chapter against
+# src/, Quarto renders the lot — and stops before the Pages steps.
 on:
   push:
     branches: [main]
+    paths:
+      - 'book/**'
+      - 'src/**'
+      - 'deps.edn'
+      - 'bb.edn'
+      - '.github/workflows/publish-book.yml'
+  pull_request:
     paths:
       - 'book/**'
       - 'src/**'
@@ -15,17 +27,29 @@ on:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
-# One deploy at a time; let a newer push cancel an in-flight build.
+# Per ref, so a superseded PR push drops its own branch's in-flight build.
+# Cancelling is limited to PRs because this group covers the whole run, deploy
+# job included: with it on for main, a second commit a minute later would kill a
+# deploy mid-upload, and the deploy job's own `cancel-in-progress: false` cannot
+# override a cancellation ordered from up here. Pushes to main queue instead.
+# Deploys take a repository-wide group of their own (see the deploy job) —
+# sharing one `pages` group here would let a PR build cancel a running deploy.
 concurrency:
-  group: pages
-  cancel-in-progress: true
+  group: book-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    # A job-level block replaces the workflow-level one outright — anything left
+    # out is `none`, so checkout's `contents: read` has to be restated here.
+    # `pages: read` is what configure-pages needs: with `enablement` left at its
+    # default it only reads GET /repos/{owner}/{repo}/pages. Writing Pages stays
+    # with deploy, which is the job that should be able to publish.
+    permissions:
+      contents: read
+      pages: read
     steps:
       - uses: actions/checkout@v4
 
@@ -52,19 +76,47 @@ jobs:
           restore-keys: m2-
 
       - name: Build the book
-        run: bb book
+        run: |
+          set -o pipefail
+          bb book 2>&1 | tee book-build.log
 
+      # Clay catches whatever a chapter throws, prints "Clay FAILED: <path>",
+      # renders the stack trace into the page and carries on to the next
+      # chapter — with more than one source in the book it never rethrows, so
+      # `bb book` exits 0 on a chapter that did not run. That log line is the
+      # only signal there is, and without this step the check above would pass
+      # on precisely the breakage it exists to catch.
+      - name: Fail if a chapter did not evaluate
+        run: |
+          if grep -F 'Clay FAILED:' book-build.log; then
+            echo "::error::a book chapter threw while Clay evaluated it — see the build log above"
+            exit 1
+          fi
+
+      # Pages needs a token a fork's pull_request event does not get, and a PR
+      # has nothing to publish anyway: verification ends here.
       - name: Configure Pages
+        if: github.event_name != 'pull_request'
         uses: actions/configure-pages@v5
 
       - name: Upload the rendered book
+        if: github.event_name != 'pull_request'
         uses: actions/upload-pages-artifact@v3
         with:
           path: book/rendered/_book
 
   deploy:
     needs: build
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    # One deploy at a time, repository-wide. A queued deploy waits instead of
+    # cancelling: a half-applied Pages deployment is worse than a slow one.
+    concurrency:
+      group: pages
+      cancel-in-progress: false
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
