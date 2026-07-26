@@ -134,7 +134,10 @@
     (cond
       (empty? files)
       {:status :no-adr-dir
-       :hint "pass --dir or --file; looked in docs/adr, docs/decisions, adr"}
+       ;; --adr-dir, not the --dir it answered to first: the alias still
+       ;; dispatches, and a failure path that teaches it is how a deprecated
+       ;; spelling outlives its own deprecation.
+       :hint "pass --adr-dir or --file; looked in docs/adr, docs/decisions, adr"}
 
       dry-run
       {:status :dry-run :adrs (mapv #(dissoc % :file) parsed) :facts facts}

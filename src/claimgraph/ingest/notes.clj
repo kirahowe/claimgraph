@@ -202,7 +202,9 @@
         notes-dir (harness/notes-path h (select-keys opts [:dir :project :ctx]))]
     (if-not (fs/directory? notes-dir)
       {:status :no-notes-dir :harness (name (:id h)) :dir (str notes-dir)
-       :hint "no auto-memory directory for this project yet (or pass --dir)"}
+       ;; --notes-dir is what this setting is called now; naming its retired
+       ;; spelling on the failure path is how the rename never finishes.
+       :hint "no auto-memory directory for this project yet (or pass --notes-dir)"}
       (let [notes (read-notes notes-dir (:note-glob h))
             changed (changed-notes notes (seen-hashes (store/-list-episodes s) (:id h)))
             run (or extractor-fn (partial llm/complete! (llm/command extractor)))

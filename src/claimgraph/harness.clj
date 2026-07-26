@@ -7,8 +7,8 @@
   No location is assumed: every default here is computed from an injectable
   context (home dir + env), honors the harness's own relocation variables
   (Claude Code's $CLAUDE_CONFIG_DIR, Codex's $CODEX_HOME), and is overridable
-  outright — --dir / $CLAIMGRAPH_NOTES_DIR / notes-dir in the project config
-  for the notes directory, --inject-file / $CLAIMGRAPH_INJECT_FILE /
+  outright — --notes-dir / $CLAIMGRAPH_NOTES_DIR / notes-dir in the project
+  config for the notes directory, --inject-file / $CLAIMGRAPH_INJECT_FILE /
   inject-file for the injection target. `claim config` shows what resolves.
 
   The managed-section markers are the echo-loop guard's anchor: ingest-notes

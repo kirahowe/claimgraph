@@ -425,6 +425,29 @@
         (let [facts (store/-get-facts-for s (:frontier state) {:direction :both})]
           (recur (logic/bfs-step state facts keep? (inc d)) (inc d)))))))
 
+(defn- walk-nodes
+  "The walk's entity list, each node carrying its hop distance from the root —
+  the shape the BFS neighborhood reports, so one reader parses both.
+
+  The distance is the round the walk DISCOVERED the node in, carried out of the
+  loop rather than recomputed from the facts that came back. It cannot be
+  recomputed from them: a round collects up to `beam` facts and only the
+  budget's worth of the best-scoring survive, and a round-2 fact routinely
+  outscores the round-1 fact that reached its endpoint — so the LINKING fact is
+  exactly what truncation drops, leaving a retained node with no path from the
+  root through any retained fact, and a reported depth of null. Only nodes the
+  returned facts mention are listed; a node whose every fact was truncated is
+  not part of the subgraph being described."
+  [root facts depths]
+  (->> facts
+       (mapcat (juxt :subject :object-ref))
+       (remove nil?)
+       (map (juxt :id identity))
+       (into {(:id root) root})
+       (map (fn [[id n]] (assoc n :depth (get depths id))))
+       (sort-by (fn [n] [(or (:depth n) Integer/MAX_VALUE) (str (:id n))]))
+       vec))
+
 (defn guided-walk
   "The evidence-guided replacement for fixed-depth BFS (review §3.2,
   TierMem/MRAgent): expand from an entity following the edges that look
@@ -432,6 +455,11 @@
   unseen facts is taken each round (logic/walk-step — token overlap ×
   effective confidence, deterministic ties), their far endpoints become the
   next frontier, until the fact budget or the graph runs out.
+
+  Answers with :entities (nodes and their discovery depth, see walk-nodes)
+  beside the walk-scored :facts. One map does double duty in the loop: what
+  has been visited IS what has a recorded depth, and a walk that tracked the
+  two separately could let them disagree about a node.
   opts: :entity :entity-scope :query :budget (default 25) :beam (default 8)"
   [s {:keys [entity entity-scope query budget beam]}]
   (let [root (require-entity s entity entity-scope)
@@ -440,16 +468,18 @@
         budget (long (or budget 25))
         beam (long (or beam 8))]
     (loop [frontier #{(:id root)}
-           visited #{(:id root)}
+           depths {(:id root) 0}
            collected {}
            depth 0]
       (if (or (empty? frontier) (>= (count collected) budget) (>= depth 6))
-        {:root root
-         :query query
-         :facts (->> (vals collected)
-                     (sort-by (fn [f] [(- (:walk-score f)) (str (:id f))]))
-                     (take budget)
-                     vec)}
+        (let [facts (->> (vals collected)
+                         (sort-by (fn [f] [(- (:walk-score f)) (str (:id f))]))
+                         (take budget)
+                         vec)]
+          {:root root
+           :query query
+           :entities (walk-nodes root facts depths)
+           :facts facts})
         (let [candidates (->> (store/-get-facts-for s (vec frontier) {:direction :both})
                               (filter #(logic/fact-valid-at? % t))
                               (remove (comp collected :id)))
@@ -457,10 +487,10 @@
               far (->> step
                        (mapcat (juxt (comp :id :subject) (comp :id :object-ref)))
                        (remove nil?)
-                       (remove visited)
+                       (remove depths)
                        set)]
           (recur far
-                 (into visited far)
+                 (into depths (map (fn [id] [id (inc depth)])) far)
                  (into collected (map (juxt :id identity)) step)
                  (inc depth)))))))
 

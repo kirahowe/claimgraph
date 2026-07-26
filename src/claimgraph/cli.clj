@@ -33,11 +33,11 @@
 
 (def usage-exit
   "A command line claimgraph could not act on at all: an unknown verb, an
-  unknown subcommand, a verb given none. Distinct from error-exit because the
-  two need different responses and a caller that sees one number cannot tell
-  them apart — a judge that could not reach its LLM is worth retrying, a typo
-  in a SessionEnd hook command line never is. 2 is the shell's own convention
-  for a usage error."
+  unknown subcommand, a verb given none, a flag value it could not read.
+  Distinct from error-exit because the two need different responses and a
+  caller that sees one number cannot tell them apart — a judge that could not
+  reach its LLM is worth retrying, a typo in a SessionEnd hook command line
+  never is. 2 is the shell's own convention for a usage error."
   2)
 
 (defn- db-path [opts]
@@ -64,16 +64,32 @@
   claimgraph.llm reads $CLAIMGRAPH_LLM_TIMEOUT_MS itself and nothing threads a
   per-call timeout down to it, so a value in .claimgraph/config.json was a
   setting `claim config` could report and no call would obey. The shell
-  resolves the chain once and installs the answer as the process default —
-  the same shape as every other setting, resolved in the one place that owns
-  resolution. Nothing is installed when the knob is unset anywhere, so an
-  ordinary run neither loads llm.clj early nor pays for the lookup."
+  resolves the chain once and installs the answer — the same shape as every
+  other setting, resolved in the one place that owns resolution. Nothing is
+  installed when the knob is unset anywhere, so an ordinary run neither loads
+  llm.clj early nor pays for the lookup.
+
+  Installing it as llm's process default is not enough on its own:
+  llm/timeout-ms consults the environment BEFORE that default, so an exported
+  $CLAIMGRAPH_LLM_TIMEOUT_MS beat both --llm-timeout-ms and the config file —
+  precisely inverting the flag > env > config > default chain this project
+  documents, on exactly the machines that set the variable. So the resolver
+  itself is bound to feed the already-resolved answer in where it looks first:
+  once the shell has folded the environment into that number, a second read of
+  the same layer at a different priority can only contradict it. A per-call
+  :timeout-ms (the judge's own tests) still outranks everything, which is what
+  makes it an override."
   [opts]
   (let [ms (config/value :llm-timeout-ms opts)]
     (when (and (number? ms) (pos? ms))
-      (when-let [v (try (requiring-resolve 'claimgraph.llm/default-timeout-ms)
-                        (catch Throwable _ nil))]
-        (alter-var-root v (constantly (long ms))))))
+      (let [ms (long ms)]
+        (when-let [default (try (requiring-resolve 'claimgraph.llm/default-timeout-ms)
+                                (catch Throwable _ nil))]
+          (alter-var-root default (constantly ms))
+          (alter-var-root (requiring-resolve 'claimgraph.llm/timeout-ms)
+                          (fn [resolve-ms]
+                            (fn ([override] (resolve-ms override ms))
+                              ([override _env] (resolve-ms override ms)))))))))
   opts)
 
 (defn- llm-opts
@@ -184,50 +200,23 @@
         (log-reads! opts :facts (:facts r))
         (emit opts r)))))
 
-(defn- subgraph-entities
-  "The walk's facts as a node list with hop distances from the root, in the
-  shape the BFS neighborhood reports. Distance is measured through the
-  returned facts, which is the same question the BFS's :depth answers: every
-  fact the walk collects touches the previous round's frontier, so every node
-  it reports is reachable from the root through the facts it reports too."
-  [root facts]
-  (let [nodes (into {(:id root) root}
-                    (comp (mapcat (juxt :subject :object-ref))
-                          (remove nil?)
-                          (map (juxt :id identity)))
-                    facts)
-        adj (reduce (fn [m {:keys [subject object-ref]}]
-                      (let [a (:id subject) b (:id object-ref)]
-                        (if (and a b)
-                          (-> m (update a (fnil conj #{}) b)
-                              (update b (fnil conj #{}) a))
-                          m)))
-                    {} facts)]
-    (loop [depths {(:id root) 0} frontier #{(:id root)} d 0]
-      (let [next-ids (into #{} (comp (mapcat adj) (remove depths)) frontier)]
-        (if (empty? next-ids)
-          (->> nodes
-               (map (fn [[id n]] (assoc n :depth (get depths id))))
-               (sort-by (fn [n] [(or (:depth n) Integer/MAX_VALUE) (str (:id n))]))
-               vec)
-          (recur (into depths (map (fn [id] [id (inc d)])) next-ids)
-                 next-ids (inc d)))))))
-
 (defn- walk-neighborhood
   "The guided walk in the neighborhood's shape, so `neighbor` answers with one
   object rather than two. With --query it used to drop :entities and :depth
   and report :walk-score where the BFS reported :effective-confidence — the
   same verb, two incompatible payloads, and no way to write one reader for
   it. The walk keeps everything that makes it a walk (:query, :walk-score,
-  its own ordering) and gains everything the neighborhood promised."
-  [{:keys [root facts] :as walk} now]
-  (let [facts (mapv #(assoc % :effective-confidence (logic/effective-confidence % now))
-                    facts)
-        entities (subgraph-entities root facts)]
-    (assoc walk
-           :facts facts
-           :entities entities
-           :depth (reduce max 0 (keep :depth entities)))))
+  its own ordering) and gains everything the neighborhood promised.
+
+  The hop distances come from the walk itself. This wrapper used to measure
+  them over the facts it was handed, which reports null for every node whose
+  linking fact the budget truncated away (core/walk-nodes) — and since the MCP
+  surface shares this wrapper, it reported null there too."
+  [{:keys [entities facts] :as walk} now]
+  (assoc walk
+         :facts (mapv #(assoc % :effective-confidence (logic/effective-confidence % now))
+                      facts)
+         :depth (reduce max 0 (keep :depth entities))))
 
 (defn cmd-neighbor [{:keys [opts]}]
   (with-store opts
@@ -353,16 +342,20 @@
                                              :default-epistemic]))))))
 
 (defn cmd-episode-open
-  "Reports the new episode with a status, its id under :episode. `episode
-  close` already calls an episode id :episode, and :episode is the flag every
-  verb that takes one spells — so the id an `episode open` is run to obtain
-  comes back under the name the next command wants it by, instead of under
-  :id on a bare row with no status at all."
+  "Reports {status, episode} — the row nested under the name of the thing it
+  is, exactly as `entity ensure` and `predicate register` report {status,
+  entity} and {status, predicate}.
+
+  It used to flatten the row into the report and rename its :id to :episode,
+  which made three sibling mutations answer in three different shapes and left
+  the episode row with no id of its own — the one field that identifies it.
+  `jq -r .episode.id` is two characters more than `jq -r .episode` and one
+  fewer shape for a caller to learn."
   [{:keys [opts]}]
   (with-write-store opts
     (fn [s]
-      (let [ep (core/open-episode s (select-keys opts [:source-type :ref]))]
-        (emit opts (assoc (dissoc ep :id) :status :opened :episode (:id ep)))))))
+      (emit opts {:status :opened
+                  :episode (core/open-episode s (select-keys opts [:source-type :ref]))}))))
 
 (defn cmd-episode-close [{:keys [opts]}]
   (with-write-store opts
@@ -596,9 +589,17 @@
   verb. It used to switch the format outright, so `audit --pretty | jq` got a
   human scorecard and no JSON at all — one flag with two meanings on the one
   verb whose output people pipe. The scorecard is --scorecard now, and stays
-  what a human at a terminal gets without asking."
+  what a human at a terminal gets without asking.
+
+  Nothing stops a caller passing two of these, so the precedence is decided
+  here and stated in help — help used to say --pretty and --scorecard both
+  \"force\" their format, and --pretty silently won. --json wins outright: a
+  caller that asked for machine output must never be handed prose. Then
+  --scorecard, the only flag that asks for the scorecard at all, over --pretty,
+  which is a global flag a wrapper may put on every command line and which says
+  how JSON is printed rather than whether JSON is what comes out."
   [{:keys [json pretty scorecard]} tty]
-  (boolean (and (not json) (not pretty) (or scorecard tty))))
+  (boolean (and (not json) (or scorecard (and (not pretty) tty)))))
 
 (defn cmd-audit [{:keys [opts]}]
   ;; The one verb that must NEVER open the real store: everything runs in a
@@ -717,11 +718,13 @@ Usage: claim <command> [options]
 All commands accept --db PATH and --pretty. All output is JSON on stdout;
 errors are JSON on stderr. Exit 0 on success, 1 when a command ran and could
 not do what it was asked, 2 when the command line itself was wrong (unknown
-verb, unknown or missing subcommand) — a typo and a failure are different
-problems and a wrapper needs to tell them apart. One exception to the output
-rule: audit prints its human scorecard when stdout is a terminal (--json or
---pretty force JSON there, --scorecard forces the scorecard; piped or
-captured output is always JSON).
+verb, unknown or missing subcommand, a flag value that would not parse) — a
+typo and a failure are different problems and a wrapper needs to tell them
+apart. One exception to the output rule: audit prints its human scorecard when
+stdout is a terminal. --scorecard forces the scorecard anywhere and outranks
+--pretty (which only says how JSON is printed); --json forces JSON and
+outranks both; piped or captured output is JSON unless --scorecard asks
+otherwise.
 
 Nothing about file locations is assumed. Every setting resolves through one
 precedence chain — CLI flag > environment variable > .claimgraph/config.json
@@ -780,7 +783,8 @@ Commands:
                         [--extractor CMD] [--out FILE] (also write the JSON
                         scorecard to FILE) [--scorecard|--json|--pretty]
                         (the human scorecard is the default at a terminal and
-                        --scorecard forces it; JSON when piped, and --pretty
+                        --scorecard forces it anywhere, outranking --pretty;
+                        --json forces JSON and outranks --scorecard; --pretty
                         means pretty-printed JSON here as everywhere else)
   init                Create the store and seed the predicate vocabulary
                         (setup calls this; use directly for a bare store)
@@ -1056,13 +1060,21 @@ Commands:
   printing the whole help text to stdout and exiting 0 is how a typo in a
   SessionEnd hook command line reads as a session that went fine. The verbs
   are named the way babashka.cli names the subcommands of a verb it does
-  know, so one error shape answers \"what could I have written\" either way."
+  know, so one error shape answers \"what could I have written\" either way.
+
+  Canonical verbs only: an alias stays dispatchable and is never advertised.
+  Handing somebody recovering from a typo the spelling the rename exists to
+  retire is how a deprecated name gets written into brand-new command lines —
+  by the tool that deprecated it."
   [{:keys [args]}]
   (if-let [verb (first args)]
     (logic/fail (str "Unknown command: " verb)
                 {:type :unknown-command
                  :command verb
-                 :expected (vec (sort (distinct (keep (comp first :cmds) table))))
+                 :expected (->> table
+                                (remove :alias-of)
+                                (keep (comp first :cmds))
+                                distinct sort vec)
                  :claimgraph/exit usage-exit
                  :hint "run `claim help` for the full command list"})
     (cmd-help nil)))
@@ -1165,21 +1177,49 @@ Commands:
   code)
 
 (defn- usage-payload
-  "babashka.cli's own dispatch failure, in claimgraph's error shape. It
-  travels as ex-data on an ExceptionInfo with NO message, so the generic
-  handler emitted {\"error\": null} — from the one failure mode a typo in a
-  hook command line actually produces, to a caller whose only contract is
-  that :error says what happened."
-  [{:keys [dispatch wrong-input all-commands cause]}]
-  (let [attempted (str/join " " (remove nil? (concat dispatch [wrong-input])))
-        exhausted (= :input-exhausted cause)]
-    {:error (if exhausted
-              (str "Incomplete command: `" attempted "` needs a subcommand")
-              (str "Unknown command: " attempted))
-     :type (if exhausted :incomplete-command :unknown-command)
-     :command attempted
-     :expected (vec (sort (map str all-commands)))
-     :hint "run `claim help` for the full command list"}))
+  "babashka.cli's own parse failures, in claimgraph's error shape. They travel
+  as ex-data on an ExceptionInfo with NO message, so the generic handler
+  emitted {\"error\": null} — from the one failure mode a typo in a hook
+  command line actually produces, to a caller whose only contract is that
+  :error says what happened.
+
+  Two unrelated mistakes arrive under that one :type, and only :cause tells
+  them apart: a verb claimgraph does not have, and a VALUE it could not read.
+  A coercion failure carries an :option and no :dispatch at all, so rendering
+  every failure as the first told a user whose verb was fine that the verb did
+  not exist, named the empty string as what they attempted, offered [] as the
+  alternatives — and never mentioned the flag actually at fault."
+  [{:keys [dispatch wrong-input all-commands cause option value msg spec]}]
+  (cond
+    (= :coerce cause)
+    (let [flag (str "--" (name option))
+          t (some-> (get-in spec [option :coerce]) name)]
+      {:error (str "Invalid value for " flag ": " (pr-str value)
+                   (when t (str " (expected a " t ")")))
+       :type :invalid-option-value
+       :option flag
+       :value value
+       :hint (str "run `claim help` for what " flag " takes")})
+
+    ;; :require / :validate / :restrict. claimgraph's specs declare none of
+    ;; them, so babashka's own message is passed through rather than
+    ;; paraphrased into a shape no command line can currently produce.
+    option
+    {:error (or msg (str "Invalid option: --" (name option)))
+     :type :invalid-option
+     :option (str "--" (name option))
+     :hint "run `claim help` for the options this command takes"}
+
+    :else
+    (let [attempted (str/join " " (remove nil? (concat dispatch [wrong-input])))
+          exhausted (= :input-exhausted cause)]
+      {:error (if exhausted
+                (str "Incomplete command: `" attempted "` needs a subcommand")
+                (str "Unknown command: " attempted))
+       :type (if exhausted :incomplete-command :unknown-command)
+       :command attempted
+       :expected (vec (sort (map str all-commands)))
+       :hint "run `claim help` for the full command list"})))
 
 (defn run
   "Dispatch one command line; return the process exit status. Separate from

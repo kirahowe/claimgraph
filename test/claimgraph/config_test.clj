@@ -15,7 +15,9 @@
   identically in both backends: a curated row redefined, a staging row
   amended. Registry semantics live in two implementations, so every one of
   those runs against both."
-  (:require [babashka.fs :as fs]
+  (:require [babashka.classpath :as cp]
+            [babashka.fs :as fs]
+            [babashka.process :as p]
             [cheshire.core :as json]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
@@ -374,7 +376,25 @@
       (is (= "" out) "stdout is the JSON channel; an error is not JSON output")
       (is (= "unknown-command" (:type err)))
       (is (str/includes? (:error err) "frobnicate"))
-      (is (contains? (set (:expected err)) "ingest-session"))))
+      (is (contains? (set (:expected err)) "ingest-session"))
+      (is (not (contains? (set (:expected err)) "session-extract"))
+          "the suggestions are the canonical verbs: the list was built from the
+           dispatch table after alias expansion, so somebody recovering from a
+           typo was handed the spelling the rename exists to retire — and would
+           write new command lines against it")))
+  (testing "a value a flag cannot take"
+    (let [{:keys [exit out err]} (argv ["neighbor" "--entity" "api" "--depth" "two"])]
+      (is (= 2 exit) "the command line was wrong, so not error-exit")
+      (is (= "" out))
+      (is (= "invalid-option-value" (:type err))
+          "every babashka.cli failure went through the unknown-verb rendering,
+           and a coercion failure carries none of the keys that rendering reads:
+           a fine verb was reported as nonexistent, the command attempted came
+           out \"\" and the alternatives came out []")
+      (is (= "--depth" (:option err)) "the flag actually at fault is named")
+      (is (str/includes? (:error err) "\"two\"") "with the value it could not read")
+      (is (str/includes? (:error err) "long") "and what that flag takes instead")
+      (is (nil? (:command err)) "and nothing is claimed about the verb, which was fine")))
   (testing "a subcommand that does not exist"
     (let [{:keys [exit err]} (argv ["entity" "frobnicate"])]
       (is (= 2 exit))
@@ -507,8 +527,14 @@
     (is (scorecard? {} true) "a human at a terminal still gets the scorecard unasked")
     (is (scorecard? {:scorecard true} false) "and a pipe can now ask for it")
     (is (not (scorecard? {} false)) "captured output stays JSON")
+    (is (scorecard? {:scorecard true :pretty true} false)
+        "--pretty says how JSON is printed, not whether JSON is what comes out,
+         so it does not veto a flag that asks for the scorecard outright — help
+         claimed both flags \"force\" their format and --pretty quietly won")
+    (is (scorecard? {:scorecard true :pretty true} true) "at a terminal too")
     (is (not (scorecard? {:json true :scorecard true} true))
-        "--json remains the override that always wins")))
+        "--json remains the override that always wins: a caller that asked for
+         machine output must never be handed prose")))
 
 (deftest every-mutation-verb-reports-a-status
   (let [s (doto (mem/create) (core/seed!))]
@@ -520,9 +546,13 @@
           "{status, entity} — the shape `entity rename` and `entity alias` use"))
     (let [r (cli-json cli/cmd-episode-open s {:source-type "session-log"})]
       (is (= "opened" (:status r)))
-      (is (string? (:episode r))
-          "the new id under the key `episode close` reports one under and every
-           verb that consumes one spells: `--episode $(... | jq -r .episode)`"))
+      (is (string? (get-in r [:episode :id]))
+          "{status, episode} — the row nested under the name of the thing it is,
+           like the two siblings above. It used to be flattened into the report
+           with its :id renamed to :episode: a third report shape among three
+           sibling mutations, and an episode row carrying no id at all")
+      (is (= "session-log" (get-in r [:episode :source-type]))
+          "and the row still reports what it recorded"))
     (let [r (cli-json cli/cmd-predicate-register s {:id "x/pairs-well-with"})]
       (is (= "registered" (:status r)))
       (is (= "x/pairs-well-with" (get-in r [:predicate :id])))
@@ -547,14 +577,45 @@
       (is (= "AuthService" (get-in walk [:root :name])))
       (is (= "token storage" (:query walk)) "and keeps what makes it a walk")
       (is (= [0 1 2] (mapv :depth (:entities walk)))
-          "entities carry the hop distance the neighborhood promises, measured
-           through the facts the walk returned")
+          "entities carry the hop distance the neighborhood promises — the round
+           the walk discovered each node in, not a distance re-measured over
+           whichever facts the budget left behind")
       (is (= (:depth walk) (reduce max (map :depth (:entities walk)))))
       (is (seq (:facts walk)))
       (is (every? #(and (contains? % :effective-confidence) (contains? % :walk-score))
                   (:facts walk))
           ":walk-score was reported INSTEAD of :effective-confidence, so a reader
            of one shape could not read the other; it is additional now"))))
+
+(deftest a-truncated-walk-still-reports-every-hop-distance
+  (let [s (doto (mem/create) (core/seed!))]
+    ;; Two branches off the root. The query's evidence sits at the end of the
+    ;; weak branch and outscores everything; the edge that DISCOVERED that
+    ;; branch scores lowest of all, so the budget is what drops it.
+    (core/assert-fact s {:subject "api" :predicate :core/depends-on
+                         :object "backup" :confidence 0.35})
+    (core/assert-fact s {:subject "api" :predicate :core/depends-on
+                         :object "svcC" :confidence 0.9})
+    (core/assert-fact s {:subject "backup" :predicate :core/prefers
+                         :object "cache strategy notes" :object-kind :literal
+                         :confidence 0.9})
+    (core/assert-fact s {:subject "svcC" :predicate :core/depends-on
+                         :object "svcD" :confidence 0.9})
+    (let [r (cli-json cli/cmd-neighbor s {:entity "api" :query "cache strategy"
+                                          :budget 3 :beam 2})]
+      (is (= 3 (count (:facts r))) "a round overshoots the budget; the sort truncates")
+      (is (not-any? #(= ["api" "backup"] [(get-in % [:subject :name])
+                                          (get-in % [:object-ref :name])])
+                    (:facts r))
+          "and what it truncated is the edge that reached `backup` at all")
+      (is (= {:api 0 :backup 1 :svcC 1 :svcD 2}
+             (into {} (map (juxt (comp keyword :name) :depth)) (:entities r)))
+          "`\"depth\": null` for `backup`: hop distance was re-measured over the
+           returned facts, and a round-2 fact routinely outscores the round-1
+           fact that discovered its endpoint — so the linking fact is exactly
+           what truncation drops and no retained fact reaches the node from the
+           root. The MCP surface shares this wrapper, so it reported null too.")
+      (is (= 2 (:depth r)) "and the walk's own depth is the deepest hop in it"))))
 
 (deftest the-llm-timeout-is-a-knob-like-every-other
   (is (= {:value 30000 :source :config}
@@ -570,14 +631,52 @@
        is not taking")
   (testing "the resolved value reaches the call that has to obey it"
     (let [v (requiring-resolve 'claimgraph.llm/default-timeout-ms)
-          before @v]
+          resolver (requiring-resolve 'claimgraph.llm/timeout-ms)
+          [before before-fn] [@v @resolver]]
       (try
         (#'cli/install-llm-timeout! {:llm-timeout-ms 4321})
         (is (= 4321 @v)
             "claimgraph.llm reads the environment itself and nothing threads a
              per-call timeout down to it, so the shell resolves the chain once
              and installs the answer as the process default")
-        (finally (alter-var-root v (constantly before)))))))
+        (is (= 4321 (@resolver nil "9999"))
+            "and the environment layer is spent: llm/timeout-ms consults the
+             environment BEFORE that default, so installing the default alone
+             left $CLAIMGRAPH_LLM_TIMEOUT_MS beating --llm-timeout-ms and the
+             config file both — exactly inverting flag > env > config > default")
+        (is (= 150 (@resolver 150))
+            "a per-call override still wins, which is what makes it an override")
+        (finally (alter-var-root v (constantly before))
+                 (alter-var-root resolver (constantly before-fn))))))
+  (testing "against a variable that is really exported"
+    ;; A child process because that is the whole question: no in-process
+    ;; binding can put a value in front of System/getenv, and this is the
+    ;; shape every machine with the variable in its shell profile runs.
+    (let [script (str "(require '[claimgraph.cli :as cli] '[claimgraph.llm :as llm])"
+                      "(#'cli/install-llm-timeout! {:llm-timeout-ms 100})"
+                      "(println (llm/timeout-ms nil))")
+          {:keys [out]} (p/sh {:extra-env {"CLAIMGRAPH_LLM_TIMEOUT_MS" "5000"}}
+                              "bb" "--classpath" (cp/get-classpath) "-e" script)]
+      (is (= "100" (str/trim out))
+          "the flag the user passed, not the variable the machine exports"))))
+
+(deftest a-runtime-hint-teaches-the-flag-help-documents
+  (testing "ingest-adr finding no decision records"
+    (let [empty-dir (str (fs/create-temp-dir {:prefix "claimgraph-adr-hint"}))
+          r ((requiring-resolve 'claimgraph.ingest.adr/ingest!)
+             nil {:dir empty-dir :dry-run true})]
+      (is (= :no-adr-dir (:status r)))
+      (is (str/includes? (:hint r) "--adr-dir")
+          "the hint named --dir while help documents --adr-dir. The alias still
+           dispatches, so nothing breaks — but the failure path is where a user
+           reads a flag name, and teaching the retired spelling there is how a
+           deprecated one outlives its deprecation")))
+  (testing "ingest-notes finding no auto-memory directory"
+    (let [absent (str (fs/path (fs/temp-dir) (str "claimgraph-absent-" (random-uuid))))
+          r ((requiring-resolve 'claimgraph.ingest.notes/ingest!) nil {:dir absent})]
+      (is (= :no-notes-dir (:status r)))
+      (is (str/includes? (:hint r) "--notes-dir")
+          "same rename, same failure path, same hint that outlived it"))))
 
 ;; ---------------------------------------------------------------------------
 ;; The store's own format stamp

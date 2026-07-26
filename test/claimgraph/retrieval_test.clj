@@ -44,6 +44,33 @@
       (testing "facts come back walk-scored, best first"
         (is (apply >= (map :walk-score (:facts r))))))))
 
+(deftest walk-entities-carry-the-round-they-were-discovered-in
+  (let [s (seeded)]
+    ;; Two branches off the root. The query's evidence sits at the far end of
+    ;; the weakest branch and outscores everything; the edge that discovered
+    ;; that branch scores lowest of all, so it is what the budget drops.
+    (core/assert-fact s {:subject "api" :predicate :core/depends-on
+                         :object "backup" :confidence 0.35})
+    (core/assert-fact s {:subject "api" :predicate :core/depends-on
+                         :object "svcC" :confidence 0.9})
+    (core/assert-fact s {:subject "backup" :predicate :core/prefers
+                         :object "cache strategy notes" :object-kind :literal
+                         :confidence 0.9})
+    (core/assert-fact s {:subject "svcC" :predicate :core/depends-on
+                         :object "svcD" :confidence 0.9})
+    (let [r (core/guided-walk s {:entity "api" :query "cache strategy"
+                                 :budget 3 :beam 2})]
+      (is (= 3 (count (:facts r)))
+          "a round collects up to `beam` facts and only then does the budget
+           truncate, so what comes back is not what the walk traversed")
+      (is (= {"api" 0 "backup" 1 "svcC" 1 "svcD" 2}
+             (into {} (map (juxt :name :depth)) (:entities r)))
+          "the walk knows it found `backup` in round 1; nothing that survived
+           the budget still says so, and a distance measured over the returned
+           facts alone reported null for it")
+      (is (= [0 1 1 2] (mapv :depth (:entities r)))
+          "listed nearest-first, like the neighborhood's node list"))))
+
 (deftest recall-escalates-tier-by-tier
   (let [ev-dir (str (fs/create-temp-dir {:prefix "claimgraph-recall-test"}))
         s (seeded)]
