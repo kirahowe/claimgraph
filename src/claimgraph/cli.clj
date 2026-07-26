@@ -151,7 +151,15 @@
 (defn- with-write-store
   "Write commands run under the write lease (multi-writer safety, #25):
   the conflict machinery is read-decide-write, so whole operations
-  serialize at this boundary. Reads never take the lease."
+  serialize at this boundary. Reads never take the lease.
+
+  The lease renews itself while the command runs, so a verb that shells out to
+  an LLM dozens of times (consolidate, hooks run) does not expire under its own
+  duration and hand a waiting writer a lease it was right to think dead (#20).
+  Losing it anyway — a suspended process, a hand-deleted lock file — fails the
+  command with :lease-lost after the work finishes: the writes landed and the
+  report says what they were, but nothing may report an unserialized write as a
+  serialized one."
   [opts f]
   (let [with-lease (requiring-resolve 'claimgraph.lease/with-lease)]
     (with-lease (db-path opts)
