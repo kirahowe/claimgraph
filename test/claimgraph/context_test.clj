@@ -6,6 +6,7 @@
   (:require [babashka.fs :as fs]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
+            [claimgraph.bench :as bench]
             [claimgraph.context :as context]
             [claimgraph.core :as core]
             [claimgraph.harness :as harness]
@@ -30,7 +31,95 @@
       (is (str/includes? v2 "view-2"))
       (is (not (str/includes? v2 "view-1")))
       (is (= (harness/strip-managed-section v1) (harness/strip-managed-section v2))
-          "recompiling never perturbs the non-managed content"))))
+          "recompiling never perturbs the non-managed content")))
+  (testing "splice output round-trips through strip to the original content"
+    (let [notes "# Claude's index\n- note\n"
+          round-trip #(str/trim (harness/strip-managed-section %))]
+      (is (= (str/trim notes)
+             (round-trip (harness/splice-managed-section notes "compiled view")))
+          "only the blank line splice leaves behind differs, and ingest trims")
+      (is (= (str/trim notes)
+             (round-trip (-> notes
+                             (harness/splice-managed-section "view-1")
+                             (harness/splice-managed-section "view-2"))))
+          "recompiles keep round-tripping — the block is replaced, not stacked"))))
+
+(deftest managed-section-is-the-complement-of-the-strip
+  (testing "the block strip removes is the block managed-section hands back"
+    (let [notes "# Claude's index\n- note\n"
+          spliced (harness/splice-managed-section notes "compiled view")]
+      (is (= (str harness/begin-marker "\ncompiled view\n" harness/end-marker)
+             (harness/managed-section spliced)))
+      (is (= spliced (str (harness/managed-section spliced)
+                          (harness/strip-managed-section spliced)))
+          "block + remainder reconstitutes the file: nothing is claimed twice")))
+  (testing "content with no block has no managed section"
+    (is (nil? (harness/managed-section "# Notes\nplain")))
+    (is (nil? (harness/managed-section nil)))))
+
+;; The markers today's compile writes are frozen, but strip has to keep
+;; recognising blocks written by every other version too: a block that stops
+;; stripping is silently re-ingested as if the user wrote it (notes-test
+;; covers the version-agnostic cases; these pin the cross-version ones).
+(def ^:private v2-begin "<!-- claimgraph:managed:begin:v2 -->")
+(def ^:private v2-end "<!-- claimgraph:managed:end:v2 -->")
+
+(deftest strip-spans-marker-generations
+  (testing "a block written by a future versioned marker strips too"
+    (is (= "before\nafter"
+           (harness/strip-managed-section
+            (str "before\n" v2-begin "\nview\n" v2-end "after")))))
+  (testing "an unterminated versioned begin still strips to EOF"
+    (is (= "before\n"
+           (harness/strip-managed-section (str "before\n" v2-begin "\nview, no end")))))
+  (testing "a begin paired with another generation's end degrades to EOF"
+    (is (= "before\n"
+           (harness/strip-managed-section
+            (str "before\n" v2-begin "\nview\n" harness/end-marker "\nnotes")))
+        "an end we cannot pair leaves the block undelimited: assume it is all ours"))
+  ;; The migration the FROZEN comment blesses, byte for byte: splice matches
+  ;; only its own generation's begin marker, so the first v2 compile prepends
+  ;; its block above the v1 one already in the file. If strip stopped at the
+  ;; first block, the v1 one below would be re-ingested as the user's words.
+  (testing "every generation's block strips, not just the first"
+    (let [rolled-out (str v2-begin "\nA\n" v2-end "\n"
+                          "user\n"
+                          harness/begin-marker "\nB\n" harness/end-marker "\ntail")
+          out (harness/strip-managed-section rolled-out)]
+      ;; both blocks gone, the newlines that bracketed them left alone
+      (is (= "\nuser\n\ntail" out))
+      (is (not (str/includes? out harness/begin-marker))
+          "a surviving old block is read back as if the user had written it")))
+  (testing "near-miss marker shapes strip instead of surviving"
+    (doseq [begin [v2-begin
+                   "<!-- claimgraph:managed:begin:v2-->"
+                   "<!--claimgraph:managed:begin:v2-->"
+                   "<!--  claimgraph:managed:begin:v2\t-->"
+                   "<!-- claimgraph:managed:begin: -->"]]
+      (is (= "before\n"
+             (harness/strip-managed-section (str "before\n" begin "\nview, no end")))
+          (str "unstripped, so re-ingested: " begin))))
+  (testing "an empty version suffix reads as the unversioned form"
+    (is (= "before\nafter"
+           (harness/strip-managed-section
+            (str "before\n<!-- claimgraph:managed:begin: -->\nview\n"
+                 harness/end-marker "after")))
+        "':' with nothing after it pairs with today's plain end marker")))
+
+;; The benchmark rewrites note files the way a compacting harness would, and
+;; it used to carry its own marker scan. Two scanners drift: the day markers
+;; gain a version, the bench drops the block it no longer recognises instead
+;; of leaving it in place, and the timeline stops exercising the echo-loop
+;; guard the benchmark exists to hold. It reads the block through
+;; harness/managed-section now — one scanner, this test its tripwire.
+(deftest bench-note-rewrite-keeps-any-generation-block
+  (let [f (str (fs/create-temp-dir {:prefix "claimgraph-bench-note-test"}) "/notes.md")]
+    (spit f (str v2-begin "\nview\n" v2-end "\nstale notes\n"))
+    (#'bench/write-note! f "fresh notes\n")
+    (let [out (slurp f)]
+      (is (str/includes? out v2-begin) "compaction squeezes the notes, not our block")
+      (is (str/includes? out "fresh notes"))
+      (is (not (str/includes? out "stale notes"))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Pure: sections and budget

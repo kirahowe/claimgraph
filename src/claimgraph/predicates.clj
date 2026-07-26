@@ -1,5 +1,5 @@
 (ns claimgraph.predicates
-  "The controlled predicate vocabulary: ~22 blessed :core/* predicates, each a
+  "The controlled predicate vocabulary: 23 blessed :core/* predicates, each a
   first-class queryable row in the store, anchored to established standards
   (PROV-O / SPDX / DOAP / SKOS / Dublin Core) via :maps-to. New predicates are
   coined in the :x/* namespace with :testing status and promoted once proven."
@@ -19,8 +19,11 @@
     :object-kind :entity :cardinality :many
     :status :stable :default-epistemic :observation :maps-to "codeontology:imports"
     :definition "Subject source unit imports/requires the object unit."}
+   ;; No :inverse-of: contains<->part-of is the one containment pair, and
+   ;; defined-in has no true inverse here. Declaring one would give contains
+   ;; two claimants and break the bijection (see logic-test).
    {:id :core/defined-in :label "defined in" :category :structural
-    :object-kind :entity :cardinality :one :inverse-of :core/contains
+    :object-kind :entity :cardinality :one
     :status :stable :default-epistemic :observation :maps-to "spdx:CONTAINED_BY"
     :definition "Subject (function, class, namespace) is defined in the object (file, module)."}
    {:id :core/contains :label "contains" :category :structural

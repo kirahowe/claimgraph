@@ -1,9 +1,11 @@
 (ns claimgraph.logic-test
   "The payoff of the functional core: assertion decisions, confidence views,
   and BFS folds tested as plain functions over values — no store, no clock,
-  no fixtures."
+  no fixtures. The seeded vocabulary is a value too, so its invariants are
+  checked here rather than through a store."
   (:require [clojure.test :refer [deftest is testing]]
-            [claimgraph.logic :as logic]))
+            [claimgraph.logic :as logic]
+            [claimgraph.predicates :as preds]))
 
 (def t0 #inst "2026-01-01T00:00:00Z")
 (def t1 #inst "2026-06-01T00:00:00Z")
@@ -21,6 +23,23 @@
 (def existing-v1
   {:id "f-old" :predicate :core/has-version :object-kind :literal
    :object-lit "1.0" :epistemic :observation :t-valid t0 :confidence 0.8})
+
+;; The seed ships into every user's store and is effectively frozen once
+;; shipped, so a malformed inverse is only cheap to fix today. Nothing reads
+;; :inverse-of yet (inverses are computed at query time), which is exactly
+;; why the rot goes unnoticed without this check.
+(deftest seed-inverses-are-bijective
+  (let [by-id (into {} (map (juxt :id identity)) preds/seed)
+        declared (into {} (keep (fn [{:keys [id inverse-of]}]
+                                  (when inverse-of [id inverse-of])))
+                       preds/seed)]
+    (is (seq declared) "the seed still declares inverses; this test is not vacuous")
+    (doseq [[id inv] declared]
+      (is (contains? by-id inv)
+          (str id " declares :inverse-of " inv ", which is not in the seed"))
+      (is (= id (get declared inv))
+          (str id " and " inv " must name each other; an inverse with two "
+               "claimants is a lie the query layer never checks")))))
 
 (deftest decide-assert-is-a-pure-function
   (testing "no existing facts -> insert"

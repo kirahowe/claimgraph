@@ -39,16 +39,13 @@
 (defn- write-note!
   "The harness rewriting a note file: fresh content replaces the old, but an
   existing managed section stays where it is — compaction squeezes Claude's
-  own notes, not claimgraph's compiled block."
+  own notes, not claimgraph's compiled block. The block is found by the same
+  reader ingestion strips with, so the bench cannot drift into measuring a
+  graph that re-consumes a section it failed to recognise."
   [f content]
   (let [old (when (fs/exists? f) (slurp f))
-        begin (some-> old (str/index-of harness/begin-marker))
-        end (when begin
-              (some-> (str/index-of old harness/end-marker begin)
-                      (+ (count harness/end-marker))))]
-    (spit f (if end
-              (str (subs old begin end) "\n\n" content)
-              content))))
+        section (some-> old harness/managed-section)]
+    (spit f (if section (str section "\n\n" content) content))))
 
 (defn- run-step! [s {:keys [code-dir notes-dir]} {:keys [op] :as step}]
   (case op

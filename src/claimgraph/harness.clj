@@ -18,21 +18,81 @@
             [clojure.string :as str]
             [claimgraph.logic :as logic]))
 
+;; FROZEN. These two strings already sit in users' inject files on every
+;; machine claimgraph has ever compiled on, and stripping them is the whole
+;; echo-loop guard: a block we no longer recognise is read back as if the
+;; user had written it, inflating confidence in our own output with nothing
+;; to catch it (no error, just slow drift). Never edit them in place — a new
+;; generation of markers appends a version suffix (":v2").
+;;
+;; What makes that migration safe is strip-managed-section removing EVERY
+;; managed block it can recognise, of any generation. Splice is deliberately
+;; not version-aware: the first compile after a v2 rollout writes its own
+;; begin marker, does not find the v1 block already in the file, and so
+;; leaves two blocks behind. Both strip. Keep that property when touching
+;; strip, or the rollout hands the old block back as the user's own words.
 (def begin-marker "<!-- claimgraph:managed:begin -->")
 (def end-marker "<!-- claimgraph:managed:end -->")
 
+;; Loose on purpose. Interior whitespace is whatever last touched the file
+;; left behind (an editor reflow, a hand-edit, a harness's own rewriter),
+;; and a half-recognised marker is the one shape that would survive into the
+;; graph while every other unrecognised shape degrades to strip-to-EOF. An
+;; empty suffix ("...begin: -->") names no generation, so it reads as the
+;; unversioned form rather than as a generation of its own.
+(def ^:private marker-patterns
+  {:begin #"<!--\s*claimgraph:managed:begin(?::([^\s>]*))?\s*-->"
+   :end #"<!--\s*claimgraph:managed:end(?::([^\s>]*))?\s*-->"})
+
+(defn- find-marker
+  "First :begin/:end marker at or after from, any version:
+  {:from :to :version} with :version nil for the unversioned form."
+  [s kind from]
+  (let [m (re-matcher (marker-patterns kind) s)]
+    (when (.find m (int from))
+      {:from (.start m) :to (.end m) :version (not-empty (.group m 1))})))
+
+(defn- next-block
+  "First managed block at or after from as {:from :to}, or nil when no begin
+  marker remains. :to is EOF for a begin we cannot pair — an undelimited
+  block is assumed to be ours all the way down."
+  [s from]
+  (when-let [begin (find-marker s :begin from)]
+    (let [end (loop [at (:to begin)]
+                (when-let [e (find-marker s :end at)]
+                  (if (= (:version e) (:version begin)) e (recur (:to e)))))]
+      {:from (:from begin) :to (if end (:to end) (count s))})))
+
 (defn strip-managed-section
-  "Remove the marker-delimited managed section (markers included). A begin
-  marker without an end strips to EOF — when in doubt, never re-consume our
-  own view. Content without markers passes through untouched."
+  "Remove every marker-delimited managed section (markers included). Content
+  without markers passes through untouched.
+
+  Version-tolerant by design: a begin marker of any generation (the current
+  one or a future ':v2' form) opens a section, and only an end marker of the
+  SAME generation closes it. Anything else — no end marker, or one from a
+  different generation — strips to EOF, because the only safe reading of a
+  block we cannot delimit is that all of it is ours; re-consuming our own
+  view is the failure we cannot detect.
+
+  Every block goes, not just the first: a marker-version rollout leaves an
+  older generation's block in the file (splice writes only its own), and one
+  surviving block is one block re-ingested as if the user had written it."
   [content]
-  (let [s (str content)
-        begin (str/index-of s begin-marker)]
-    (if-not begin
-      s
-      (let [end (str/index-of s end-marker begin)
-            after (if end (subs s (+ end (count end-marker))) "")]
-        (str (subs s 0 begin) after)))))
+  (let [s (str content)]
+    (loop [kept [] from 0]
+      (if-let [b (next-block s from)]
+        (recur (conj kept (subs s from (:from b))) (:to b))
+        (str/join (conj kept (subs s from)))))))
+
+(defn managed-section
+  "The first managed block in content, markers included — the first of what
+  strip-managed-section takes out — or nil when there is none. Callers that
+  carry the block across a rewrite read it here instead of scanning for
+  markers themselves; one scanner means one place that knows marker shapes."
+  [content]
+  (let [s (str content)]
+    (when-let [b (next-block s 0)]
+      (subs s (:from b) (:to b)))))
 
 (defn splice-managed-section
   "Replace the marker-delimited managed section of content with inner
