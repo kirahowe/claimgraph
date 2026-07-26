@@ -26,16 +26,24 @@
 
 (def settings
   "The registry of configurable settings: option key -> where a value may
-  come from. :opt-key is the CLI option when it differs from the setting name
-  (--dir means the notes dir on the commands that take it). A nil :default
-  means the consumer computes one (documented in :desc)."
+  come from. A nil :default means the consumer computes one (documented in
+  :desc).
+
+  A setting's name IS its flag, always. The registry used to allow a setting
+  to be spelled differently on the command line (:notes-dir was --dir), and
+  that indirection is how `setup --notes-dir` persisted a key no runtime
+  consumer read while `setup --dir` persisted nothing at all: two names for
+  one setting means two places to keep in sync, and they did not stay in
+  sync. Old spellings are the CLI's business now — cli.clj folds a verb's
+  legacy flag onto the canonical one before the env and config layers are
+  consulted, so the alias keeps working without the registry knowing."
   (array-map
    :db {:flag "--db" :env "CLAIMGRAPH_DB" :default ".claimgraph/db"
         :desc "Store path (an LMDB directory; the format stamp, oplog, evidence, lock, and stamp files derive from it as siblings)."}
    :harness {:flag "--harness" :env "CLAIMGRAPH_HARNESS" :default "claude-code"
              :desc "Which harness's auto-memory the ambient loop consumes (claude-code | codex)."}
-   :notes-dir {:flag "--dir" :opt-key :dir :env "CLAIMGRAPH_NOTES_DIR"
-               :desc "The harness's auto-memory notes directory. Default: resolved per harness from its own layout, honoring CLAUDE_CONFIG_DIR / CODEX_HOME."}
+   :notes-dir {:flag "--notes-dir" :env "CLAIMGRAPH_NOTES_DIR"
+               :desc "The harness's auto-memory notes directory (--dir is the older spelling and still works on the verbs that took it). Default: resolved per harness from its own layout, honoring CLAUDE_CONFIG_DIR / CODEX_HOME."}
    :inject-file {:flag "--inject-file" :env "CLAIMGRAPH_INJECT_FILE"
                  :desc "The file the harness injects at session start — compile-context's write target, relative to the notes dir (or absolute). Default per harness: MEMORY.md / memory_summary.md."}
    :settings-file {:flag "--settings-file" :env "CLAIMGRAPH_SETTINGS_FILE"
@@ -44,6 +52,9 @@
                 :desc "Where `setup` installs the agent skill. Default: <project>/.claude/skills."}
    :extractor {:flag "--extractor" :env "CLAIMGRAPH_LLM_CMD" :default "claude -p"
                :desc "LLM command for extraction and judging: prompt on stdin, completion on stdout."}
+   :llm-timeout-ms {:flag "--llm-timeout-ms" :env "CLAIMGRAPH_LLM_TIMEOUT_MS"
+                    :coerce :long
+                    :desc "How long any one LLM shell-out may run before its process tree is killed. Default: claimgraph.llm/default-timeout-ms (120000) — under the SessionEnd hook one wedged call would otherwise eat the hook's whole budget."}
    :evidence-dir {:flag "--evidence-dir" :env "CLAIMGRAPH_EVIDENCE_DIR"
                   :desc "Content-addressed raw-evidence store. Default: <db>.evidence."}
    :consolidate-days {:flag "--consolidate-days" :env "CLAIMGRAPH_CONSOLIDATE_DAYS"
@@ -178,7 +189,7 @@
   when unset everywhere and there is no static default."
   [k {:keys [opts env config]}]
   (let [spec (get settings k)
-        opt (get opts (or (:opt-key spec) k))
+        opt (get opts k)
         env-v (some->> (:env spec) (get env))
         cfg-v (get config k)]
     (cond
@@ -195,10 +206,9 @@
   only sees a value the user actually set somewhere."
   [opts ctx ks]
   (reduce (fn [o k]
-            (let [ok (or (:opt-key (get settings k)) k)
-                  {:keys [value source]} (resolve-setting k (assoc ctx :opts o))]
-              (if (and (contains? #{:env :config} source) (nil? (get o ok)))
-                (assoc o ok value)
+            (let [{:keys [value source]} (resolve-setting k (assoc ctx :opts o))]
+              (if (and (contains? #{:env :config} source) (nil? (get o k)))
+                (assoc o k value)
                 o)))
           opts ks))
 

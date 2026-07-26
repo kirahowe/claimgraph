@@ -17,16 +17,75 @@
 (def ^:private global-spec
   {:db {:desc "Database path (default: $CLAIMGRAPH_DB, .claimgraph/config.json, or ./.claimgraph/db)"}
    :pretty {:coerce :boolean :desc "Pretty-print JSON output"}
-   :json {:coerce :boolean :desc "Force JSON output (audit defaults to the human scorecard at a terminal)"}})
+   :json {:coerce :boolean :desc "Force JSON output (audit defaults to the human scorecard at a terminal)"}
+   :llm-timeout-ms {:coerce :long :desc "Per-call LLM timeout in ms (default 120000)"}})
+
+;; ---------------------------------------------------------------------------
+;; Exit status
+;; ---------------------------------------------------------------------------
+
+(def ok-exit 0)
+
+(def error-exit
+  "A command that ran and could not do what it was asked — the documented
+  JSON-on-stderr contract."
+  1)
+
+(def usage-exit
+  "A command line claimgraph could not act on at all: an unknown verb, an
+  unknown subcommand, a verb given none. Distinct from error-exit because the
+  two need different responses and a caller that sees one number cannot tell
+  them apart — a judge that could not reach its LLM is worth retrying, a typo
+  in a SessionEnd hook command line never is. 2 is the shell's own convention
+  for a usage error."
+  2)
 
 (defn- db-path [opts]
   (config/value :db opts))
 
-(defn- llm-command-opts
-  "Commands whose LLM shell-out is --command: same resolution chain as
-  --extractor (flag > $CLAIMGRAPH_LLM_CMD > config extractor > claude -p)."
+(defn- accept-alias
+  "Fold a verb's older flag spelling onto the one that setting is now called,
+  unless the canonical flag was passed too.
+
+  Renaming a flag in an alpha still breaks the command lines the project's own
+  README, SKILL.md and installed hooks teach, so every rename here keeps its
+  predecessor working. Folded BEFORE config/with-defaults runs, so an explicit
+  legacy flag still outranks the environment and the config file — merging the
+  layers first would let $CLAIMGRAPH_NOTES_DIR quietly beat an explicit
+  --dir."
+  [opts canonical alias]
+  (cond-> opts
+    (and (nil? (get opts canonical)) (some? (get opts alias)))
+    (assoc canonical (get opts alias))))
+
+(defn- install-llm-timeout!
+  "Make the LLM call timeout resolve like every other knob.
+
+  claimgraph.llm reads $CLAIMGRAPH_LLM_TIMEOUT_MS itself and nothing threads a
+  per-call timeout down to it, so a value in .claimgraph/config.json was a
+  setting `claim config` could report and no call would obey. The shell
+  resolves the chain once and installs the answer as the process default —
+  the same shape as every other setting, resolved in the one place that owns
+  resolution. Nothing is installed when the knob is unset anywhere, so an
+  ordinary run neither loads llm.clj early nor pays for the lookup."
   [opts]
-  (update opts :command #(or % (config/value :extractor {}))))
+  (let [ms (config/value :llm-timeout-ms opts)]
+    (when (and (number? ms) (pos? ms))
+      (when-let [v (try (requiring-resolve 'claimgraph.llm/default-timeout-ms)
+                        (catch Throwable _ nil))]
+        (alter-var-root v (constantly (long ms))))))
+  opts)
+
+(defn- llm-opts
+  "Preflight for every verb that shells out to an LLM. Two resolutions no
+  command should reinvent: the call timeout (above), and --command falling
+  back to the chain --extractor resolves through (flag > $CLAIMGRAPH_LLM_CMD >
+  config > claude -p). That fallback used to resolve against an EMPTY opts
+  map, which meant `judge --extractor mycmd` and `consolidate --extractor
+  mycmd` accepted the flag, ignored it, and shelled out to claude -p."
+  [opts]
+  (install-llm-timeout! opts)
+  (update opts :command #(or % (config/value :extractor opts))))
 
 (defn- emit
   "Every command's output, through the canonical encoder. Command output is
@@ -125,13 +184,60 @@
         (log-reads! opts :facts (:facts r))
         (emit opts r)))))
 
+(defn- subgraph-entities
+  "The walk's facts as a node list with hop distances from the root, in the
+  shape the BFS neighborhood reports. Distance is measured through the
+  returned facts, which is the same question the BFS's :depth answers: every
+  fact the walk collects touches the previous round's frontier, so every node
+  it reports is reachable from the root through the facts it reports too."
+  [root facts]
+  (let [nodes (into {(:id root) root}
+                    (comp (mapcat (juxt :subject :object-ref))
+                          (remove nil?)
+                          (map (juxt :id identity)))
+                    facts)
+        adj (reduce (fn [m {:keys [subject object-ref]}]
+                      (let [a (:id subject) b (:id object-ref)]
+                        (if (and a b)
+                          (-> m (update a (fnil conj #{}) b)
+                              (update b (fnil conj #{}) a))
+                          m)))
+                    {} facts)]
+    (loop [depths {(:id root) 0} frontier #{(:id root)} d 0]
+      (let [next-ids (into #{} (comp (mapcat adj) (remove depths)) frontier)]
+        (if (empty? next-ids)
+          (->> nodes
+               (map (fn [[id n]] (assoc n :depth (get depths id))))
+               (sort-by (fn [n] [(or (:depth n) Integer/MAX_VALUE) (str (:id n))]))
+               vec)
+          (recur (into depths (map (fn [id] [id (inc d)])) next-ids)
+                 next-ids (inc d)))))))
+
+(defn- walk-neighborhood
+  "The guided walk in the neighborhood's shape, so `neighbor` answers with one
+  object rather than two. With --query it used to drop :entities and :depth
+  and report :walk-score where the BFS reported :effective-confidence — the
+  same verb, two incompatible payloads, and no way to write one reader for
+  it. The walk keeps everything that makes it a walk (:query, :walk-score,
+  its own ordering) and gains everything the neighborhood promised."
+  [{:keys [root facts] :as walk} now]
+  (let [facts (mapv #(assoc % :effective-confidence (logic/effective-confidence % now))
+                    facts)
+        entities (subgraph-entities root facts)]
+    (assoc walk
+           :facts facts
+           :entities entities
+           :depth (reduce max 0 (keep :depth entities)))))
+
 (defn cmd-neighbor [{:keys [opts]}]
   (with-store opts
     (fn [s]
       (emit opts
             (if (:query opts)
-              (core/guided-walk s (select-keys opts [:entity :entity-scope
-                                                     :query :budget :beam]))
+              (walk-neighborhood
+               (core/guided-walk s (select-keys opts [:entity :entity-scope
+                                                      :query :budget :beam]))
+               (core/now))
               (core/get-neighborhood s (assoc (select-keys opts [:entity :entity-scope :depth
                                                                  :scope :min-confidence :predicate])
                                               :as-of (parse-time (:as-of opts)))))))))
@@ -173,19 +279,29 @@
     (fn [s] (emit opts (core/conflicts s)))))
 
 (defn cmd-judge [{:keys [opts]}]
-  (let [judge (requiring-resolve (if (:sweep opts)
+  (let [opts (-> opts
+                 (accept-alias :min-verdict-confidence :min-confidence)
+                 llm-opts)
+        judge (requiring-resolve (if (:sweep opts)
                                    'claimgraph.judge/sweep-conflicts!
                                    'claimgraph.judge/judge-conflicts!))]
     (with-write-store opts
       (fn [s]
-        (emit opts (judge s (select-keys (llm-command-opts opts)
-                                         [:command :resolve :min-confidence])))))))
+        (emit opts (judge s {:command (:command opts)
+                             :resolve (:resolve opts)
+                             :min-confidence (:min-verdict-confidence opts)}))))))
 
-(defn cmd-entity-ensure [{:keys [opts]}]
+(defn cmd-entity-ensure
+  "Reports {status, entity} like `entity rename` and `entity alias` do. It
+  used to answer with the bare entity — a mutation whose output a caller had
+  to recognise by its shape rather than read a status off, alone among the
+  entity verbs."
+  [{:keys [opts]}]
   (with-write-store opts
-    (fn [s] (emit opts (core/ensure-entity s {:name (:name opts)
-                                              :type (:type opts)
-                                              :scope (:scope opts)})))))
+    (fn [s] (emit opts {:status :ensured
+                        :entity (core/ensure-entity s {:name (:name opts)
+                                                       :type (:type opts)
+                                                       :scope (:scope opts)})}))))
 
 (defn cmd-entity-list [{:keys [opts]}]
   (with-store opts
@@ -216,11 +332,18 @@
   (with-store opts
     (fn [s] (emit opts (core/list-predicates s (select-keys opts [:category :status :usage]))))))
 
-(defn cmd-predicate-register [{:keys [opts]}]
+(defn cmd-predicate-register
+  "Reports {status, predicate}. The registry row is nested rather than merged
+  with the status: a predicate row HAS a :status of its own (staging, stable,
+  deprecated) and flattening the report over it would answer a question about
+  the vocabulary with a fact about the command."
+  [{:keys [opts]}]
   (with-write-store opts
-    (fn [s] (emit opts (core/register-predicate
-                        s (select-keys opts [:id :label :category :object-kind
-                                             :cardinality :definition :default-epistemic]))))))
+    (fn [s] (emit opts {:status :registered
+                        :predicate (core/register-predicate
+                                    s (select-keys opts [:id :label :category :object-kind
+                                                         :cardinality :definition
+                                                         :default-epistemic]))}))))
 
 (defn cmd-predicate-promote [{:keys [opts]}]
   (with-write-store opts
@@ -229,9 +352,17 @@
                                              :object-kind :cardinality :maps-to
                                              :default-epistemic]))))))
 
-(defn cmd-episode-open [{:keys [opts]}]
+(defn cmd-episode-open
+  "Reports the new episode with a status, its id under :episode. `episode
+  close` already calls an episode id :episode, and :episode is the flag every
+  verb that takes one spells — so the id an `episode open` is run to obtain
+  comes back under the name the next command wants it by, instead of under
+  :id on a bare row with no status at all."
+  [{:keys [opts]}]
   (with-write-store opts
-    (fn [s] (emit opts (core/open-episode s (select-keys opts [:source-type :ref]))))))
+    (fn [s]
+      (let [ep (core/open-episode s (select-keys opts [:source-type :ref]))]
+        (emit opts (assoc (dissoc ep :id) :status :opened :episode (:id ep)))))))
 
 (defn cmd-episode-close [{:keys [opts]}]
   (with-write-store opts
@@ -254,12 +385,16 @@
         (emit opts (core/ingest s (select-keys opts [:episode :source-type :ref]) facts))))))
 
 (defn cmd-ingest-code [{:keys [opts]}]
-  (let [ingest-code (requiring-resolve 'claimgraph.ingest.code/ingest!)]
+  ;; --project is the project root on every other verb, and ingest-code takes
+  ;; nothing else; it accepted --project silently and analysed the cwd anyway.
+  (let [opts (accept-alias opts :project :dir)
+        ingest-code (requiring-resolve 'claimgraph.ingest.code/ingest!)]
     (with-write-store opts
-      (fn [s] (emit opts (ingest-code s (select-keys opts [:dir :scope :language])))))))
+      (fn [s] (emit opts (ingest-code s (assoc (select-keys opts [:scope :language])
+                                               :dir (:project opts))))))))
 
-(defn cmd-session-extract [{:keys [opts]}]
-  (let [opts (config/with-defaults opts [:extractor])
+(defn cmd-ingest-session [{:keys [opts]}]
+  (let [opts (-> (config/with-defaults opts [:extractor]) llm-opts)
         extract (requiring-resolve 'claimgraph.ingest.session/extract!)]
     (with-write-store opts
       (fn [s]
@@ -267,21 +402,26 @@
                                      :evidence-dir (evidence-dir opts))))))))
 
 (defn cmd-ingest-notes [{:keys [opts]}]
-  (let [opts (config/with-defaults opts [:harness :notes-dir :extractor])
+  (let [opts (-> (accept-alias opts :notes-dir :dir)
+                 (config/with-defaults [:harness :notes-dir :extractor])
+                 llm-opts)
         ingest-notes (requiring-resolve 'claimgraph.ingest.notes/ingest!)]
     (with-write-store opts
       (fn [s]
-        (emit opts (ingest-notes s (assoc (select-keys opts [:harness :dir :project
+        (emit opts (ingest-notes s (assoc (select-keys opts [:harness :project
                                                              :extractor :dry-run])
+                                          :dir (:notes-dir opts)
                                           :evidence-dir (evidence-dir opts))))))))
 
 (defn cmd-ingest-adr [{:keys [opts]}]
-  (let [ingest-adr (requiring-resolve 'claimgraph.ingest.adr/ingest!)]
+  (let [opts (accept-alias opts :adr-dir :dir)
+        ingest-adr (requiring-resolve 'claimgraph.ingest.adr/ingest!)]
     (with-write-store opts
-      (fn [s] (emit opts (ingest-adr s (select-keys opts [:dir :file :dry-run])))))))
+      (fn [s] (emit opts (ingest-adr s (assoc (select-keys opts [:file :dry-run])
+                                              :dir (:adr-dir opts))))))))
 
 (defn cmd-ingest-failure [{:keys [opts]}]
-  (let [opts (config/with-defaults opts [:extractor])
+  (let [opts (-> (config/with-defaults opts [:extractor]) llm-opts)
         extract (requiring-resolve 'claimgraph.ingest.failure/extract!)]
     (with-write-store opts
       (fn [s]
@@ -310,13 +450,15 @@
                                              {:type :evidence-missing :evidence hash}))})))))
 
 (defn cmd-compile-context [{:keys [opts]}]
-  (let [opts (config/with-defaults opts [:harness :notes-dir :inject-file])
+  (let [opts (-> (accept-alias opts :notes-dir :dir)
+                 (config/with-defaults [:harness :notes-dir :inject-file]))
         compile-context (requiring-resolve 'claimgraph.context/compile!)]
     (with-store opts
       (fn [s]
-        (emit opts (compile-context s (select-keys opts [:harness :dir :project
-                                                         :inject-file :budget
-                                                         :dry-run])))))))
+        (emit opts (compile-context s (assoc (select-keys opts [:harness :project
+                                                                :inject-file :budget
+                                                                :dry-run])
+                                             :dir (:notes-dir opts))))))))
 
 (defn cmd-coach [{:keys [opts args]}]
   (let [consult (requiring-resolve 'claimgraph.coach/consult)]
@@ -347,18 +489,32 @@
     (with-write-store opts
       (fn [s] (emit opts (outcome! s (db-path opts) {:valence valence}))))))
 
-(defn cmd-hooks-run [{:keys [opts]}]
-  (let [opts (-> (config/with-defaults opts [:harness :notes-dir :inject-file
-                                             :extractor :consolidate-days :code-ingest])
-                 llm-command-opts)
-        run (requiring-resolve 'claimgraph.hooks/run!)]
-    (with-write-store opts
-      (fn [s]
-        (emit opts (run s (assoc (select-keys opts [:harness :project :dir :inject-file
-                                                    :extractor :consolidate-days :command
-                                                    :resolve :min-confidence :code-ingest])
-                                 :db (db-path opts)
-                                 :evidence-dir (evidence-dir opts))))))))
+(defn cmd-hooks-run
+  "The SessionEnd pass. A partial pass still exits 0 — a hook that fails is
+  worse than a hook that reports, and a stage failing is exactly when the
+  next session most needs the view the other stages did recompile — but CI
+  and cron need to be able to see it, so --fail-on-partial turns the same
+  report into a non-zero status without changing what it says."
+  [{:keys [opts]}]
+  (let [opts (-> opts
+                 (accept-alias :notes-dir :dir)
+                 (accept-alias :min-verdict-confidence :min-confidence)
+                 (config/with-defaults [:harness :notes-dir :inject-file
+                                        :extractor :consolidate-days :code-ingest])
+                 llm-opts)
+        run (requiring-resolve 'claimgraph.hooks/run!)
+        r (with-write-store opts
+            (fn [s]
+              (run s (assoc (select-keys opts [:harness :project :inject-file
+                                               :extractor :consolidate-days :command
+                                               :resolve :code-ingest])
+                            :dir (:notes-dir opts)
+                            :min-confidence (:min-verdict-confidence opts)
+                            :db (db-path opts)
+                            :evidence-dir (evidence-dir opts)))))]
+    (emit opts r)
+    (when (and (:fail-on-partial opts) (= :partial (:status r)))
+      error-exit)))
 
 (defn cmd-hooks-install [{:keys [opts]}]
   (let [opts (config/with-defaults opts [:harness :settings-file :consolidate-days])
@@ -416,37 +572,53 @@
     (fn [s] (emit opts (core/stats s)))))
 
 (defn cmd-consolidate [{:keys [opts]}]
-  (let [consolidate (requiring-resolve 'claimgraph.consolidate/consolidate!)]
+  (let [opts (-> opts
+                 (accept-alias :min-verdict-confidence :min-confidence)
+                 llm-opts)
+        consolidate (requiring-resolve 'claimgraph.consolidate/consolidate!)]
     (with-write-store opts
       (fn [s]
-        (emit opts (consolidate s (select-keys (llm-command-opts opts)
-                                               [:command :resolve :min-confidence
-                                                :min-usage])))))))
+        (emit opts (consolidate s (assoc (select-keys opts [:command :resolve :min-usage])
+                                         :min-confidence (:min-verdict-confidence opts))))))))
+
+(defn- audit-scan-dirs
+  "audit's extra scan directories under both spellings. --scan-dir is what
+  they are; --dir is what they were called when it also meant the notes dir
+  everywhere else. They are a repeatable list of extra sources, so passing
+  both adds both rather than one shadowing the other."
+  [opts]
+  (into (vec (:scan-dir opts)) (:dir opts)))
+
+(defn- audit-scorecard?
+  "Pure: does this invocation want the human scorecard rather than JSON?
+
+  --pretty means pretty-printed JSON here exactly as it does on every other
+  verb. It used to switch the format outright, so `audit --pretty | jq` got a
+  human scorecard and no JSON at all — one flag with two meanings on the one
+  verb whose output people pipe. The scorecard is --scorecard now, and stays
+  what a human at a terminal gets without asking."
+  [{:keys [json pretty scorecard]} tty]
+  (boolean (and (not json) (not pretty) (or scorecard tty))))
 
 (defn cmd-audit [{:keys [opts]}]
   ;; The one verb that must NEVER open the real store: everything runs in a
-  ;; throwaway in-memory store, so no with-store here. On audit, --dir means
-  ;; extra scan directories (spec §2); the auto-memory notes dir override
-  ;; therefore flows only through $CLAIMGRAPH_NOTES_DIR / the config file.
-  (let [opts (config/with-defaults opts [:harness :extractor])
+  ;; throwaway in-memory store, so no with-store here.
+  (let [opts (-> (config/with-defaults opts [:harness :extractor])
+                 install-llm-timeout!)
         audit! (requiring-resolve 'claimgraph.audit/audit!)
         r (audit! {:project (:project opts)
                    :harness (:harness opts)
                    :files (:file opts)
-                   :dirs (:dir opts)
-                   :notes-dir (config/value :notes-dir {})
+                   :dirs (audit-scan-dirs opts)
+                   :notes-dir (config/value :notes-dir opts)
                    :no-code (:no-code opts)
                    :no-judge (:no-judge opts)
                    :extractor (:extractor opts)})]
     (when-let [f (:out opts)]
       (spit f (str (wire/generate-string r {:pretty true}) "\n")))
-    ;; A human at a terminal gets the scorecard; a pipe, script, or agent
-    ;; gets JSON. --pretty and --json force either way.
-    (cond
-      (:json opts) (emit opts r)
-      (or (:pretty opts) (tty?))
+    (if (audit-scorecard? opts (tty?))
       (println ((requiring-resolve 'claimgraph.audit/render-pretty) r))
-      :else (emit opts r))))
+      (emit opts r))))
 
 (def ^:private setup-persist-keys
   "Settings a `claim setup` invocation may persist to .claimgraph/config.json —
@@ -454,13 +626,18 @@
   [:db :harness :notes-dir :inject-file :settings-file :skills-dir
    :extractor :consolidate-days])
 
-(defn cmd-setup [{:keys [opts]}]
-  (let [chosen (select-keys opts setup-persist-keys)
+(defn cmd-setup
+  "Onboarding. :blocked exits non-zero: a blocked setup wired nothing, and a
+  caller that reads exit 0 as \"claimgraph is installed\" has no other signal
+  saying it isn't. The report still goes to stdout — it names the missing
+  prerequisite, which is the thing worth having."
+  [{:keys [opts]}]
+  (let [opts (accept-alias opts :notes-dir :dir)
+        chosen (select-keys opts setup-persist-keys)
         opts (config/with-defaults opts [:harness :notes-dir :settings-file
                                          :skills-dir :consolidate-days])
-        run! (requiring-resolve 'claimgraph.setup/run!)]
-    (emit opts
-          (run! (assoc (select-keys opts [:project :bin :db :harness :settings-file
+        run! (requiring-resolve 'claimgraph.setup/run!)
+        r (run! (assoc (select-keys opts [:project :bin :db :harness :settings-file
                                           :skills-dir :consolidate-days :coach
                                           :mcp :dry-run])
                        :chosen chosen
@@ -469,14 +646,17 @@
                                     (fn [s]
                                       {:status :initialized
                                        :db (str (fs/canonicalize (db-path opts)))
-                                       :predicates (count (store/-list-predicates s {}))}))))))))
+                                       :predicates (count (store/-list-predicates s {}))})))))]
+    (emit opts r)
+    (when (= :blocked (:status r)) error-exit)))
 
 (defn cmd-config [{:keys [opts]}]
-  (let [opts+ (config/with-defaults opts [:harness :notes-dir :inject-file
+  (let [opts (accept-alias opts :notes-dir :dir)
+        opts+ (config/with-defaults opts [:harness :notes-dir :inject-file
                                           :settings-file :skills-dir])
         h ((requiring-resolve 'claimgraph.harness/resolve-harness) (:harness opts+))
         notes-dir ((requiring-resolve 'claimgraph.harness/notes-path)
-                   h (select-keys opts+ [:dir :project]))
+                   h {:dir (:notes-dir opts+) :project (:project opts+)})
         project (str (fs/canonicalize (or (:project opts+) ".")))]
     (emit opts
           (assoc (config/describe opts)
@@ -535,15 +715,22 @@
 Usage: claim <command> [options]
 
 All commands accept --db PATH and --pretty. All output is JSON on stdout;
-errors are JSON on stderr with exit code 1. One exception: audit prints its
-human scorecard when stdout is a terminal (--json forces JSON there; piped
-or captured output is always JSON).
+errors are JSON on stderr. Exit 0 on success, 1 when a command ran and could
+not do what it was asked, 2 when the command line itself was wrong (unknown
+verb, unknown or missing subcommand) — a typo and a failure are different
+problems and a wrapper needs to tell them apart. One exception to the output
+rule: audit prints its human scorecard when stdout is a terminal (--json or
+--pretty force JSON there, --scorecard forces the scorecard; piped or
+captured output is always JSON).
 
 Nothing about file locations is assumed. Every setting resolves through one
 precedence chain — CLI flag > environment variable > .claimgraph/config.json
 > default — and `claim config` shows each one's value and where it came from.
+A setting's flag is its own name (--notes-dir sets notes-dir); where a flag
+has been renamed the old spelling still works on the verbs that took it.
 Harness defaults honor the harness's own relocations ($CLAUDE_CONFIG_DIR,
-$CODEX_HOME).
+$CODEX_HOME). Every LLM shell-out is bounded by --llm-timeout-ms /
+$CLAIMGRAPH_LLM_TIMEOUT_MS / llm-timeout-ms (default 120000).
 
 Commands:
   setup               One-shot onboarding for a project (idempotent, safe to
@@ -584,14 +771,17 @@ Commands:
                         filters false positives (judged-compatible pairs are
                         removed); it only reports — audit never resolves.
                         Exit 0 even with findings: it's a report.
-                        [--project DIR] [--file F]... [--dir D]... (extra
-                        sources beyond the default scan; on this verb --dir
-                        means extra directories, every *.md inside)
+                        [--project DIR] [--file F]... [--scan-dir D]...
+                        (extra sources beyond the default scan: every *.md
+                        inside; --dir is the older spelling and still adds
+                        one) [--notes-dir D] (the auto-memory dir to read)
                         [--no-code] (skip the staleness-vs-code prong)
                         [--no-judge] (skip the LLM verdict pass; report raw)
                         [--extractor CMD] [--out FILE] (also write the JSON
-                        scorecard to FILE) [--pretty|--json] (human scorecard
-                        is the default at a terminal, JSON when piped)
+                        scorecard to FILE) [--scorecard|--json|--pretty]
+                        (the human scorecard is the default at a terminal and
+                        --scorecard forces it; JSON when piped, and --pretty
+                        means pretty-printed JSON here as everywhere else)
   init                Create the store and seed the predicate vocabulary
                         (setup calls this; use directly for a bare store)
   assert              Assert a fact through validation + conflict resolution
@@ -619,7 +809,11 @@ Commands:
                         With --query \"...\" the fixed-depth BFS becomes an
                         evidence-guided walk: each round expands only the
                         [--beam 8] best edges by query-overlap × effective
-                        confidence, until [--budget 25] facts.
+                        confidence, until [--budget 25] facts. The walk
+                        answers in the same shape (root, entities with their
+                        hop distance, depth, facts with effective-confidence)
+                        plus the query and each fact's walk-score, so one
+                        reader parses both.
   coach               Gated push: claim coach \"task text\" — decides
                         WHETHER the graph holds something worth interrupting
                         with (standing decisions, known failure modes, open
@@ -640,10 +834,15 @@ Commands:
   judge               LLM-judge open conflicts: relation contradicts|duplicate|
                         supersedes|compatible per pair. Reports only, unless
                         --resolve, which acts on verdicts at/above
-                        --min-confidence (0.8): invalidates duplicates and
-                        superseded facts, unlinks compatible pairs. A
-                        contradicts verdict is never auto-resolved.
-                        [--command \"claude -p\"] (default $CLAIMGRAPH_LLM_CMD)
+                        --min-verdict-confidence (0.8; --min-confidence is the
+                        older spelling): invalidates duplicates and superseded
+                        facts, unlinks compatible pairs. The gate is the
+                        judge's confidence in its own verdict, which is why it
+                        is not the --min-confidence that filters facts on read.
+                        A contradicts verdict is never auto-resolved.
+                        [--command CMD | --extractor CMD] (both resolve the
+                        same chain: flag > $CLAIMGRAPH_LLM_CMD > config >
+                        claude -p)
                         --sweep generates candidates the write path can't
                         see (exclusive-value pairs, decision-category facts
                         sharing an object across predicates), judges them,
@@ -673,7 +872,7 @@ Commands:
                         further writes to it fail with the forwarding address.
   evidence            The raw bytes an episode was extracted from:
                         --episode ID | --hash SHA256 [--evidence-dir DIR]
-                        Provenance past the summary: session-extract and
+                        Provenance past the summary: ingest-session and
                         ingest-notes keep their raw input as immutable
                         content-addressed artifacts in <db>.evidence/ —
                         what the extractor dropped is never unrecoverable.
@@ -697,11 +896,13 @@ Commands:
                         language whose command emits the interchange format
                         (one JSON object per unit: unit, file, requires,
                         language; JSONL or array).
-                        [--dir .] [--scope code] [--language clojure]
-                        (--language filters to one analyzer; reconciliation
-                        stays scoped to it)
-  session-extract     LLM-extract durable facts from a session transcript
+                        [--project DIR] (the root to analyse, default cwd;
+                        --dir is the older spelling) [--scope code]
+                        [--language clojure] (--language filters to one
+                        analyzer; reconciliation stays scoped to it)
+  ingest-session      LLM-extract durable facts from a session transcript
                         (plain text or Claude Code session JSONL): --file F | stdin
+                        (session-extract is the older name and still works)
                         [--ref ID] [--dry-run] [--extractor \"claude -p\"]
                         Default extractor: $CLAIMGRAPH_LLM_CMD or \"claude -p\".
                         Extracted facts are capped at 0.7 confidence, source-type
@@ -709,19 +910,20 @@ Commands:
   ingest-notes        Ingest the harness's auto-memory notes (the ambient
                         capture tier): delta-detects changed note files and
                         extracts only those, one episode per (file, revision).
-                        [--harness claude-code] [--project DIR] [--dir NOTES_DIR]
+                        [--harness claude-code] [--project DIR] [--notes-dir D]
                         [--dry-run] [--extractor \"claude -p\"]
                         The notes dir defaults per harness (honoring
                         $CLAUDE_CONFIG_DIR / $CODEX_HOME); override with
-                        --dir, $CLAIMGRAPH_NOTES_DIR, or notes-dir in the
-                        project config.
+                        --notes-dir (--dir still works), $CLAIMGRAPH_NOTES_DIR,
+                        or notes-dir in the project config.
                         Notes ingest as agent inference: source-type agent-note,
                         confidence capped at 0.65, never commitments (a decision
                         reported by a note is demoted to an observation). No
                         reconciliation: notes the harness compacts away fade by
                         disuse instead of being invalidated. The managed
                         claimgraph section of MEMORY.md is never re-consumed.
-  ingest-adr          Mechanically parse decision records (no LLM): --dir D |
+  ingest-adr          Mechanically parse decision records (no LLM): --adr-dir D
+                        (--dir is the older spelling) |
                         --file F [--dry-run]; default dirs docs/adr,
                         docs/decisions, adr. Title/filename -> the ADR
                         entity; Status: -> has-status (a change supersedes,
@@ -748,7 +950,7 @@ Commands:
                         open conflicts, recent supersessions, top current
                         facts by effective confidence (code-derived facts
                         excluded — the view carries what the code can't say).
-                        [--harness claude-code] [--project DIR] [--dir NOTES_DIR]
+                        [--harness claude-code] [--project DIR] [--notes-dir D]
                         [--inject-file F] (write target; default per harness,
                         relative to the notes dir or absolute)
                         [--budget 25000] [--dry-run]
@@ -775,12 +977,17 @@ Commands:
                         due (stamp-gated, default every 7 days; 0 = always).
                         Stages report independently — an analyzer or
                         extractor failure never blocks the deterministic
-                        recompile. [--harness claude-code] [--project DIR]
-                        [--dir NOTES_DIR] [--inject-file F]
+                        recompile, and the pass still exits 0 with
+                        \"status\":\"partial\" — a hook that fails is worse
+                        than a hook that reports. [--fail-on-partial] turns
+                        that same report into exit 1 for CI.
+                        [--harness claude-code] [--project DIR]
+                        [--notes-dir D] [--inject-file F]
                         [--code-ingest session-end|manual] (manual opts the
                         code stage out of the ambient loop)
                         [--consolidate-days 7] [--extractor CMD]
-                        [--command CMD] [--resolve] [--min-confidence 0.8]
+                        [--command CMD] [--resolve]
+                        [--min-verdict-confidence 0.8]
   outcome             Close the loop on retrieved facts: claim outcome
                         accepted|rejected. Read verbs (facts/search/recall/
                         coach) log which facts they surfaced (<db>.retrievals);
@@ -832,85 +1039,166 @@ Commands:
                         --resolve), sweep for conflict candidates the write
                         path can't see, and report x/* predicates earning
                         promotion review.
-                        [--resolve] [--min-confidence 0.8] [--min-usage 3]
-                        [--command \"claude -p\"] (default $CLAIMGRAPH_LLM_CMD)
+                        [--resolve] [--min-verdict-confidence 0.8]
+                        [--min-usage 3]
+                        [--command CMD | --extractor CMD] (default
+                        $CLAIMGRAPH_LLM_CMD, then claude -p)
 ")
 
 (defn cmd-help [_]
   (println help-text))
 
+(declare table)
+
+(defn- cmd-unknown
+  "The table's catch-all. Bare `claim` is the help screen and a success;
+  anything else that reaches here is a verb claimgraph does not have, and
+  printing the whole help text to stdout and exiting 0 is how a typo in a
+  SessionEnd hook command line reads as a session that went fine. The verbs
+  are named the way babashka.cli names the subcommands of a verb it does
+  know, so one error shape answers \"what could I have written\" either way."
+  [{:keys [args]}]
+  (if-let [verb (first args)]
+    (logic/fail (str "Unknown command: " verb)
+                {:type :unknown-command
+                 :command verb
+                 :expected (vec (sort (distinct (keep (comp first :cmds) table))))
+                 :claimgraph/exit usage-exit
+                 :hint "run `claim help` for the full command list"})
+    (cmd-help nil)))
+
+(defn- expand-aliases
+  "Pure: one dispatch entry per accepted spelling of a verb.
+
+  A renamed verb has to answer to its old name for a long time — the name is
+  already written into installed SKILL.md files, README snippets, and hook
+  command lines on machines this release will never see, and none of those
+  get fixed by the rename. Aliases carry :alias-of so anything reading the
+  table can tell a second name from a second command."
+  [entries]
+  (into []
+        (mapcat (fn [{:keys [cmds aliases] :as e}]
+                  (let [e (dissoc e :aliases)]
+                    (cons e (map #(assoc e :cmds % :alias-of cmds) aliases)))))
+        entries))
+
 (def table
-  [{:cmds ["setup"] :fn cmd-setup
-    :spec {:coach {:coerce :boolean} :mcp {:coerce :boolean}
-           :dry-run {:coerce :boolean} :consolidate-days {:coerce :long}}}
-   {:cmds ["audit"] :fn cmd-audit
-    :spec {:file {:coerce []} :dir {:coerce []}
-           :no-code {:coerce :boolean} :no-judge {:coerce :boolean}}}
-   {:cmds ["config"] :fn cmd-config}
-   {:cmds ["version"] :fn cmd-version}
-   {:cmds ["init"] :fn cmd-init}
-   {:cmds ["assert"] :fn cmd-assert :spec {:confidence {:coerce :double}}}
-   {:cmds ["facts"] :fn cmd-facts :spec {:min-confidence {:coerce :double}
-                                         :include-invalidated {:coerce :boolean}}}
-   {:cmds ["neighbor"] :fn cmd-neighbor :spec {:depth {:coerce :long}
-                                               :budget {:coerce :long}
-                                               :beam {:coerce :long}
-                                               :min-confidence {:coerce :double}}}
-   {:cmds ["recall"] :fn cmd-recall :spec {:min-hits {:coerce :long}}}
-   {:cmds ["coach"] :fn cmd-coach :spec {:hook {:coerce :boolean}}}
-   {:cmds ["outcome"] :fn cmd-outcome}
-   {:cmds ["mcp"] :fn cmd-mcp}
-   {:cmds ["history"] :fn cmd-history}
-   {:cmds ["search"] :fn cmd-search}
-   {:cmds ["invalidate"] :fn cmd-invalidate}
-   {:cmds ["conflicts"] :fn cmd-conflicts}
-   {:cmds ["judge"] :fn cmd-judge :spec {:resolve {:coerce :boolean}
-                                         :sweep {:coerce :boolean}
-                                         :min-confidence {:coerce :double}}}
-   {:cmds ["entity" "ensure"] :fn cmd-entity-ensure}
-   {:cmds ["entity" "list"] :fn cmd-entity-list}
-   {:cmds ["entity" "rename"] :fn cmd-entity-rename}
-   {:cmds ["entity" "alias"] :fn cmd-entity-alias}
-   {:cmds ["entity" "merge"] :fn cmd-entity-merge}
-   {:cmds ["entity" "split"] :fn cmd-entity-split}
-   {:cmds ["entity" "duplicates"] :fn cmd-entity-duplicates}
-   {:cmds ["predicates"] :fn cmd-predicates :spec {:usage {:coerce :boolean}}}
-   {:cmds ["predicate" "register"] :fn cmd-predicate-register}
-   {:cmds ["predicate" "promote"] :fn cmd-predicate-promote}
-   {:cmds ["evidence"] :fn cmd-evidence}
-   {:cmds ["episode" "open"] :fn cmd-episode-open}
-   {:cmds ["episode" "close"] :fn cmd-episode-close}
-   {:cmds ["episode" "list"] :fn cmd-episode-list}
-   {:cmds ["ingest-code"] :fn cmd-ingest-code}
-   {:cmds ["ingest"] :fn cmd-ingest}
-   {:cmds ["session-extract"] :fn cmd-session-extract :spec {:dry-run {:coerce :boolean}}}
-   {:cmds ["ingest-notes"] :fn cmd-ingest-notes :spec {:dry-run {:coerce :boolean}}}
-   {:cmds ["ingest-failure"] :fn cmd-ingest-failure :spec {:dry-run {:coerce :boolean}}}
-   {:cmds ["ingest-adr"] :fn cmd-ingest-adr :spec {:dry-run {:coerce :boolean}}}
-   {:cmds ["compile-context"] :fn cmd-compile-context
-    :spec {:budget {:coerce :long} :dry-run {:coerce :boolean}}}
-   {:cmds ["hooks" "run"] :fn cmd-hooks-run
-    :spec {:consolidate-days {:coerce :long} :resolve {:coerce :boolean}
-           :min-confidence {:coerce :double}}}
-   {:cmds ["hooks" "install"] :fn cmd-hooks-install
-    :spec {:consolidate-days {:coerce :long} :coach {:coerce :boolean}}}
-   {:cmds ["dump"] :fn cmd-dump}
-   {:cmds ["load"] :fn cmd-load}
-   {:cmds ["reconcile"] :fn cmd-reconcile}
-   {:cmds ["stats"] :fn cmd-stats}
-   {:cmds ["consolidate"] :fn cmd-consolidate
-    :spec {:resolve {:coerce :boolean} :min-confidence {:coerce :double}
-           :min-usage {:coerce :long}}}
-   {:cmds ["help"] :fn cmd-help}
-   {:cmds [] :fn cmd-help}])
+  (expand-aliases
+   [{:cmds ["setup"] :fn cmd-setup
+     :spec {:coach {:coerce :boolean} :mcp {:coerce :boolean}
+            :dry-run {:coerce :boolean} :consolidate-days {:coerce :long}}}
+    {:cmds ["audit"] :fn cmd-audit
+     :spec {:file {:coerce []} :dir {:coerce []} :scan-dir {:coerce []}
+            :scorecard {:coerce :boolean}
+            :no-code {:coerce :boolean} :no-judge {:coerce :boolean}}}
+    {:cmds ["config"] :fn cmd-config}
+    {:cmds ["version"] :fn cmd-version}
+    {:cmds ["init"] :fn cmd-init}
+    {:cmds ["assert"] :fn cmd-assert :spec {:confidence {:coerce :double}}}
+    {:cmds ["facts"] :fn cmd-facts :spec {:min-confidence {:coerce :double}
+                                          :include-invalidated {:coerce :boolean}}}
+    {:cmds ["neighbor"] :fn cmd-neighbor :spec {:depth {:coerce :long}
+                                                :budget {:coerce :long}
+                                                :beam {:coerce :long}
+                                                :min-confidence {:coerce :double}}}
+    {:cmds ["recall"] :fn cmd-recall :spec {:min-hits {:coerce :long}}}
+    {:cmds ["coach"] :fn cmd-coach :spec {:hook {:coerce :boolean}}}
+    {:cmds ["outcome"] :fn cmd-outcome}
+    {:cmds ["mcp"] :fn cmd-mcp}
+    {:cmds ["history"] :fn cmd-history}
+    {:cmds ["search"] :fn cmd-search}
+    {:cmds ["invalidate"] :fn cmd-invalidate}
+    {:cmds ["conflicts"] :fn cmd-conflicts}
+    {:cmds ["judge"] :fn cmd-judge :spec {:resolve {:coerce :boolean}
+                                          :sweep {:coerce :boolean}
+                                          :min-confidence {:coerce :double}
+                                          :min-verdict-confidence {:coerce :double}}}
+    {:cmds ["entity" "ensure"] :fn cmd-entity-ensure}
+    {:cmds ["entity" "list"] :fn cmd-entity-list}
+    {:cmds ["entity" "rename"] :fn cmd-entity-rename}
+    {:cmds ["entity" "alias"] :fn cmd-entity-alias}
+    {:cmds ["entity" "merge"] :fn cmd-entity-merge}
+    {:cmds ["entity" "split"] :fn cmd-entity-split}
+    {:cmds ["entity" "duplicates"] :fn cmd-entity-duplicates}
+    {:cmds ["predicates"] :fn cmd-predicates :spec {:usage {:coerce :boolean}}}
+    {:cmds ["predicate" "register"] :fn cmd-predicate-register}
+    {:cmds ["predicate" "promote"] :fn cmd-predicate-promote}
+    {:cmds ["evidence"] :fn cmd-evidence}
+    {:cmds ["episode" "open"] :fn cmd-episode-open}
+    {:cmds ["episode" "close"] :fn cmd-episode-close}
+    {:cmds ["episode" "list"] :fn cmd-episode-list}
+    {:cmds ["ingest-code"] :fn cmd-ingest-code}
+    {:cmds ["ingest"] :fn cmd-ingest}
+    {:cmds ["ingest-session"] :fn cmd-ingest-session
+     :aliases [["session-extract"]]
+     :spec {:dry-run {:coerce :boolean}}}
+    {:cmds ["ingest-notes"] :fn cmd-ingest-notes :spec {:dry-run {:coerce :boolean}}}
+    {:cmds ["ingest-failure"] :fn cmd-ingest-failure :spec {:dry-run {:coerce :boolean}}}
+    {:cmds ["ingest-adr"] :fn cmd-ingest-adr :spec {:dry-run {:coerce :boolean}}}
+    {:cmds ["compile-context"] :fn cmd-compile-context
+     :spec {:budget {:coerce :long} :dry-run {:coerce :boolean}}}
+    {:cmds ["hooks" "run"] :fn cmd-hooks-run
+     :spec {:consolidate-days {:coerce :long} :resolve {:coerce :boolean}
+            :min-confidence {:coerce :double}
+            :min-verdict-confidence {:coerce :double}
+            :fail-on-partial {:coerce :boolean}}}
+    {:cmds ["hooks" "install"] :fn cmd-hooks-install
+     :spec {:consolidate-days {:coerce :long} :coach {:coerce :boolean}}}
+    {:cmds ["dump"] :fn cmd-dump}
+    {:cmds ["load"] :fn cmd-load}
+    {:cmds ["reconcile"] :fn cmd-reconcile}
+    {:cmds ["stats"] :fn cmd-stats}
+    {:cmds ["consolidate"] :fn cmd-consolidate
+     :spec {:resolve {:coerce :boolean} :min-confidence {:coerce :double}
+            :min-verdict-confidence {:coerce :double}
+            :min-usage {:coerce :long}}}
+    {:cmds ["help"] :fn cmd-help}
+    {:cmds [] :fn cmd-unknown}]))
+
+(defn- emit-error!
+  "The error contract, in the one place that implements it: JSON on stderr,
+  never stdout, whatever went wrong. Returns the status so the caller decides
+  nothing."
+  [payload code]
+  (binding [*out* *err*]
+    (println (wire/generate-string payload {:pretty true})))
+  code)
+
+(defn- usage-payload
+  "babashka.cli's own dispatch failure, in claimgraph's error shape. It
+  travels as ex-data on an ExceptionInfo with NO message, so the generic
+  handler emitted {\"error\": null} — from the one failure mode a typo in a
+  hook command line actually produces, to a caller whose only contract is
+  that :error says what happened."
+  [{:keys [dispatch wrong-input all-commands cause]}]
+  (let [attempted (str/join " " (remove nil? (concat dispatch [wrong-input])))
+        exhausted (= :input-exhausted cause)]
+    {:error (if exhausted
+              (str "Incomplete command: `" attempted "` needs a subcommand")
+              (str "Unknown command: " attempted))
+     :type (if exhausted :incomplete-command :unknown-command)
+     :command attempted
+     :expected (vec (sort (map str all-commands)))
+     :hint "run `claim help` for the full command list"}))
+
+(defn run
+  "Dispatch one command line; return the process exit status. Separate from
+  -main because a status is a value a test can read and System/exit is not."
+  [args]
+  (try
+    (let [r (cli/dispatch table (vec args) {:spec global-spec})]
+      (if (int? r) r ok-exit))
+    (catch clojure.lang.ExceptionInfo e
+      (let [d (ex-data e)]
+        (if (= :org.babashka/cli (:type d))
+          (emit-error! (usage-payload d) usage-exit)
+          (emit-error! (merge {:error (ex-message e)}
+                              (dissoc d :claimgraph/error :claimgraph/exit))
+                       (or (:claimgraph/exit d) error-exit)))))))
 
 (defn -main [& args]
-  (try
-    (cli/dispatch table (vec args) {:spec global-spec})
-    (catch clojure.lang.ExceptionInfo e
-      (binding [*out* *err*]
-        (println (wire/generate-string
-                  (merge {:error (ex-message e)}
-                         (dissoc (ex-data e) :claimgraph/error))
-                  {:pretty true})))
-      (System/exit 1))))
+  (let [code (run args)]
+    ;; flush before exiting: System/exit gives stdout no chance to drain, and
+    ;; the report a non-zero status refers to is on stdout
+    (flush)
+    (when-not (zero? code) (System/exit code))))
