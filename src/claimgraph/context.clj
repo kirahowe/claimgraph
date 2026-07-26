@@ -52,17 +52,26 @@
 
 (defn recent-supersessions
   "Pure: facts invalidated by supersession within the window, newest first,
-  each paired with its successor when the invalidation reason identifies one."
+  each paired with its successor.
+
+  Selection is on :invalidation-kind and the pairing is on :successor, both
+  structural. They were recovered from the reason sentence by matching
+  ^superseded by (\\S+)$, and the producers did not all agree with that
+  regex: the judge wrote \"judged superseded by <id>\", which whole-string
+  matching never matches, so a supersession an LLM resolved could not appear
+  here at all. A successor that is not in `facts` — invalidated itself,
+  filtered out, or not yet loaded — renders as \"no longer\" rather than
+  dropping the line: that the claim stopped holding is the part the reader
+  needs."
   [facts now window-days]
   (let [by-id (into {} (map (juxt :id identity)) facts)
         cutoff (- (logic/ms now) (* window-days 86400000))]
     (->> facts
          (keep (fn [f]
                  (when-let [ti (:t-invalid f)]
-                   (when (>= (logic/ms ti) cutoff)
-                     (when-let [[_ succ-id] (re-matches #"superseded by (\S+)"
-                                                        (str (:invalidation-reason f)))]
-                       {:old f :new (get by-id succ-id) :at ti})))))
+                   (when (and (>= (logic/ms ti) cutoff)
+                              (logic/supersession-kinds (:invalidation-kind f)))
+                     {:old f :new (get by-id (:successor f)) :at ti}))))
          (sort-by (comp - logic/ms :at))
          vec)))
 

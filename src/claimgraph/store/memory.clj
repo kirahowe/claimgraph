@@ -158,9 +158,13 @@
   (-get-history [_ entity-id predicate]
     (vec (facts-for @state [entity-id] {:direction :out :predicate predicate})))
 
-  (-invalidate [_ fact-id at reason]
-    (swap! state update-in [:facts fact-id]
-           assoc :t-invalid at :invalidation-reason reason)
+  (-invalidate [_ fact-id at invalidation]
+    (let [{:keys [kind successor reason]} (logic/invalidation invalidation)]
+      (swap! state update-in [:facts fact-id]
+             (fn [f]
+               (cond-> (assoc f :t-invalid at :invalidation-reason reason)
+                 kind (assoc :invalidation-kind kind)
+                 successor (assoc :successor successor)))))
     fact-id)
 
   (-link-conflicts [_ fact-id conflict-ids]

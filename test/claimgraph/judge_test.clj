@@ -118,11 +118,16 @@
     (testing "low confidence gates action"
       (is (= {:action :none :reason :low-confidence}
              (judge/resolution-plan pair {:relation :duplicate :confidence 0.5} 0.8))))
-    (testing "duplicate invalidates the newer fact"
-      (is (= {:action :invalidate :fact-id "f-new" :reason "judged duplicate of f-old"}
+    (testing "duplicate invalidates the newer fact, naming the twin it kept"
+      (is (= {:action :invalidate :fact-id "f-new" :kind :judged-duplicate
+              :successor "f-old" :reason "judged duplicate of f-old"}
              (judge/resolution-plan pair {:relation :duplicate :confidence 0.9} 0.8))))
-    (testing "supersedes invalidates the established fact"
-      (is (= {:action :invalidate :fact-id "f-old" :reason "judged superseded by f-new"}
+    (testing "supersedes invalidates the established fact, naming its successor"
+      ;; the kind and the successor used to exist only inside the sentence,
+      ;; and the sentence was phrased so that the compiled context's
+      ;; ^superseded by (\S+)$ never matched it
+      (is (= {:action :invalidate :fact-id "f-old" :kind :judged-superseded
+              :successor "f-new" :reason "judged superseded by f-new"}
              (judge/resolution-plan pair {:relation :supersedes :confidence 0.9} 0.8))))
     (testing "compatible unlinks"
       (is (= {:action :unlink}
@@ -160,8 +165,13 @@
     (is (zero? (:open (core/conflicts s))))
     (let [{:keys [facts]} (core/get-facts s {:entity "ADR-1"})]
       (is (= ["superseded"] (mapv :object-lit facts)) "only the newer status survives"))
-    (let [{:keys [history]} (core/get-history s {:subject "ADR-1" :predicate :core/has-status})]
-      (is (some #(str/includes? (str (:invalidation-reason %)) "judged superseded") history)))))
+    (let [{:keys [history]} (core/get-history s {:subject "ADR-1" :predicate :core/has-status})
+          retired (first (filter :t-invalid history))
+          survivor (first (remove :t-invalid history))]
+      (is (str/includes? (str (:invalidation-reason retired)) "judged superseded"))
+      (testing "and the link the compiled view reads is structure, not that sentence"
+        (is (= :judged-superseded (:invalidation-kind retired)))
+        (is (= (:id survivor) (:successor retired)))))))
 
 (deftest judge-resolves-duplicate-against-the-newer-fact
   (let [s (store-with-conflict)]

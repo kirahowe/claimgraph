@@ -5,7 +5,12 @@
   writes leave as effect plans for the shell (claimgraph.core) to execute.
   Every function here is referentially transparent (throws are deterministic)."
   (:require [clojure.string :as str]
-            [claimgraph.predicates :as preds]))
+            [claimgraph.predicates :as preds]
+            ;; the wire-shape DECLARATION, not a store: claimgraph.store is a
+            ;; leaf holding the protocol and the field table, and reading the
+            ;; table here is what keeps the dump's rehydration from being a
+            ;; second, drifting copy of it
+            [claimgraph.store :as store]))
 
 (def default-scope "project")
 
@@ -74,6 +79,65 @@
       tv (assoc :t-valid tv)
       ti (assoc :t-invalid ti))))
 
+;; ---------------------------------------------------------------------------
+;; Invalidation: why a fact's interval closed, as structure
+;; ---------------------------------------------------------------------------
+
+(def invalidation-kinds
+  "Every kind of invalidation claimgraph performs, and the producer of each.
+  These used to be distinguishable only by reading the reason sentence, which
+  meant one producer could — and did — phrase itself out of every reader:
+  the judge wrote \"judged superseded by <id>\", the compiled context matched
+  ^superseded by (\\S+)$, and an LLM-resolved supersession therefore never
+  appeared in the briefing built to show what changed.
+
+    :superseded          assert-fact closed it for a newer assertion
+    :judged-superseded   the LLM judge ruled the newer fact its successor
+    :judged-duplicate    the LLM judge ruled it a restatement of another
+    :merge-duplicate     an entity merge left the same claim twice
+    :reconcile-duplicate reconcile found two writers had claimed the same
+    :code-absent         the declaration is gone from the source it came from
+    :manual              a human ran `claim invalidate`
+
+  Readers must NOT treat this set as closed. A store outlives the build that
+  wrote it: a dump or an oplog from a newer claimgraph can carry a kind this
+  one has never heard of, and the additive change that introduced it does not
+  move the format version (see claimgraph.version). So an unrecognised kind
+  is kept verbatim and simply matches nothing — the same outcome as the nil
+  a caller that hasn't been taught its kind produces, and the reason nothing
+  here validates against this set."
+  #{:superseded :judged-superseded :judged-duplicate :merge-duplicate
+    :reconcile-duplicate :code-absent :manual})
+
+(def supersession-kinds
+  "The kinds that mean a successor took this fact's place — what \"changed
+  recently\" is asking about. Duplicate collapses are excluded deliberately:
+  nothing changed, one of two identical rows was retired, and rendering that
+  as X → X is noise in the one section a human reads to catch up."
+  #{:superseded :judged-superseded})
+
+(defn invalidation
+  "Normalize what a caller passed to store/-invalidate into
+  {:kind kw|nil :successor str|nil :reason str}.
+
+  A bare string is a reason with no structure, and both backends route
+  through here so that stays true in one place rather than two. It is what
+  every caller passed before kinds existed, and what a caller that has not
+  been taught its kind still passes; accepting it is what lets the producers
+  be converted one at a time instead of in one commit that has to be right
+  everywhere at once.
+
+  :kind arrives as a keyword from a live caller and as a string from JSON —
+  an oplog line replayed on another machine, a dump reloaded — so it is
+  coerced rather than trusted, the same discipline rehydrate-dump-record
+  applies to every other keyword-valued column."
+  [in]
+  (if (map? in)
+    {:kind (->kw (:kind in))
+     :successor (some-> (:successor in) str)
+     :reason (some-> (:reason in) str)}
+    {:kind nil :successor nil :reason (some-> in str)}))
+
 (defn- strip-nils [m] (into {} (filter (comp some? val)) m))
 
 (defn- kw-fields [m ks]
@@ -81,6 +145,18 @@
 
 (defn- date-fields [m ks]
   (reduce (fn [a k] (if (some? (get a k)) (update a k parse-instant) a)) m ks))
+
+(defn- double-fields [m ks]
+  (reduce (fn [a k] (if (some? (get a k)) (update a k double) a)) m ks))
+
+(defn- embedded-entity-fields
+  "Nested entity maps carry the one keyword an embedding of them has: :type."
+  [m ks]
+  (reduce (fn [a k]
+            (if (some? (get a k))
+              (update a k #(-> % (kw-fields [:type]) strip-nils))
+              a))
+          m ks))
 
 (def dump-discriminator
   "The key a dump record says its kind under. Emphatically NOT :type: an
@@ -143,12 +219,16 @@
                       (kw-fields [:source-type])
                       (date-fields [:opened-at :closed-at])
                       strip-nils)]
+      ;; Read off store/fact-fields rather than spelled out: a fact column
+      ;; this list forgets does not vanish, it comes back the wrong TYPE — a
+      ;; keyword as "core/prefers", a Date as an ISO string — and then
+      ;; compares unequal to everything it is put beside, which no round-trip
+      ;; count and no error message ever shows.
       :fact [t (-> m
-                   (kw-fields [:predicate :object-kind :epistemic :source-type])
-                   (date-fields [:t-valid :t-invalid :recorded-at :last-reinforced-at])
-                   (update :subject #(some-> % (kw-fields [:type]) strip-nils))
-                   (update :object-ref #(some-> % (kw-fields [:type]) strip-nils))
-                   (update :confidence #(some-> % double))
+                   (kw-fields (store/fact-keys-of :keyword))
+                   (date-fields (store/fact-keys-of :instant))
+                   (double-fields (store/fact-keys-of :double))
+                   (embedded-entity-fields (store/fact-keys-of :entity))
                    strip-nils)]
       nil [:unstamped rec]
       [:unknown rec])))
@@ -646,11 +726,16 @@
                   :entities (mapv #(select-keys % [:id :name :type]) es)})))
        vec))
 
-(defn collapse-duplicates-plan
+(defn collapse-duplicates
   "After a merge repoints facts, the same claim can exist twice. Plan the
   collapse: among currently-valid facts identical in subject, predicate,
   object, scope and epistemic class, keep the earliest-recorded and
-  invalidate the rest."
+  invalidate the rest, as [{:id retired :survivor id}].
+
+  The survivor rides along because the caller has to record it — a retired
+  duplicate whose invalidation names no counterpart is a row that looks
+  deleted for no reason a year later — and only this grouping knows which of
+  the twins it was."
   [facts at]
   (->> facts
        (filter #(fact-valid-at? % at))
@@ -663,8 +748,15 @@
        vals
        (mapcat (fn [group]
                  (when (> (count group) 1)
-                   (rest (sort-by (comp ms :recorded-at) group)))))
-       (mapv :id)))
+                   (let [[keep & retire] (sort-by (comp ms :recorded-at) group)]
+                     (map (fn [f] {:id (:id f) :survivor (:id keep)}) retire)))))
+       vec))
+
+(defn collapse-duplicates-plan
+  "collapse-duplicates as the bare list of ids to invalidate, for callers that
+  record nothing about the twin that survived."
+  [facts at]
+  (mapv :id (collapse-duplicates facts at)))
 
 ;; ---------------------------------------------------------------------------
 ;; Conflicts

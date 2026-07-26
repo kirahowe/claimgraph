@@ -19,86 +19,10 @@
 
 (require '[pod.huahaiy.datalevin :as d])
 
-(def schema
-  {;; ---- Entity ----
-   :entity/id        {:db/valueType :db.type/string :db/unique :db.unique/identity}
-   :entity/name      {:db/valueType :db.type/string :db/fulltext true}
-   :entity/type      {:db/valueType :db.type/keyword}
-   :entity/scope     {:db/valueType :db.type/string}
-   :entity/aliases   {:db/valueType :db.type/string :db/cardinality :db.cardinality/many
-                      :db/fulltext true}
-   ;; derived lookup fields for near-match resolution, maintained on write
-   :entity/norm-name    {:db/valueType :db.type/string}
-   :entity/norm-aliases {:db/valueType :db.type/string :db/cardinality :db.cardinality/many}
-
-   ;; ---- Fact (reified edge + metadata bundle) ----
-   :fact/id          {:db/valueType :db.type/string :db/unique :db.unique/identity}
-   :fact/subject     {:db/valueType :db.type/ref}
-   :fact/predicate   {:db/valueType :db.type/keyword}
-   :fact/object-ref  {:db/valueType :db.type/ref}
-   :fact/object-lit  {:db/valueType :db.type/string :db/fulltext true}
-   :fact/object-kind {:db/valueType :db.type/keyword}
-   :fact/t-valid     {:db/valueType :db.type/instant}
-   :fact/t-invalid   {:db/valueType :db.type/instant}
-   :fact/recorded-at {:db/valueType :db.type/instant}
-   ;; derived long for indexed recorded-before selection (Datalog comparison
-   ;; predicates work on numbers, not boxed dates)
-   :fact/recorded-ms {:db/valueType :db.type/long}
-   :fact/last-reinforced-at {:db/valueType :db.type/instant}
-   :fact/last-reinforced-ms {:db/valueType :db.type/long}
-   :fact/confidence  {:db/valueType :db.type/double}
-   :fact/source      {:db/valueType :db.type/ref}
-   :fact/source-type {:db/valueType :db.type/keyword}
-   :fact/epistemic   {:db/valueType :db.type/keyword}
-   :fact/scope       {:db/valueType :db.type/string}
-   :fact/conflicts   {:db/valueType :db.type/ref :db/cardinality :db.cardinality/many}
-   :fact/invalidation-reason {:db/valueType :db.type/string}
-   ;; reserved-but-unused: retrofitting an ACL dimension later is far more
-   ;; painful than carrying nullable fields now
-   :fact/read-acl    {:db/valueType :db.type/string}
-   :fact/write-acl   {:db/valueType :db.type/string}
-
-   ;; ---- Episode (provenance anchor) ----
-   :episode/id          {:db/valueType :db.type/string :db/unique :db.unique/identity}
-   :episode/source-type {:db/valueType :db.type/keyword}
-   :episode/ref         {:db/valueType :db.type/string}
-   :episode/summary     {:db/valueType :db.type/string :db/fulltext true}
-   :episode/opened-at   {:db/valueType :db.type/instant}
-   :episode/closed-at   {:db/valueType :db.type/instant}
-   ;; content-address (sha-256) of the raw-evidence artifact this episode
-   ;; was extracted from; the bytes live outside the store (claimgraph.evidence)
-   :episode/evidence    {:db/valueType :db.type/string}
-
-   ;; ---- Predicate registry (self-describing vocabulary) ----
-   :predicate/id          {:db/valueType :db.type/keyword :db/unique :db.unique/identity}
-   :predicate/label       {:db/valueType :db.type/string}
-   :predicate/category    {:db/valueType :db.type/keyword}
-   :predicate/object-kind {:db/valueType :db.type/keyword}
-   :predicate/cardinality {:db/valueType :db.type/keyword}
-   :predicate/inverse-of  {:db/valueType :db.type/keyword}
-   :predicate/exclusion-group {:db/valueType :db.type/keyword}
-   :predicate/value-exclusivity {:db/valueType :db.type/keyword}
-   :predicate/status      {:db/valueType :db.type/keyword}
-   :predicate/replaced-by {:db/valueType :db.type/keyword}
-   :predicate/definition  {:db/valueType :db.type/string}
-   :predicate/maps-to     {:db/valueType :db.type/string}
-   :predicate/default-epistemic {:db/valueType :db.type/keyword}
-   :predicate/alt-labels  {:db/valueType :db.type/string :db/cardinality :db.cardinality/many}})
-
 ;; ---- wire <-> datom translation -------------------------------------------
 
 (def ^:private entity-pull
   [:entity/id :entity/name :entity/type :entity/scope :entity/aliases])
-
-(def ^:private fact-pull
-  [:fact/id :fact/predicate :fact/object-kind :fact/object-lit
-   :fact/t-valid :fact/t-invalid :fact/recorded-at :fact/last-reinforced-at
-   :fact/confidence
-   :fact/epistemic :fact/scope :fact/source-type :fact/invalidation-reason
-   {:fact/subject entity-pull}
-   {:fact/object-ref entity-pull}
-   {:fact/source [:episode/id]}
-   {:fact/conflicts [:fact/id]}])
 
 (defn- ent->wire [m]
   (when m
@@ -106,24 +30,193 @@
      :type (:entity/type m) :scope (:entity/scope m)
      :aliases (vec (:entity/aliases m))}))
 
+(def ^:private fact-attrs
+  "Every fact attribute, declared once: the datom it lives in, its schema, how
+  it is pulled, how it projects back to the wire, and how it is written.
+
+  Those were four separate lists here (the schema map, fact-pull, fact->wire,
+  fact->tx) plus a fifth a namespace away (the dump's rehydration, now driven
+  off store/fact-fields), and adding a column meant editing all of them with
+  nothing checking that you had. Each omission failed differently and none of
+  them failed loudly: no pull or no projection and the column is simply
+  invisible on read; no tx entry and it is dropped on write; no schema and the
+  datom is untyped. store/fact-fields is the wire half of this declaration,
+  and the two are checked against each other at load — see
+  undeclared-fact-fields.
+
+  Defaults cover the plain columns: pull the attribute, project it with a
+  get, write the wire value under it. A row only says more when it is a
+  reference, when it maintains a derived index column beside itself, or when
+  something other than -insert-fact owns the write:
+
+    :pull     what to put in fact-pull (default: the attribute)
+    :project  pulled map -> wire value (default: get the attribute)
+    :tx       fact -> tx fragment, possibly several attributes (default: the
+              wire value under the attribute); one that returns nil writes
+              nothing, i.e. -insert-fact does not own this column
+    :derived  extra schema for index columns this field maintains"
+  (array-map
+   :id {:attr :fact/id
+        :schema {:db/valueType :db.type/string :db/unique :db.unique/identity}}
+
+   :subject {:attr :fact/subject
+             :schema {:db/valueType :db.type/ref}
+             :pull {:fact/subject entity-pull}
+             :project #(ent->wire (:fact/subject %))
+             :tx (fn [f] {:fact/subject [:entity/id (get-in f [:subject :id])]})}
+
+   :predicate {:attr :fact/predicate :schema {:db/valueType :db.type/keyword}}
+
+   :object-kind {:attr :fact/object-kind :schema {:db/valueType :db.type/keyword}}
+
+   :object-ref {:attr :fact/object-ref
+                :schema {:db/valueType :db.type/ref}
+                :pull {:fact/object-ref entity-pull}
+                :project #(ent->wire (:fact/object-ref %))
+                :tx (fn [f] {:fact/object-ref (when-let [o (:object-ref f)]
+                                                [:entity/id (:id o)])})}
+
+   :object-lit {:attr :fact/object-lit
+                :schema {:db/valueType :db.type/string :db/fulltext true}}
+
+   :t-valid {:attr :fact/t-valid :schema {:db/valueType :db.type/instant}}
+
+   :t-invalid {:attr :fact/t-invalid :schema {:db/valueType :db.type/instant}}
+
+   ;; the -ms twins are derived longs for indexed selection: Datalog
+   ;; comparison predicates work on numbers, not boxed dates
+   :recorded-at {:attr :fact/recorded-at
+                 :schema {:db/valueType :db.type/instant}
+                 :derived {:fact/recorded-ms {:db/valueType :db.type/long}}
+                 :tx (fn [f]
+                       {:fact/recorded-at (:recorded-at f)
+                        :fact/recorded-ms (some-> ^java.util.Date (:recorded-at f)
+                                                  .getTime)})}
+
+   :last-reinforced-at {:attr :fact/last-reinforced-at
+                        :schema {:db/valueType :db.type/instant}
+                        :derived {:fact/last-reinforced-ms {:db/valueType :db.type/long}}
+                        :tx (fn [f]
+                              {:fact/last-reinforced-at (:last-reinforced-at f)
+                               :fact/last-reinforced-ms
+                               (some-> ^java.util.Date (:last-reinforced-at f) .getTime)})}
+
+   :confidence {:attr :fact/confidence :schema {:db/valueType :db.type/double}}
+
+   :epistemic {:attr :fact/epistemic :schema {:db/valueType :db.type/keyword}}
+
+   :scope {:attr :fact/scope :schema {:db/valueType :db.type/string}}
+
+   :source-type {:attr :fact/source-type :schema {:db/valueType :db.type/keyword}}
+
+   :episode {:attr :fact/source
+             :schema {:db/valueType :db.type/ref}
+             :pull {:fact/source [:episode/id]}
+             :project #(get-in % [:fact/source :episode/id])
+             :tx (fn [f] {:fact/source (when-let [ep (:episode f)] [:episode/id ep])})}
+
+   ;; -link-conflicts owns this one, and has to: the linked facts are refs,
+   ;; and a load restores facts in file order, so at insert time the other
+   ;; side of the link routinely does not exist yet
+   :conflicts {:attr :fact/conflicts
+               :schema {:db/valueType :db.type/ref
+                        :db/cardinality :db.cardinality/many}
+               :pull {:fact/conflicts [:fact/id]}
+               :project #(mapv :fact/id (:fact/conflicts %))
+               :tx (constantly nil)}
+
+   :invalidation-reason {:attr :fact/invalidation-reason
+                         :schema {:db/valueType :db.type/string}}
+
+   :invalidation-kind {:attr :fact/invalidation-kind
+                       :schema {:db/valueType :db.type/keyword}}
+
+   ;; a fact id as a STRING, not a ref: the successor is written when the
+   ;; predecessor closes, which is before the successor exists on a replay or
+   ;; a restore. A ref would refuse that write; a dangling id just reads back
+   ;; as no successor known (store/-invalidate)
+   :successor {:attr :fact/successor :schema {:db/valueType :db.type/string}}))
+
+(defn undeclared-fact-fields
+  "Where fact-attrs and store/fact-fields disagree: {:missing [wire-keys this
+  store cannot read or write] :extra [attributes nothing documents]}. Empty
+  both ways is the invariant; it is checked at load below, and named here so a
+  test can say which half is wrong instead of only that the namespace refused
+  to load."
+  []
+  {:missing (vec (remove (set (keys fact-attrs)) store/fact-keys))
+   :extra (vec (remove (set store/fact-keys) (keys fact-attrs)))})
+
+(let [{:keys [missing extra]} (undeclared-fact-fields)]
+  (when (or (seq missing) (seq extra))
+    (throw (ex-info (str "claimgraph.store.datalevin and claimgraph.store "
+                         "disagree about the fact wire shape")
+                    {:type :fact-shape-mismatch
+                     :undeclared-here missing
+                     :undocumented-in-store extra}))))
+
+(def ^:private fact-schema
+  (into {} (mapcat (fn [[_ {:keys [attr schema derived]}]]
+                     (cons [attr schema] derived)))
+        fact-attrs))
+
+(def schema
+  (merge
+   {;; ---- Entity ----
+    :entity/id        {:db/valueType :db.type/string :db/unique :db.unique/identity}
+    :entity/name      {:db/valueType :db.type/string :db/fulltext true}
+    :entity/type      {:db/valueType :db.type/keyword}
+    :entity/scope     {:db/valueType :db.type/string}
+    :entity/aliases   {:db/valueType :db.type/string :db/cardinality :db.cardinality/many
+                       :db/fulltext true}
+    ;; derived lookup fields for near-match resolution, maintained on write
+    :entity/norm-name    {:db/valueType :db.type/string}
+    :entity/norm-aliases {:db/valueType :db.type/string :db/cardinality :db.cardinality/many}}
+
+   ;; ---- Fact (reified edge + metadata bundle) ----
+   fact-schema
+   {;; reserved-but-unused: retrofitting an ACL dimension later is far more
+    ;; painful than carrying nullable fields now. No wire key, so no row in
+    ;; fact-attrs — the day they carry a value they become one.
+    :fact/read-acl    {:db/valueType :db.type/string}
+    :fact/write-acl   {:db/valueType :db.type/string}}
+
+   {;; ---- Episode (provenance anchor) ----
+    :episode/id          {:db/valueType :db.type/string :db/unique :db.unique/identity}
+    :episode/source-type {:db/valueType :db.type/keyword}
+    :episode/ref         {:db/valueType :db.type/string}
+    :episode/summary     {:db/valueType :db.type/string :db/fulltext true}
+    :episode/opened-at   {:db/valueType :db.type/instant}
+    :episode/closed-at   {:db/valueType :db.type/instant}
+    ;; content-address (sha-256) of the raw-evidence artifact this episode
+    ;; was extracted from; the bytes live outside the store (claimgraph.evidence)
+    :episode/evidence    {:db/valueType :db.type/string}}
+
+   {;; ---- Predicate registry (self-describing vocabulary) ----
+    :predicate/id          {:db/valueType :db.type/keyword :db/unique :db.unique/identity}
+    :predicate/label       {:db/valueType :db.type/string}
+    :predicate/category    {:db/valueType :db.type/keyword}
+    :predicate/object-kind {:db/valueType :db.type/keyword}
+    :predicate/cardinality {:db/valueType :db.type/keyword}
+    :predicate/inverse-of  {:db/valueType :db.type/keyword}
+    :predicate/exclusion-group {:db/valueType :db.type/keyword}
+    :predicate/value-exclusivity {:db/valueType :db.type/keyword}
+    :predicate/status      {:db/valueType :db.type/keyword}
+    :predicate/replaced-by {:db/valueType :db.type/keyword}
+    :predicate/definition  {:db/valueType :db.type/string}
+    :predicate/maps-to     {:db/valueType :db.type/string}
+    :predicate/default-epistemic {:db/valueType :db.type/keyword}
+    :predicate/alt-labels  {:db/valueType :db.type/string
+                            :db/cardinality :db.cardinality/many}}))
+
+(def ^:private fact-pull
+  (mapv (fn [[_ {:keys [attr pull]}]] (or pull attr)) fact-attrs))
+
 (defn- fact->wire [m]
-  {:id (:fact/id m)
-   :subject (ent->wire (:fact/subject m))
-   :predicate (:fact/predicate m)
-   :object-kind (:fact/object-kind m)
-   :object-ref (ent->wire (:fact/object-ref m))
-   :object-lit (:fact/object-lit m)
-   :t-valid (:fact/t-valid m)
-   :t-invalid (:fact/t-invalid m)
-   :recorded-at (:fact/recorded-at m)
-   :last-reinforced-at (:fact/last-reinforced-at m)
-   :confidence (:fact/confidence m)
-   :epistemic (:fact/epistemic m)
-   :scope (:fact/scope m)
-   :source-type (:fact/source-type m)
-   :episode (get-in m [:fact/source :episode/id])
-   :conflicts (mapv :fact/id (:fact/conflicts m))
-   :invalidation-reason (:fact/invalidation-reason m)})
+  (into {}
+        (map (fn [[k {:keys [attr project]}]]
+               [k (if project (project m) (get m attr))]))
+        fact-attrs))
 
 (defn- episode->wire [m]
   {:id (:episode/id m) :source-type (:episode/source-type m)
@@ -205,23 +298,10 @@
 
 (defn- fact->tx [f]
   (strip-nils
-   {:fact/id (:id f)
-    :fact/subject [:entity/id (get-in f [:subject :id])]
-    :fact/predicate (:predicate f)
-    :fact/object-kind (:object-kind f)
-    :fact/object-ref (when-let [o (:object-ref f)] [:entity/id (:id o)])
-    :fact/object-lit (:object-lit f)
-    :fact/t-valid (:t-valid f)
-    :fact/t-invalid (:t-invalid f)
-    :fact/recorded-at (:recorded-at f)
-    :fact/recorded-ms (some-> ^java.util.Date (:recorded-at f) .getTime)
-    :fact/last-reinforced-at (:last-reinforced-at f)
-    :fact/last-reinforced-ms (some-> ^java.util.Date (:last-reinforced-at f) .getTime)
-    :fact/confidence (:confidence f)
-    :fact/epistemic (:epistemic f)
-    :fact/scope (:scope f)
-    :fact/source-type (:source-type f)
-    :fact/source (when-let [ep (:episode f)] [:episode/id ep])}))
+   (into {}
+         (map (fn [[k {:keys [attr tx]}]]
+                (if tx (tx f) {attr (get f k)})))
+         fact-attrs)))
 
 ;; ---- queries ---------------------------------------------------------------
 
@@ -389,10 +469,13 @@
   (-get-history [_ entity-id predicate]
     (mapv fact->wire (q-facts (d/db conn) [entity-id] :out predicate)))
 
-  (-invalidate [_ fact-id at reason]
-    (d/transact! conn [{:fact/id fact-id
-                        :fact/t-invalid at
-                        :fact/invalidation-reason reason}])
+  (-invalidate [_ fact-id at invalidation]
+    (let [{:keys [kind successor reason]} (logic/invalidation invalidation)]
+      (d/transact! conn [(strip-nils {:fact/id fact-id
+                                      :fact/t-invalid at
+                                      :fact/invalidation-reason reason
+                                      :fact/invalidation-kind kind
+                                      :fact/successor successor})]))
     fact-id)
 
   (-link-conflicts [_ fact-id conflict-ids]

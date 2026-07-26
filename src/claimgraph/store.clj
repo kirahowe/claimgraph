@@ -8,18 +8,77 @@
   Wire shapes:
 
   entity    {:id :name :type :scope :aliases [str]}
-  fact      {:id :subject <entity> :predicate kw :object-kind :entity|:literal
-             :object-ref <entity>|nil :object-lit str|nil
-             :t-valid Date :t-invalid Date|nil :recorded-at Date
-             :last-reinforced-at Date|nil
-             :confidence double :epistemic kw :scope str :source-type kw
-             :episode str|nil :conflicts [fact-id] :invalidation-reason str|nil}
+  fact      every field of `fact-fields` below, and only those — the
+            declaration is the shape, not a prose copy of it
   episode   {:id :source-type :ref :summary :opened-at :closed-at
              :evidence str|nil — a tagged digest, `sha256-` + 64 hex (71
              chars); stores predating the tag hold a bare 64-hex digest}
   predicate {:id kw :label :category kw :object-kind kw :cardinality kw
              :inverse-of kw :status kw :replaced-by kw :definition
              :maps-to :default-epistemic kw}")
+
+(def fact-fields
+  "The fact wire shape, declared once, in order. Every place that has to
+  enumerate a fact's attributes derives its list from here: the Datalevin
+  schema, the pull pattern, the wire projection and the tx builder
+  (store.datalevin/fact-attrs, which is checked against this at load), and
+  the dump rehydration (logic/rehydrate-dump-record). Adding a column is then
+  one line here plus one row of storage detail, instead of five edits nothing
+  keeps in sync.
+
+  Five edits, and not one of them fails loudly when it is the one you forget:
+  a field missing from the pull or the wire projection is simply invisible on
+  read, one missing from the tx builder is dropped on write, one missing from
+  the schema is an untyped datom, and one missing from the rehydration comes
+  back from a dump as a STRING and compares unequal to every keyword and every
+  Date it is put beside. That is not hypothetical — it is how -list-entities
+  came to omit :aliases and take every alias out of a Datalevin dump.
+
+  :json is what a JSON round trip has to restore, and it is the only thing
+  this namespace says about storage — the wire shape is the contract, the
+  datoms are one backend's business:
+
+    :string    passthrough
+    :keyword   back to a keyword, never left as \"core/prefers\"
+    :instant   back to a java.util.Date, milliseconds intact
+    :double    back to a double, never a long
+    :entity    a nested entity map, whose own :type is a keyword
+    :fact-ids  a vector of fact ids (strings)
+
+  Every field but :id, :subject, :predicate, :object-kind, :t-valid,
+  :recorded-at, :confidence, :epistemic, :scope and :source-type is nullable."
+  [{:key :id                  :json :string}
+   {:key :subject             :json :entity}
+   {:key :predicate           :json :keyword}
+   {:key :object-kind         :json :keyword}   ; :entity | :literal
+   {:key :object-ref          :json :entity}    ; set iff :object-kind :entity
+   {:key :object-lit          :json :string}    ; set iff :object-kind :literal
+   {:key :t-valid             :json :instant}
+   {:key :t-invalid           :json :instant}   ; open interval when absent
+   {:key :recorded-at         :json :instant}
+   {:key :last-reinforced-at  :json :instant}
+   {:key :confidence          :json :double}
+   {:key :epistemic           :json :keyword}
+   {:key :scope               :json :string}
+   {:key :source-type         :json :keyword}
+   {:key :episode             :json :string}    ; provenance: the episode's id
+   {:key :conflicts           :json :fact-ids}  ; written by -link-conflicts
+   ;; why the interval closed. The sentence is for humans and nothing parses
+   ;; it; the kind (logic/invalidation-kinds) and the successor are what a
+   ;; reader acts on. All three are written by -invalidate.
+   {:key :invalidation-reason :json :string}
+   {:key :invalidation-kind   :json :keyword}
+   {:key :successor           :json :string}])
+
+(def fact-keys
+  "Every fact wire key, in declaration order."
+  (mapv :key fact-fields))
+
+(defn fact-keys-of
+  "The fact wire keys whose JSON round trip is of one class — the input to
+  every field list that used to be written out by hand."
+  [json-class]
+  (into [] (comp (filter #(= json-class (:json %))) (map :key)) fact-fields))
 
 (defprotocol Store
   (-ensure-entity [s ent]
@@ -79,8 +138,19 @@
     (as subject or object). Ranks the roster shown to the extractor.")
   (-get-history [s entity-id predicate]
     "All facts (valid + invalidated) for (subject, predicate).")
-  (-invalidate [s fact-id at reason]
-    "Close the validity interval: set :t-invalid and :invalidation-reason.")
+  (-invalidate [s fact-id at invalidation]
+    "Close the validity interval at `at`, recording WHY as structure rather
+    than as a sentence. `invalidation` is {:kind kw :successor fact-id
+    :reason str}, normalized through logic/invalidation — which also accepts
+    a bare reason string, the shape every caller passed before the kind
+    existed, so a writer that has not been taught its kind yet still records
+    a fact correctly (it just records nothing a reader can act on).
+
+    :successor is a plain fact id, deliberately not a reference the store
+    resolves: a dump restores facts in file order and an oplog replays them
+    in clock order, so the successor routinely does not exist yet when the
+    predecessor closes. A dangling id has to degrade to \"no successor known\"
+    on read, never refuse the write.")
   (-link-conflicts [s fact-id conflict-ids]
     "Record conflict links from fact-id to each id in conflict-ids.")
   (-unlink-conflicts [s fact-id conflict-ids]

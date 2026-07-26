@@ -151,9 +151,15 @@
 (defn resolution-plan
   "Pure: verdict -> effect plan for one conflict pair.
 
-    {:action :invalidate :fact-id id :reason str}
+    {:action :invalidate :fact-id id :kind kw :successor id :reason str}
     {:action :unlink}
-    {:action :none :reason :needs-human|:low-confidence|:unparseable}"
+    {:action :none :reason :needs-human|:low-confidence|:unparseable}
+
+  The invalidation carries its kind and its successor as data. It used to
+  carry only the sentence \"judged superseded by <id>\", and the compiled
+  context recovered supersessions by matching ^superseded by (\\S+)$ against
+  that field — which this phrasing never matched, so no supersession the
+  judge ever resolved reached the briefing that exists to report them."
   [{:keys [fact candidate]} {:keys [relation confidence]} min-confidence]
   (cond
     (= :contradicts relation) {:action :none :reason :needs-human}
@@ -161,8 +167,12 @@
     (< confidence min-confidence) {:action :none :reason :low-confidence}
     :else (case relation
             :duplicate {:action :invalidate :fact-id (:id fact)
+                        :kind :judged-duplicate
+                        :successor (:id candidate)
                         :reason (str "judged duplicate of " (:id candidate))}
             :supersedes {:action :invalidate :fact-id (:id candidate)
+                         :kind :judged-superseded
+                         :successor (:id fact)
                          :reason (str "judged superseded by " (:id fact))}
             :compatible {:action :unlink})))
 
@@ -172,7 +182,8 @@
 
 (defn- execute-resolution! [s at {:keys [fact candidate]} plan]
   (case (:action plan)
-    :invalidate (store/-invalidate s (:fact-id plan) at (:reason plan))
+    :invalidate (store/-invalidate s (:fact-id plan) at
+                                   (select-keys plan [:kind :successor :reason]))
     :unlink (store/-unlink-conflicts s (:id fact) [(:id candidate)])
     nil))
 

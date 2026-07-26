@@ -9,7 +9,8 @@
             [claimgraph.core :as core]
             [claimgraph.logic :as logic]
             [claimgraph.store :as store]
-            [claimgraph.store.memory :as mem]))
+            [claimgraph.store.memory :as mem]
+            [claimgraph.wire :as wire]))
 
 (defn- skip-reason
   "Which of the three ways the pod goes missing applies, as {:cause :detail},
@@ -595,6 +596,139 @@
     (let [rec (first (filter #(= "AuthService" (:name %)) (core/dump s)))]
       (is (= ["auth-svc"] (:aliases rec)))
       (is (= :service (:type rec))))))
+
+;; ---------------------------------------------------------------------------
+;; The fact wire shape: one declaration, five derived lists
+;; ---------------------------------------------------------------------------
+
+(defn- full-fact!
+  "A fact carrying EVERY field store/fact-fields documents, written straight
+  through the raw primitives. Deliberately not well-formed as a claim — it
+  fills both object columns, and is invalidated at insert rather than by the
+  assertion path — because what is under test is whether a declared column
+  survives storage at all, not whether core would ever produce this
+  combination. A field that gains a row in fact-fields and no value here
+  fails the assertions below, which is how the fixture stays complete."
+  [s]
+  (let [a (store/-ensure-entity s {:name "A" :type :service :scope "project"})
+        b (store/-ensure-entity s {:name "B" :type :tool :scope "project"})
+        ep (core/open-episode s {:source-type :session-log :ref "session-full"})
+        f {:id "f-full"
+           :subject a
+           :predicate :core/depends-on
+           :object-kind :entity
+           :object-ref b
+           :object-lit "and a literal too"
+           :t-valid (date "2026-01-01T00:00:00Z")
+           :t-invalid (date "2026-03-01T00:00:00Z")
+           :recorded-at (date "2026-01-02T00:00:00Z")
+           :last-reinforced-at (date "2026-02-01T00:00:00Z")
+           :confidence 0.75
+           :epistemic :observation
+           :scope "project"
+           :source-type :session-log
+           :episode (:id ep)
+           :invalidation-reason "superseded by f-rival"
+           :invalidation-kind :superseded
+           :successor "f-rival"}]
+    (store/-insert-fact s (assoc f :id "f-rival" :object-lit "the rival"
+                                 :t-invalid nil :invalidation-reason nil
+                                 :invalidation-kind nil :successor nil))
+    (store/-insert-fact s f)
+    ;; the one column -insert-fact does not own: conflict links are refs, and
+    ;; the fact on the other end need not exist when this one is written
+    (store/-link-conflicts s "f-full" ["f-rival"])
+    (assoc f :conflicts ["f-rival"])))
+
+(deftest every-documented-fact-field-survives-the-store
+  ;; A fact attribute used to be declared in four places nothing kept in sync
+  ;; — the schema, the pull, the wire projection and the tx builder — and each
+  ;; omission failed silently and differently: invisible on read, dropped on
+  ;; write, or untyped. They are one declaration now (store/fact-fields, keyed
+  ;; through store.datalevin/fact-attrs), and this is what catches the next
+  ;; half-declared one: delete any single line from that table and this fails.
+  (with-stores [s]
+    (let [written (full-fact! s)
+          back (first (store/-select-facts s {:ids ["f-full"]}))]
+      (doseq [k store/fact-keys]
+        (is (some? (get back k))
+            (str k " is documented in the fact wire shape but did not come back "
+                 "from the store")))
+      (is (= written (select-keys back store/fact-keys))
+          "every documented field comes back with the value that went in"))))
+
+(deftest every-documented-fact-field-survives-the-dump
+  ;; The fifth list: logic/rehydrate-dump-record. A column it forgets does not
+  ;; vanish from a dump, it comes back the wrong TYPE — a keyword as a string,
+  ;; a Date as an ISO string — and then compares unequal to everything beside
+  ;; it, which no record count and no error ever reports.
+  (with-stores [s]
+    (full-fact! s)
+    (let [record (first (filter #(= "f-full" (:id %)) (core/dump s)))
+          [kind back] (logic/rehydrate-dump-record
+                       (wire/parse-string (wire/generate-string record)))]
+      (is (= :fact kind))
+      (doseq [{:keys [key json]} store/fact-fields]
+        (let [v (get back key)]
+          (is (some? v) (str key " did not survive the dump"))
+          (is (case json
+                :string (string? v)
+                :keyword (keyword? v)
+                :instant (instance? java.util.Date v)
+                :double (instance? Double v)
+                :entity (and (map? v) (keyword? (:type v)))
+                :fact-ids (and (vector? v) (every? string? v)))
+              (str key " came back from the dump as " (type v)
+                   ", not the " json " its declaration promises")))))))
+
+;; ---------------------------------------------------------------------------
+;; Invalidation: the successor link, as structure
+;; ---------------------------------------------------------------------------
+
+(deftest supersession-records-its-kind-and-its-successor
+  ;; The successor used to exist only inside the sentence "superseded by
+  ;; <id>", which meant every reader of it was a regex and every producer of
+  ;; it was free to disagree with them.
+  (with-stores [s]
+    (core/assert-fact s {:subject "svc" :predicate :core/has-version :object "1.0"})
+    (let [r (core/assert-fact s {:subject "svc" :predicate :core/has-version
+                                 :object "2.0"})
+          successor (get-in r [:fact :id])
+          old (first (filter :t-invalid
+                             (:history (core/get-history
+                                        s {:subject "svc"
+                                           :predicate :core/has-version}))))]
+      (is (= :superseded (:invalidation-kind old)))
+      (is (= successor (:successor old)))
+      (is (= (str "superseded by " successor) (:invalidation-reason old))
+          "the sentence stays, and is now the only part nothing parses"))))
+
+(deftest manual-invalidation-is-a-kind-of-its-own
+  (with-stores [s]
+    (core/assert-fact s {:subject "svc" :predicate :core/deployed-via
+                         :object "Heroku" :object-kind :literal})
+    (let [fid (:id (first (:facts (core/get-facts s {:entity "svc"}))))]
+      (core/invalidate s {:fact-id fid :reason "shut the account"})
+      (let [f (first (store/-select-facts s {:ids [fid]}))]
+        (is (= :manual (:invalidation-kind f)))
+        (is (nil? (:successor f)) "a human closing a fact names no replacement")
+        (is (= "shut the account" (:invalidation-reason f)))))))
+
+(deftest merge-collapse-names-the-surviving-twin
+  ;; "duplicate after merging X into Y" said which merge retired the row but
+  ;; never which row it lost to, so the survivor was unrecoverable from the
+  ;; record — the one question a reader has when they meet a retired duplicate.
+  (with-stores [s]
+    (core/assert-fact s {:subject "AuthSvc" :predicate :core/depends-on :object "Redis"})
+    (core/assert-fact s {:subject "AuthService" :predicate :core/depends-on :object "Redis"})
+    (core/merge-entities s {:from "AuthSvc" :into "AuthService"})
+    (let [history (:history (core/get-history s {:subject "AuthService"
+                                                 :predicate :core/depends-on}))
+          retired (first (filter :t-invalid history))
+          survivor (first (remove :t-invalid history))]
+      (is (= :merge-duplicate (:invalidation-kind retired)))
+      (is (= (:id survivor) (:successor retired)))
+      (is (str/includes? (:invalidation-reason retired) "duplicate after merging")))))
 
 (deftest predicate-promotion
   (with-stores [s]

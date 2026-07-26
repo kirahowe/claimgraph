@@ -73,15 +73,13 @@
   (into {} (map (juxt :name #(dissoc % :id))) (store/-list-entities s {})))
 
 (def ^:private documented-fact-fields
-  "Every field of the fact wire shape as claimgraph.store documents it. Pinned
-  here so the projection below cannot quietly stop covering one: an explicit
-  key list is how :recorded-at, :last-reinforced-at and :episode dropped out of
-  the round-trip check while the test still said \"field for field\", and
-  :recorded-at is the field the millisecond encoding exists to protect."
-  #{:id :subject :predicate :object-kind :object-ref :object-lit
-    :t-valid :t-invalid :recorded-at :last-reinforced-at
-    :confidence :epistemic :scope :source-type :episode :conflicts
-    :invalidation-reason})
+  "Every field of the fact wire shape, read from the one declaration that owns
+  it rather than copied. Copying is how :recorded-at, :last-reinforced-at and
+  :episode dropped out of this check while the test still said \"field for
+  field\" — and a second copy went stale the moment :invalidation-kind and
+  :successor were added, failing here for naming the shape rather than for
+  anything the round trip got wrong."
+  (set store/fact-keys))
 
 (defn- fact-semantics
   "A fact reduced to what two stores can compare — EVERY key the store hands

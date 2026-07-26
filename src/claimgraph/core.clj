@@ -218,13 +218,15 @@
       (when (seq aliases)
         (store/-update-entity s (:id dst) {:add-aliases aliases}))
       (store/-delete-entity s (:id src))
-      (let [dups (logic/collapse-duplicates-plan
+      (let [dups (logic/collapse-duplicates
                   (store/-get-facts s (:id dst) {:direction :both})
                   t-now)]
-        (doseq [id dups]
+        (doseq [{:keys [id survivor]} dups]
           (store/-invalidate s id t-now
-                             (str "duplicate after merging " (:name src)
-                                  " into " (:name dst))))
+                             {:kind :merge-duplicate
+                              :successor survivor
+                              :reason (str "duplicate after merging " (:name src)
+                                           " into " (:name dst))}))
         {:status :merged
          :from (:name src)
          :into (:name dst)
@@ -284,7 +286,9 @@
     :insert {:status :created :fact (store/-insert-fact s fact)}
     :supersede (do (doseq [id invalidate]
                      (store/-invalidate s id effective-at
-                                        (str "superseded by " (:id fact))))
+                                        {:kind :superseded
+                                         :successor (:id fact)
+                                         :reason (str "superseded by " (:id fact))}))
                    {:status :superseded
                     :fact (store/-insert-fact s fact)
                     :superseded invalidate})
@@ -607,7 +611,8 @@
     (when (< (logic/ms at) (logic/ms (:t-valid f)))
       (logic/fail "Invalid interval: the fact starts after the requested end"
                   {:type :invalid-interval :t-valid (:t-valid f) :at at}))
-    (store/-invalidate s fact-id at (or reason "manually invalidated"))
+    (store/-invalidate s fact-id at {:kind :manual
+                                     :reason (or reason "manually invalidated")})
     {:status :invalidated :fact-id fact-id :at at}))
 
 ;; ---------------------------------------------------------------------------
@@ -859,9 +864,21 @@
         (store/-insert-fact s (-> f
                                   (assoc :subject (remap (:subject f)))
                                   (assoc :object-ref (remap (:object-ref f)))
-                                  (dissoc :invalidation-reason :conflicts)))
-        (when (and (:t-invalid f) (:invalidation-reason f))
-          (store/-invalidate s (:id f) (:t-invalid f) (:invalidation-reason f))))
+                                  (dissoc :invalidation-reason :invalidation-kind
+                                          :successor :conflicts)))
+        ;; the whole invalidation goes back through -invalidate, not the
+        ;; insert: it is the one write that has to look identical however the
+        ;; fact got here, so a dumped supersession restores with the same kind
+        ;; and successor a live one records. :successor is a plain id and is
+        ;; restored as one — the successor may be several thousand lines
+        ;; further down this dump, and a load that waited for it would have to
+        ;; order the file
+        (when (and (:t-invalid f)
+                   (or (:invalidation-reason f) (:invalidation-kind f) (:successor f)))
+          (store/-invalidate s (:id f) (:t-invalid f)
+                             {:kind (:invalidation-kind f)
+                              :successor (:successor f)
+                              :reason (:invalidation-reason f)})))
       (doseq [f facts
               :when (seq (:conflicts f))]
         (store/-link-conflicts s (:id f) (vec (:conflicts f))))

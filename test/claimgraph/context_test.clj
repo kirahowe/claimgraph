@@ -11,6 +11,8 @@
             [claimgraph.core :as core]
             [claimgraph.harness :as harness]
             [claimgraph.ingest.notes :as notes]
+            [claimgraph.judge :as judge]
+            [claimgraph.store :as store]
             [claimgraph.store.memory :as mem]))
 
 ;; ---------------------------------------------------------------------------
@@ -142,6 +144,7 @@
                       :source-type :decision-record :confidence 0.95})
                (fact {:id "f-old" :object-lit "Heroku" :predicate :core/deployed-via
                       :t-invalid #inst "2026-07-01"
+                      :invalidation-kind :superseded :successor "f-new"
                       :invalidation-reason "superseded by f-new"})
                (fact {:id "f-new" :object-lit "Fly" :predicate :core/deployed-via})
                (fact {:id "f-code" :source-type :code :predicate :core/defined-in
@@ -164,8 +167,66 @@
 (deftest supersessions-outside-the-window-drop-out
   (is (empty? (context/recent-supersessions
                [(fact {:t-invalid #inst "2026-01-01"
-                       :invalidation-reason "superseded by f-x"})]
+                       :invalidation-kind :superseded :successor "f-x"})]
                now context/supersession-window-days))))
+
+(deftest supersessions-are-selected-by-kind-not-by-prose
+  (testing "the reason sentence is cosmetic: nothing reads it any more"
+    (is (empty? (context/recent-supersessions
+                 [(fact {:id "f-a" :t-invalid #inst "2026-07-01"
+                         :invalidation-reason "superseded by f-b"})]
+                 now context/supersession-window-days))
+        "a reason that merely says 'superseded by' carries no link"))
+  (testing "every supersession kind reaches the section, however it was decided"
+    (doseq [kind [:superseded :judged-superseded]]
+      (is (= 1 (count (context/recent-supersessions
+                       [(fact {:id "f-a" :t-invalid #inst "2026-07-01"
+                               :invalidation-kind kind :successor "f-b"})
+                        (fact {:id "f-b"})]
+                       now context/supersession-window-days)))
+          (str kind " is a supersession and belongs in the briefing"))))
+  (testing "a duplicate collapse is not a change and stays out"
+    (is (empty? (context/recent-supersessions
+                 [(fact {:id "f-a" :t-invalid #inst "2026-07-01"
+                         :invalidation-kind :merge-duplicate :successor "f-b"})
+                  (fact {:id "f-b"})]
+                 now context/supersession-window-days))))
+  (testing "an unrecognised kind from a newer writer is ignored, not guessed at"
+    (is (empty? (context/recent-supersessions
+                 [(fact {:id "f-a" :t-invalid #inst "2026-07-01"
+                         :invalidation-kind :retracted-by-decree :successor "f-b"})]
+                 now context/supersession-window-days))))
+  (testing "a successor that is not in the fact set renders, without a target"
+    (let [[{:keys [old new]}] (context/recent-supersessions
+                               [(fact {:id "f-a" :t-invalid #inst "2026-07-01"
+                                       :invalidation-kind :superseded
+                                       :successor "f-gone"})]
+                               now context/supersession-window-days)]
+      (is (= "f-a" (:id old)))
+      (is (nil? new) "that it stopped holding is still worth reporting"))))
+
+(deftest judge-resolved-supersessions-reach-the-briefing
+  ;; The live bug this section was rebuilt for: judge.clj wrote "judged
+  ;; superseded by <id>" and recent-supersessions matched
+  ;; ^superseded by (\S+)$ against it, so no supersession the LLM ever
+  ;; resolved appeared in the one section that reports what changed. The two
+  ;; namespaces meet here because that is where they disagreed.
+  (let [s (mem/create)
+        _ (core/seed! s)
+        _ (core/assert-fact s {:subject "ADR-1" :predicate :core/has-status
+                               :object "accepted"})
+        _ (core/assert-fact s {:subject "ADR-1" :predicate :core/has-status
+                               :object "superseded"})
+        _ (judge/judge-conflicts!
+           s {:judge-fn (constantly "{\"relation\":\"supersedes\",\"confidence\":0.95}")
+              :resolve true})
+        sections (context/compiled-sections {:facts (store/-all-facts s)
+                                             :conflicts []
+                                             :now (java.util.Date.)})
+        lines (:lines (first (filter #(= :supersessions (:key %)) sections)))]
+    (is (= 1 (count lines)))
+    (is (str/includes? (first lines) "\"accepted\" → \"superseded\"")
+        "old → new, with the successor the judge picked")))
 
 (deftest budget-cuts-low-priority-lines-first
   (let [sections [{:key :a :header "A" :lines ["- a1" "- a2"]}
