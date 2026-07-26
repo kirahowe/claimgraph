@@ -1,13 +1,32 @@
 (ns claimgraph.setup-test
   "One-shot onboarding against a temp project: every step idempotent and
   dry-runnable, no real store backend (init-fn injected), no LLM, no real
-  ~/.claude."
+  ~/.claude.
+
+  Also the home of the checks about what a user's INSTALL looks like, because
+  they answer to the same question and nothing else in the suite owns it: the
+  installer against bb.edn, this repo's own .gitignore against the block setup
+  manages, and the command surfaces a user actually invokes — `dump`, `load`,
+  `version`, and the MCP tools — driven end to end through cli/mcp against an
+  in-memory store, so what lands on disk is asserted rather than assumed from
+  the units underneath.
+
+  Cheshire, not claimgraph.wire, on purpose in these tests: the artifacts are
+  being checked as bytes a foreign reader sees, and going back through the
+  encoder under test would let a drift in it agree with itself."
   (:require [babashka.fs :as fs]
             [babashka.process :as process]
             [cheshire.core :as json]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
-            [claimgraph.setup :as setup]))
+            [claimgraph.cli :as cli]
+            [claimgraph.config :as config]
+            [claimgraph.core :as core]
+            [claimgraph.mcp :as mcp]
+            [claimgraph.setup :as setup]
+            [claimgraph.store :as store]
+            [claimgraph.store.memory :as mem]
+            [claimgraph.version :as version]))
 
 (defn- temp-project []
   (str (fs/create-temp-dir {:prefix "claimgraph-setup-test"})))
@@ -113,16 +132,41 @@
         cfg (json/parse-string
              (slurp (str (fs/path project ".claimgraph" "config.json"))) true)]
     (is (= :installed (get-in r [:steps :config :status])))
-    (is (= {:harness "codex" :consolidate-days 3} cfg))
+    (is (= {:harness "codex" :consolidate-days 3
+            :config-version version/format-version}
+           cfg))
     (testing "re-running with new choices merges, preserving earlier ones"
       (setup/run! (assoc base-opts :project project
                          :chosen {:extractor "llm -m small"}))
-      (is (= {:harness "codex" :consolidate-days 3 :extractor "llm -m small"}
+      (is (= {:harness "codex" :consolidate-days 3 :extractor "llm -m small"
+              :config-version version/format-version}
              (json/parse-string
               (slurp (str (fs/path project ".claimgraph" "config.json"))) true))))
     (testing "all defaults + no file -> nothing persisted"
       (is (= :skipped (get-in (setup/run! (assoc base-opts :project (temp-project)))
                               [:steps :config :status]))))))
+
+(deftest the-config-we-write-is-the-config-config-clj-reads
+  ;; the format gate on the config file could only ever fire on a hand-edited
+  ;; one while the writer stamped nothing — a gate that cannot fire is a gate
+  ;; nobody notices is missing until a future release needs it
+  (let [project (temp-project)
+        _ (setup/persist-config! {:project project :chosen {:harness "codex"}})
+        path (str (fs/path project ".claimgraph" "config.json"))
+        cfg (json/parse-string (slurp path) true)]
+    (is (= version/format-version (:config-version cfg)))
+    (is (empty? (config/unknown-keys cfg))
+        "the stamp is a key config.clj knows, not one it warns about")
+    (is (nil? (config/unsupported-format path (:config-version cfg)))
+        "and this build reads what it just wrote")
+    (testing "a file from before stamping is stamped on the next pass, settings intact"
+      (let [project (temp-project)
+            path (str (fs/path project ".claimgraph" "config.json"))]
+        (fs/create-dirs (fs/parent path))
+        (spit path "{\"harness\":\"codex\"}\n")
+        (setup/persist-config! {:project project :chosen {}})
+        (is (= {:harness "codex" :config-version version/format-version}
+               (json/parse-string (slurp path) true)))))))
 
 (deftest gitignore-respects-existing-coverage-and-external-dbs
   (testing "a repo already ignoring the whole directory is left alone"
@@ -228,6 +272,31 @@
         (is (= 1 (count (re-seq #"(?m)^\.claimgraph/db\.last-consolidate$" content)))
             "and nothing ended up both inside and outside the managed region"))
       (is (= :unchanged (:status (setup/ensure-gitignore! {:project project})))))))
+
+(deftest managed-block-covers-every-sibling-the-store-writes
+  ;; each of these is a real file claimgraph drops next to the db; one missing
+  ;; from the block is one that turns up untracked in every project using
+  ;; claimgraph and rides the next `git add -A` into someone's history
+  (let [entries (set (setup/gitignore-entries ".claimgraph/db"))]
+    (doseq [sibling ["/"            ; the LMDB directory itself
+                     ".lock"        ; lease/lock-file
+                     ".evidence/"   ; evidence/default-dir
+                     ".oplog/"      ; oplog/oplog-dir
+                     ".retrievals"  ; outcome/log-file
+                     ".last-consolidate"
+                     ".version"]]   ; store.datalevin/version-file
+      (is (contains? entries (str ".claimgraph/db" sibling))
+          (str ".claimgraph/db" sibling " is written but not ignored")))))
+
+(deftest this-repo-ignores-what-its-own-setup-manages
+  ;; claimgraph is used on claimgraph: an entry the block gained that this
+  ;; .gitignore never did shows up here as an untracked artifact in the repo
+  ;; the maintainer commits from
+  (is (some? repo-root) "the checkout has to be locatable — this check must never no-op")
+  (let [ignored (set (map str/trim (str/split-lines (slurp (str (fs/path repo-root ".gitignore"))))))]
+    (doseq [entry (setup/gitignore-entries ".claimgraph/db")]
+      (is (contains? ignored entry)
+          (str entry " is in the managed block but not in this repo's .gitignore")))))
 
 (deftest bb-edn-pins-the-babashka-the-installer-installs
   ;; scripts/setup.sh installs BB_VERSION and reads bb.edn's :min-bb-version as
@@ -391,6 +460,112 @@
     (is (= :error (get-in r [:steps :store :status])))
     (is (= :installed (get-in r [:steps :skill :status]))
         "a failed store init never blocks the file-side steps")))
+
+;; ---------------------------------------------------------------------------
+;; The command surfaces, driven end to end against an in-memory store
+;; ---------------------------------------------------------------------------
+
+(defn- a-store
+  "A seeded in-memory store holding one fact, plus a db path in a temp project
+  — the CLI writes its lease and retrieval log beside that path, and neither
+  belongs in the machine running the suite."
+  []
+  (let [s (doto (mem/create) (core/seed!))]
+    (core/assert-fact s {:subject "AuthService" :predicate :core/prefers
+                         :object "argon2" :object-kind :literal
+                         :epistemic :preference :source-type :user-assertion})
+    [s (str (fs/path (temp-project) "db"))]))
+
+(def ^:private ms-timestamp
+  #"\"recorded-at\":\"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z\"")
+
+(defn- run-cli
+  "One CLI command against a given store, its stdout captured. Redefining the
+  store opener is what keeps the pod (and a real db) out of this."
+  [cmd s opts]
+  (with-redefs [cli/open-store (fn [_] s)]
+    (str/trim (with-out-str (cmd {:opts opts})))))
+
+(deftest init-reconciles-the-vocabulary-of-a-store-that-already-has-one
+  ;; seed! reconciles a predicate row to the seed's shape INCLUDING removals,
+  ;; but open-store only seeds an empty store — so until `claim init` re-seeds
+  ;; unconditionally the reconciliation is unreachable, and an upgraded store
+  ;; keeps whatever the old vocabulary said. That is how the non-bijective
+  ;; :inverse-of survived its own removal.
+  (let [[s db] (a-store)]
+    (store/-register-predicate s (assoc (store/-get-predicate s :core/defined-in)
+                                        :inverse-of :core/contains))
+    (is (= :core/contains (:inverse-of (store/-get-predicate s :core/defined-in)))
+        "a store carrying the pre-removal row")
+    (run-cli cli/cmd-init s {:db db})
+    (is (nil? (:inverse-of (store/-get-predicate s :core/defined-in)))
+        "`claim init` is the documented upgrade path and must actually reconcile")))
+
+(deftest dump-command-writes-the-artifact-it-reports
+  ;; the header requirement was pinned only at wire/dump-lines: nothing
+  ;; asserted that the command a user runs puts one in the file, so a dump
+  ;; command that went back to plain cheshire failed three unit assertions and
+  ;; nothing that looked like a dump
+  (let [[s db] (a-store)
+        out (str (fs/path (fs/parent db) "graph.dump.jsonl"))
+        report (json/parse-string (run-cli cli/cmd-dump s {:db db :out out}) true)
+        lines (str/split-lines (slurp out))]
+    (testing "the file leads with the header a loader gates on"
+      (is (= (version/dump-header) (json/parse-string (first lines) true))))
+    (testing "timestamps reach the file with their milliseconds"
+      (is (some #(re-find ms-timestamp %) (rest lines))
+          "a second-granularity dump loses intervals shorter than a second"))
+    (testing "the counts describe the file, unambiguously"
+      (is (= (count lines) (:lines report)) "what `wc -l` will say")
+      (is (= (dec (count lines)) (:records report)) "the graph, header excluded")
+      (is (= version/format-version (:format report))))
+    (testing "and load reads back what dump wrote, header and all"
+      (let [fresh (mem/create)
+            r (json/parse-string (run-cli cli/cmd-load fresh {:db db :file out}) true)]
+        (is (= "loaded" (:status r)))
+        (is (= version/format-version (:format r)) "the header was read, not restored as a record")
+        (is (= 1 (:facts r)))
+        (is (= (get-in (core/get-facts s {:entity "AuthService"}) [:facts 0 :recorded-at])
+               (get-in (core/get-facts fresh {:entity "AuthService"}) [:facts 0 :recorded-at]))
+            "the round trip is exact to the millisecond")))))
+
+(deftest mcp-and-the-cli-answer-with-the-same-bytes
+  ;; two surfaces onto one store: an agent that reads a fact over MCP and
+  ;; diffs it against the CLI's answer (or the committed dump) must not find a
+  ;; different recorded-at because one surface truncated the milliseconds
+  (let [[s db] (a-store)
+        over-mcp (get-in (mcp/handle s db {:id 1 :method "tools/call"
+                                           :params {:name "memory_facts"
+                                                    :arguments {:entity "AuthService"}}})
+                         [:result :content 0 :text])
+        over-cli (run-cli cli/cmd-facts s {:db db :entity "AuthService"})
+        ;; :effective-confidence is decayed at read time and moves between the
+        ;; two calls by design; every other field is the same fact twice
+        stable #(update (json/parse-string % true) :facts
+                        (partial mapv (fn [f] (dissoc f :effective-confidence))))]
+    (is (re-find ms-timestamp over-mcp) "MCP truncated the timestamp")
+    (is (= (re-find ms-timestamp over-cli) (re-find ms-timestamp over-mcp)))
+    (is (= (stable over-cli) (stable over-mcp))))
+  (testing "and the server names the release, not a literal that drifts from it"
+    (let [[s db] (a-store)]
+      (is (= {:name "claimgraph" :version version/release}
+             (get-in (mcp/handle s db {:id 1 :method "initialize" :params {}})
+                     [:result :serverInfo]))))))
+
+(deftest version-marks-a-checkout-it-cannot-vouch-for
+  (testing "the payload carries the marker only when there is something to mark"
+    (is (nil? (:dirty (version/describe "abc1234" false))))
+    (is (true? (:dirty (version/describe "abc1234" true))))
+    (is (nil? (:dirty (version/describe nil true))) "no checkout, nothing to vouch for"))
+  (testing "and the marker is read off this checkout rather than assumed"
+    (is (fs/exists? (fs/path repo-root ".git"))
+        "the suite runs from a checkout — this check must never no-op")
+    (let [{:keys [sha dirty]} (#'cli/source-checkout)
+          porcelain (:out (process/sh {:dir repo-root :out :string :err :string}
+                                      "git" "status" "--porcelain"))]
+      (is (re-matches #"[0-9a-f]{40}" (str sha)) "HEAD, from claimgraph's own checkout")
+      (is (= (not (str/blank? porcelain)) dirty)
+          "uncommitted or untracked source is exactly what makes the sha unquotable"))))
 
 (deftest repo-dogfood-skill-is-in-sync-with-the-template
   ;; the repo's own .claude/skills/claimgraph/SKILL.md is the template

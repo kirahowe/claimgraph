@@ -6,9 +6,14 @@
 
   Pod discipline: the pod is a serialization boundary — push whole queries
   across and get result sets back, never loop chattily."
-  (:require [babashka.pods :as pods]
+  (:require [babashka.fs :as fs]
+            [babashka.pods :as pods]
+            [claimgraph.config :as config]
             [claimgraph.logic :as logic]
-            [claimgraph.store :as store]))
+            [claimgraph.predicates :as preds]
+            [claimgraph.store :as store]
+            [claimgraph.version :as version]
+            [claimgraph.wire :as wire]))
 
 (pods/load-pod (or (System/getenv "CLAIMGRAPH_DTLV") "dtlv"))
 
@@ -126,16 +131,75 @@
    :opened-at (:episode/opened-at m) :closed-at (:episode/closed-at m)
    :evidence (:episode/evidence m)})
 
-(defn- pred->wire [m]
-  (into {} (filter (comp some? val))
-        {:id (:predicate/id m) :label (:predicate/label m)
-         :category (:predicate/category m) :object-kind (:predicate/object-kind m)
-         :cardinality (:predicate/cardinality m) :inverse-of (:predicate/inverse-of m)
-         :status (:predicate/status m) :replaced-by (:predicate/replaced-by m)
-         :definition (:predicate/definition m) :maps-to (:predicate/maps-to m)
-         :default-epistemic (:predicate/default-epistemic m)
-         :exclusion-group (:predicate/exclusion-group m)
-         :value-exclusivity (:predicate/value-exclusivity m)}))
+(def ^:private predicate-attrs
+  "Wire key -> attribute for every registry field -register-predicate owns.
+  Ownership is the point: this list bounds what a re-registration may write
+  and, on a curated row, what it may retract. :predicate/alt-labels is
+  deliberately absent — nothing writes it yet, and a reconcile that cleared
+  every attribute it merely didn't recognise would delete a future writer's
+  data on the next `claim init`."
+  (array-map
+   :label :predicate/label
+   :category :predicate/category
+   :object-kind :predicate/object-kind
+   :cardinality :predicate/cardinality
+   :inverse-of :predicate/inverse-of
+   :status :predicate/status
+   :replaced-by :predicate/replaced-by
+   :definition :predicate/definition
+   :maps-to :predicate/maps-to
+   :default-epistemic :predicate/default-epistemic
+   :exclusion-group :predicate/exclusion-group
+   :value-exclusivity :predicate/value-exclusivity))
+
+(defn- curated?
+  "Does registering this id REDEFINE the row, or AMEND it? The store cannot
+  see which caller it is serving, but the id says which half of the
+  vocabulary the row belongs to, and the two halves are owned by different
+  writers.
+
+  :core/* is curated: the seed map IS the row, because nothing else may write
+  one — logic/prepare-registration refuses a runtime coinage outside :x/*. So
+  a field the seed drops has to be retracted. :core/defined-in lost
+  :inverse-of when the containment pair stopped being bijective, and an
+  add-only upsert would leave every store that ever seeded the old row
+  reporting the retired value forever.
+
+  :x/* accumulates instead, across writers that each know only part of the
+  row: coined on first use from preds/auto-registration, amended by `claim
+  predicate register` with the fields the user named (never the whole row),
+  deprecated by promotion with the forwarding address. Reconciling one of
+  those against a partial map is how `predicate register x/foo --definition
+  ...` erased :maps-to, :default-epistemic and the :replaced-by pointing at
+  the promoted twin.
+
+  Anything else — a namespace only a dump or an oplog replay can introduce —
+  arrives as a whole row from a store that already held it, so it reconciles
+  like the curated half. That includes an id that is not a keyword at all: a
+  hand-written dump can put anything in :id, and such a row should fail on
+  the write, where the error names the row, rather than inside a namespace
+  check that never had an opinion about it."
+  [pred-id]
+  (not (and (keyword? pred-id) (preds/experimental? pred-id))))
+
+(defn- pred->wire
+  "Registry row -> wire map, driven off predicate-attrs so the field list has
+  one home.
+
+  Key order is not part of the wire contract and never was: a map of nine
+  keys or more is a hash map whichever way it is built, so every seeded
+  predicate serializes to the same bytes it did before this was rewritten
+  (measured: all 23). What did change order is a row short enough to stay an
+  array map — a freshly coined :x/* predicate, seven keys — which now leads
+  with :id instead of wherever hashing put it. That is a one-time reordering
+  of those lines in a committed dump, with no value changed and nothing for a
+  loader to notice, which is why it costs no format bump: JSON object key
+  order carries no meaning, and pinning the old order would mean keeping the
+  13-key literal whose duplication of this list is what went wrong first."
+  [m]
+  (into {:id (:predicate/id m)}
+        (keep (fn [[k attr]] (when-some [v (get m attr)] [k v])))
+        predicate-attrs))
 
 (defn- strip-nils [m] (into {} (filter (comp some? val)) m))
 
@@ -298,9 +362,13 @@
     entity-id)
 
   (-list-entities [_ {:keys [type scope]}]
+    ;; entity-pull, not a narrower list: core/dump reads entities through here,
+    ;; so a field this projection omits is a field the dump silently drops. It
+    ;; omitted :entity/aliases, which took every alias out of a datalevin dump
+    ;; and disarmed alias resolution on restore.
     (cond->> (map ent->wire
-                  (d/q '[:find [(pull ?e [:entity/id :entity/name :entity/type :entity/scope]) ...]
-                         :where [?e :entity/id _]]
+                  (d/q [:find [(list 'pull '?e entity-pull) '...]
+                        :where '[?e :entity/id _]]
                        (d/db conn)))
       type (filter #(= type (:type %)))
       scope (filter #(= scope (:scope %)))
@@ -404,20 +472,24 @@
       true vec))
 
   (-register-predicate [_ pred]
-    (d/transact! conn [(strip-nils
-                        {:predicate/id (:id pred)
-                         :predicate/label (:label pred)
-                         :predicate/category (:category pred)
-                         :predicate/object-kind (:object-kind pred)
-                         :predicate/cardinality (:cardinality pred)
-                         :predicate/inverse-of (:inverse-of pred)
-                         :predicate/status (:status pred)
-                         :predicate/replaced-by (:replaced-by pred)
-                         :predicate/definition (:definition pred)
-                         :predicate/maps-to (:maps-to pred)
-                         :predicate/default-epistemic (:default-epistemic pred)
-                         :predicate/exclusion-group (:exclusion-group pred)
-                         :predicate/value-exclusivity (:value-exclusivity pred)})])
+    (let [id (:id pred)
+          row (into {:predicate/id id}
+                    (keep (fn [[k attr]] (when-some [v (get pred k)] [attr v])))
+                    predicate-attrs)
+          ;; On a curated row a field the caller dropped is retracted; on a
+          ;; staging row it is left alone (see curated?). The existing row is
+          ;; only read when the answer can depend on it, which also keeps the
+          ;; first-use :x/* coinage a single round trip to the pod.
+          retractions (when (curated? id)
+                        (let [existing (d/q '[:find (pull ?p [*]) . :in $ ?id
+                                              :where [?p :predicate/id ?id]]
+                                            (d/db conn) id)]
+                          (keep (fn [[k attr]]
+                                  (let [old (get existing attr)]
+                                    (when (and (nil? (get pred k)) (some? old))
+                                      [:db/retract [:predicate/id id] attr old])))
+                                predicate-attrs)))]
+      (d/transact! conn (conj (vec retractions) row)))
     pred)
 
   (-search [this query _opts]
@@ -439,7 +511,8 @@
                                         [:where ['?e attr '_]]) db) 0))
           invalidated (or (d/q '[:find (count ?f) . :where [?f :fact/t-invalid _]] db) 0)
           total (cnt :fact/id)]
-      {:entities (cnt :entity/id)
+      {:format version/format-version
+       :entities (cnt :entity/id)
        :facts {:total total :valid (- total invalidated) :invalidated invalidated}
        :episodes (cnt :episode/id)
        :predicates (frequencies
@@ -448,7 +521,95 @@
 
   (-close [_] (d/close conn)))
 
-(defn open-store
-  "Open (creating if needed) a Datalevin-backed store at path."
+;; ---- format stamp ----------------------------------------------------------
+
+(defn version-file
+  "The store's format stamp: <db>.version, alongside <db>.oplog, <db>.evidence,
+  <db>.lock and <db>.retrievals. A sibling FILE rather than a datom, and the
+  reason is ordering, not taste — see open-store."
   [path]
-  (->DatalevinStore (d/get-conn path schema)))
+  (str path ".version"))
+
+(defn stamped-format
+  "The format this store declares: the :format out of <db>.version, or nil
+  when there is no stamp file at all.
+
+  A stamp that exists but says nothing this build can read — truncated by a
+  crash mid-spit, empty, or JSON without a :format — is REFUSED here, not
+  reported as unstamped. The two look alike and are opposites: absent means
+  written before stamping existed, which is every store claimgraph has ever
+  written and is safe to open; unreadable means something wrote a stamp and
+  this build cannot tell which format it claimed. Reading that as unstamped
+  is the worst available outcome, because open-store would then merge this
+  build's schema into a store that may be newer and stamp! would replace the
+  file with this build's number — destroying, on exactly the input the gate
+  cannot read, the only evidence the store was ever anything else."
+  [path]
+  (let [f (version-file path)]
+    (when (fs/exists? f)
+      (let [raw (slurp f)
+            parsed (try (wire/parse-string raw) (catch Exception _ nil))]
+        (if (some? (:format parsed))
+          (:format parsed)
+          (logic/fail
+           (str f " is not a readable format stamp (it holds: "
+                (pr-str (subs raw 0 (min 200 (count raw))))
+                "), so this claimgraph cannot tell what wrote " path ".")
+           {:type :unreadable-format-stamp
+            :artifact f
+            :supported version/format-version
+            :hint (str "open the store with the claimgraph that wrote it, which "
+                       "will re-stamp it; delete " f " only if you know this store "
+                       "is this build's or older — this build would then treat it "
+                       "as unstamped, merge its own schema in, and stamp it format "
+                       version/format-version)}))))))
+
+(defn- stamp!
+  "Write <db>.version if it does not already say exactly this. Rewriting an
+  unchanged stamp on every open would churn the mtime of a file that backup
+  and sync tools watch.
+
+  Only ever reached once stamped-format has accepted the file, which is what
+  makes an unconditional write safe: the one stamp that must never be
+  overwritten is the one nobody could parse, and that is refused upstream
+  rather than replaced here."
+  [path]
+  (let [f (version-file path)
+        content (wire/generate-string {:format version/format-version
+                                       :version version/release})]
+    (when-not (= content (when (fs/exists? f) (slurp f)))
+      (spit f content))))
+
+(defn open-store
+  "Open (creating if needed) a Datalevin-backed store at path, refusing one
+  written by a claimgraph newer than this build — or one whose stamp this
+  build cannot read at all (stamped-format).
+
+  The gate runs BEFORE d/get-conn, and that ordering is the whole design.
+  get-conn MERGES `schema` into the store as it opens: a check that waits for
+  a connection has already written this build's :db/valueType and
+  :db/cardinality over a newer build's, so detecting the incompatibility would
+  be the act that commits it — and the newer claimgraph the user goes back to
+  now finds a store this one quietly rewrote. That is also why the stamp is a
+  sibling file and not a datom: a datom cannot be read until the merge that it
+  exists to prevent has happened.
+
+  What the sibling costs is that `cp -r db/` alone leaves the stamp behind and
+  the copy reads as unstamped. That copy has also lost the oplog (which is the
+  record — the store is its materialized view), the evidence blobs and the
+  lease, so it is not a store anyone can use anyway, and it is not worth
+  trading the ordering guarantee to defend.
+
+  An unstamped store is stamped in place rather than refused. Every store
+  written before this change is unstamped, including claimgraph's own dogfood
+  store, and they are format-0 stores in name only: stamping added no
+  attribute and changed no valueType, so a format-0 and a format-1 store are
+  byte-identical in shape. Refusing them would strand every existing user over
+  a difference that does not exist."
+  [path]
+  (config/require-format (version-file path) (stamped-format path))
+  (let [conn (d/get-conn path schema)]
+    ;; after the open, so the stamp lands next to a store that exists: the
+    ;; parent directory is datalevin's to create on a fresh path
+    (stamp! path)
+    (->DatalevinStore conn)))

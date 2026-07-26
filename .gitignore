@@ -6,6 +6,7 @@
 .claimgraph/db.oplog/
 .claimgraph/db.retrievals
 .claimgraph/db.last-consolidate
+.claimgraph/db.version
 *.dump.jsonl
 bench/results/
 

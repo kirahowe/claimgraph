@@ -12,9 +12,17 @@
   resolved value and the layer it came from.
 
   Resolution is pure (resolve-setting over passed opts/env/config maps); the
-  only impure seams are reading the real environment and the config file."
+  only impure seams are reading the real environment and the config file.
+
+  This namespace also owns the pure compatibility gate every stamped artifact
+  shares (unsupported-format below). It lives here rather than in each
+  artifact's namespace because the decision is one integer comparison with one
+  policy, and three copies of a policy is how two of them drift."
   (:require [babashka.fs :as fs]
-            [cheshire.core :as json]))
+            [cheshire.core :as json]
+            [clojure.string :as str]
+            [claimgraph.logic :as logic]
+            [claimgraph.version :as version]))
 
 (def settings
   "The registry of configurable settings: option key -> where a value may
@@ -23,7 +31,7 @@
   means the consumer computes one (documented in :desc)."
   (array-map
    :db {:flag "--db" :env "CLAIMGRAPH_DB" :default ".claimgraph/db"
-        :desc "Store path (an LMDB directory; the oplog, evidence, lock, and stamp files derive from it as siblings)."}
+        :desc "Store path (an LMDB directory; the format stamp, oplog, evidence, lock, and stamp files derive from it as siblings)."}
    :harness {:flag "--harness" :env "CLAIMGRAPH_HARNESS" :default "claude-code"
              :desc "Which harness's auto-memory the ambient loop consumes (claude-code | codex)."}
    :notes-dir {:flag "--dir" :opt-key :dir :env "CLAIMGRAPH_NOTES_DIR"
@@ -43,6 +51,117 @@
                       :desc "Consolidation cadence for hooks run, in days (0 = every run)."}
    :code-ingest {:flag "--code-ingest" :env "CLAIMGRAPH_CODE_INGEST" :default "session-end"
                  :desc "Whether hooks run refreshes code facts as its first stage (session-end | manual). Delta-gated either way; manual opts a project with an expensive analyzer out of the ambient pass. The code-analyzers map (config-file only) tunes which analyzers run."}))
+
+(def config-only-keys
+  "Keys the config file legitimately carries that are NOT settings, listed so
+  the unknown-key check has one authority to consult and a deliberate
+  omission cannot be mistaken for an oversight.
+
+  :code-analyzers is a map of analyzer id -> command, read straight from the
+  file by ingest/code.clj. It stays out of the registry on purpose: a setting
+  earns its place there by having a flag and an env var, and neither spelling
+  makes sense for nested JSON on a command line, so `claim config` would print
+  a row it could not teach you to set.
+
+  :config-version is the file's own format stamp — the same integer every
+  other persisted artifact carries (claimgraph.version/format-version), not a
+  setting anyone resolves."
+  #{:code-analyzers :config-version})
+
+(defn unknown-keys
+  "Pure. The config-file keys claimgraph recognises nothing about, sorted.
+
+  A misspelled key (`notes_dir`, `extactor`) parses as valid JSON, resolves to
+  nothing, and changes nothing — the exact silent-configuration failure this
+  namespace refuses to tolerate elsewhere, wearing a disguise. Naming the keys
+  is the only way a user finds out the setting never took effect; the file
+  cannot warn about them retroactively once people have accumulated cruft in
+  it, which is why this is cheap now and impossible later."
+  [config]
+  (->> (when (map? config) (keys config))
+       (remove #(contains? settings %))
+       (remove config-only-keys)
+       (sort-by name)
+       vec))
+
+(defn unknown-key-warning
+  "Pure. The one-line warning for unknown-keys, or nil when there is nothing
+  to say."
+  [path config]
+  (when-let [ks (seq (unknown-keys config))]
+    (str "claimgraph: " path ": ignoring " (count ks) " unrecognised key"
+         (when (next ks) "s") " — " (str/join ", " (map name ks))
+         ". `claim config` lists every setting claimgraph reads.")))
+
+;; ---------------------------------------------------------------------------
+;; Pure: the format gate every stamped artifact shares
+;; ---------------------------------------------------------------------------
+
+(defn format-number?
+  "Pure. Is this what a claimgraph format stamp is — one non-negative integer?
+  Zero is the floor, being \"written before stamping existed\"; below that is
+  a number no artifact has ever carried.
+
+  Deliberately narrow, because the values that are not a format number arrive
+  looking like one. JSON has a single number type: a stamp written 2.0 parses
+  to a Double, one written past 2^63 to a BigInteger, and a hand-edit that
+  quotes it to a String. `int?` calls none of those three an integer, so a
+  gate that asks `int?` before comparing treats all three as no stamp at all
+  and reads the file anyway; a gate that compares first throws on the String.
+  Whether a stamp is legible has to be decided before it is compared."
+  [x]
+  (and (integer? x) (not (neg? x))))
+
+(defn unsupported-format
+  "Pure. Can this build read an artifact stamped `found`? nil when it can,
+  the error data to fail with when it cannot.
+
+  An absent stamp is format 0 — everything written before stamping existed —
+  and reads. So does any format BELOW ours, by construction: format-version
+  moves only when an OLD reader would get a NEW artifact wrong, so a new
+  reader still understands every older shape, and refusing a file it can read
+  is a worse failure than the missing stamp was.
+
+  Two shapes are refused, and the remedies differ, so the errors do too. A
+  stamp ABOVE ours is :unsupported-format — the case worth stopping the world
+  for, because the alternative is applying the only rules this build knows to
+  bytes that stopped following them and calling the result a success. The
+  error names both integers because \"upgrade claimgraph\" is the whole
+  remedy and a version number is how you tell whether you have one. A stamp
+  that is not a format number at all is :unreadable-format — upgrading fixes
+  nothing, since no claimgraph ever wrote it; the file was hand-edited or was
+  never claimgraph's, and the one thing this gate must not do is guess which
+  shape its bytes follow."
+  [artifact found]
+  (cond
+    (nil? found) nil
+
+    (not (format-number? found))
+    {:type :unreadable-format
+     :artifact (str artifact)
+     :found found
+     :supported version/format-version
+     :message (str artifact " declares format " (pr-str found)
+                   ", which is not a claimgraph format stamp (that is one"
+                   " non-negative integer, currently " version/format-version
+                   "). Nothing this build can read wrote that, so it will not"
+                   " guess what the rest of the file means.")}
+
+    (> found version/format-version)
+    {:type :unsupported-format
+     :artifact (str artifact)
+     :found found
+     :supported version/format-version
+     :message (str artifact " was written by a newer claimgraph: format "
+                   found ", but this build (" version/release ") reads format "
+                   version/format-version " and below. Upgrade claimgraph.")}))
+
+(defn require-format
+  "unsupported-format, thrown. Returns `found` so it composes into a read."
+  [artifact found]
+  (when-let [e (unsupported-format artifact found)]
+    (logic/fail (:message e) (dissoc e :message)))
+  found)
 
 ;; ---------------------------------------------------------------------------
 ;; Pure: resolution
@@ -93,12 +212,32 @@
   ([] (config-file-path (into {} (System/getenv))))
   ([env] (or (get env "CLAIMGRAPH_CONFIG") ".claimgraph/config.json")))
 
+(defonce ^:private warned
+  ;; Warned-about (path, keys) pairs. Every config/value call re-reads the
+  ;; file, so a command that resolves four settings would otherwise print the
+  ;; same warning four times, and a warning that repeats reads as a cascade of
+  ;; failures rather than one typo.
+  (atom #{}))
+
 (defn read-config-file
-  "Parsed config map (keyword keys) or nil. A malformed file fails loudly —
-  silently ignoring configuration is worse than an error."
+  "Parsed config map (keyword keys) or nil.
+
+  Three ways this refuses to ignore configuration silently, which is the rule
+  the whole namespace is built on: malformed JSON throws, a file stamped with
+  a format this build cannot read is refused by name, and keys claimgraph does
+  not recognise warn on stderr (once per process) instead of resolving to
+  nothing in a corner. The warning is stderr and not an error because cruft
+  accumulates in committed files and a hard failure would lock people out of
+  their own repo over a dead key."
   [path]
   (when (fs/exists? path)
-    (json/parse-string (slurp (str path)) true)))
+    (let [config (json/parse-string (slurp (str path)) true)]
+      (require-format path (:config-version config))
+      (when-let [w (unknown-key-warning path config)]
+        (when-not (contains? @warned w)
+          (swap! warned conj w)
+          (binding [*out* *err*] (println w))))
+      config)))
 
 (defn context
   "The two ambient layers, read once: {:env ... :config ... :config-file path}."
@@ -119,17 +258,30 @@
 
 (defn describe
   "The `claim config` payload: every setting with its resolved value, the
-  layer it came from, and how to set it at each layer."
-  [opts]
-  (let [ctx (assoc (context) :opts opts)]
-    {:config-file {:path (:config-file ctx)
-                   :exists (boolean (:config ctx))}
-     :precedence "flag > env > config-file > default"
-     :settings
-     (into (array-map)
-           (for [[k spec] settings]
-             [k (merge (resolve-setting k ctx)
-                       {:flag (:flag spec)
-                        :env (:env spec)
-                        :config-key (name k)
-                        :desc (:desc spec)})]))}))
+  layer it came from, and how to set it at each layer.
+
+  :unknown-keys is here as well as on stderr because this is the command a
+  user runs to find out why a setting isn't taking, and a key claimgraph never
+  reads is the likeliest answer. :config-version is the file's own stamp, nil
+  for a file written before stamping (which resolves exactly the same way — it
+  gates readers, not values).
+
+  The two-arity takes the ambient layers as data, the way resolve-setting and
+  merge-defaults do, so what `claim config` reports about a given config file
+  is checkable without one on disk."
+  ([opts] (describe opts (context)))
+  ([opts base-ctx]
+   (let [ctx (assoc base-ctx :opts opts)]
+     {:config-file {:path (:config-file ctx)
+                    :exists (boolean (:config ctx))
+                    :config-version (:config-version (:config ctx))
+                    :unknown-keys (unknown-keys (:config ctx))}
+      :precedence "flag > env > config-file > default"
+      :settings
+      (into (array-map)
+            (for [[k spec] settings]
+              [k (merge (resolve-setting k ctx)
+                        {:flag (:flag spec)
+                         :env (:env spec)
+                         :config-key (name k)
+                         :desc (:desc spec)})]))})))

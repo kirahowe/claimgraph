@@ -9,9 +9,27 @@
   in previously-written facts in both backends."
   (:require [clojure.string :as str]
             [claimgraph.logic :as logic]
-            [claimgraph.store :as store]))
+            [claimgraph.predicates :as preds]
+            [claimgraph.store :as store]
+            [claimgraph.version :as version]))
 
 (defn- index-key [name scope] [name scope])
+
+(def ^:private predicate-fields
+  "The registry fields -register-predicate owns, and therefore the only ones a
+  redefinition may drop. Mirrors datalevin/predicate-attrs; the two lists
+  disagreeing is the one way this store and that one could report different
+  predicate rows for the same seed."
+  [:label :category :object-kind :cardinality :inverse-of :status :replaced-by
+   :definition :maps-to :default-epistemic :exclusion-group :value-exclusivity])
+
+(defn- curated?
+  "Does registering this id redefine the row or amend it? Mirrors
+  datalevin/curated?, where the reasoning lives; the config-test suite runs
+  both backends through the same registrations, which is what keeps a policy
+  that has to exist twice from meaning two different things."
+  [pred-id]
+  (not (and (keyword? pred-id) (preds/experimental? pred-id))))
 
 (defn- hydrate [st f]
   (cond-> f
@@ -220,7 +238,18 @@
       true vec))
 
   (-register-predicate [_ pred]
-    (swap! state update-in [:predicates (:id pred)] #(merge % pred))
+    ;; A curated row is reconciled — the owned fields are cleared first, so a
+    ;; field the caller dropped disappears instead of surviving from the last
+    ;; registration. A staging row is amended: only the fields it names move.
+    ;; Anything outside the owned set is left where it is either way.
+    (swap! state update-in [:predicates (:id pred)]
+           (fn [old]
+             (let [base (or old {})]
+               (into (if (curated? (:id pred))
+                       (apply dissoc base predicate-fields)
+                       base)
+                     (filter (comp some? val))
+                     (assoc (select-keys pred predicate-fields) :id (:id pred))))))
     (get-in @state [:predicates (:id pred)]))
 
   (-search [_ query _opts]
@@ -236,7 +265,8 @@
   (-stats [_]
     (let [st @state
           facts (vals (:facts st))]
-      {:entities (count (:entities st))
+      {:format (:format st)
+       :entities (count (:entities st))
        :facts {:total (count facts)
                :valid (count (remove :t-invalid facts))
                :invalidated (count (filter :t-invalid facts))}
@@ -245,5 +275,16 @@
 
   (-close [_] nil))
 
-(defn create []
-  (->MemStore (atom {:entities {} :by-name-scope {} :facts {} :episodes {} :predicates {}})))
+(defn create
+  "A fresh store, stamped with the format this build writes.
+
+  There is no gate to run and nothing to migrate — an in-memory store cannot
+  outlive the process that made it, so it can never be the older or newer
+  artifact the datalevin gate exists for. The stamp is here so both backends
+  answer the same question the same way through -stats: a suite that runs
+  against both proves the abstraction only where the two agree, and a field
+  one of them simply doesn't have is a hole in that proof."
+  []
+  (->MemStore (atom {:format version/format-version
+                     :entities {} :by-name-scope {} :facts {}
+                     :episodes {} :predicates {}})))

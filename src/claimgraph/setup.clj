@@ -14,7 +14,8 @@
             [cheshire.core :as json]
             [clojure.java.io :as io]
             [clojure.string :as str]
-            [claimgraph.hooks :as hooks]))
+            [claimgraph.hooks :as hooks]
+            [claimgraph.version :as version]))
 
 (defn- attempt [f]
   (try (f)
@@ -70,14 +71,20 @@
   "The db-derived local artifacts that must never be committed. The config
   file and dumps are deliberately absent — they are the committable surface.
   The oplog is ignored by default but syncable: drop that line if you move
-  effect logs between machines via git (docs: `reconcile`)."
+  effect logs between machines via git (docs: `reconcile`).
+
+  Every sibling the store writes has to be listed here the day it starts
+  being written, or it lands untracked in a repo whose next `git add -A`
+  commits it — <db>.version, the store's format stamp, is describing THIS
+  machine's store and belongs to no one else's checkout."
   [db-rel]
   [(str db-rel "/")
    (str db-rel ".lock")
    (str db-rel ".evidence/")
    (str db-rel ".oplog/")
    (str db-rel ".retrievals")
-   (str db-rel ".last-consolidate")])
+   (str db-rel ".last-consolidate")
+   (str db-rel ".version")])
 
 (defn gitignore-block [db-rel]
   (str/join "\n" (concat [gitignore-begin-marker gitignore-header gitignore-header-tail]
@@ -198,7 +205,15 @@
 (defn persist-config!
   "Merge explicitly-chosen non-default settings into the project config file
   so every later command (and every other writer of the repo) honors them
-  without flags. Nothing chosen + no file -> skipped."
+  without flags. Nothing chosen + no file -> skipped.
+
+  Stamped with :config-version, the same integer every other persisted
+  artifact carries (claimgraph.version/format-version), because the file this
+  writes is the file config.clj gates on: a writer that never stamps leaves
+  that gate able to fire only on a hand-edited file, which is to say never.
+  The stamp is always THIS build's — the shape being written is this build's,
+  and a file stamped ahead of us was refused by config/read-config-file long
+  before setup got here."
   [{:keys [project chosen dry-run]}]
   (let [path (fs/path project ".claimgraph" "config.json")
         current (when (fs/exists? path)
@@ -206,7 +221,11 @@
     (if (and (empty? chosen) (nil? current))
       {:status :skipped :note "all defaults — nothing to persist (see `claim config`)"}
       (write-step! path
-                   (str (json/generate-string (merge current chosen) {:pretty true}) "\n")
+                   (str (json/generate-string
+                         (assoc (merge current chosen)
+                                :config-version version/format-version)
+                         {:pretty true})
+                        "\n")
                    dry-run))))
 
 (defn ensure-gitignore!
