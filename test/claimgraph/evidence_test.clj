@@ -19,10 +19,56 @@
         h3 (evidence/write! dir "different content")]
     (is (= h1 h2) "identical content is one artifact")
     (is (not= h1 h3))
-    (is (= 64 (count h1)) "full sha-256 hex")
+    (is (re-matches #"sha256-[0-9a-f]{64}" h1)
+        "the name says which function produced it, so a later one can differ")
+    (is (= h1 (evidence/content-hash "kira: we chose argon2\n"))
+        "the minted identity is the pointer episodes carry — one form, not two")
+    (is (some #(= h1 (str (fs/file-name %))) (fs/list-dir dir))
+        "the pointer IS the filename, which is why the tag uses a hyphen")
     (is (= "kira: we chose argon2\n" (evidence/fetch dir h1)))
     (is (nil? (evidence/fetch dir "0000dead")) "absent artifacts are nil, not errors")
-    (is (= 2 (count (fs/list-dir dir))))))
+    (is (nil? (evidence/fetch dir nil)))
+    (is (= 2 (count (fs/list-dir dir))) "write-once: two contents, two files")))
+
+(deftest legacy-bare-hex-pointers-still-resolve
+  (testing "artifacts written before the algorithm tag are named bare hex"
+    (let [dir (str (fs/create-temp-dir {:prefix "claimgraph-evidence-legacy"}))
+          content "kira: argon2, decided before the tag existed\n"
+          hex (subs (evidence/content-hash content) (count "sha256-"))]
+      (fs/create-dirs dir)
+      (spit (str (fs/path dir hex)) content)
+      (is (= content (evidence/fetch dir hex))
+          "a bare-hex pointer from an existing store still reaches its bytes")
+      (is (= content (evidence/fetch dir (str "sha256-" hex)))
+          "and the tagged pointer finds the same bytes under the old name")
+      (is (= 1 (count (fs/list-dir dir))) "reading legacy artifacts rewrites nothing"))))
+
+(deftest write-is-idempotent-against-a-legacy-artifact
+  (testing "re-ingesting content an upgraded store already holds writes nothing"
+    (let [dir (str (fs/create-temp-dir {:prefix "claimgraph-evidence-legacy-write"}))
+          content "legacy bytes\n"
+          hex (subs (evidence/content-hash content) (count "sha256-"))]
+      (fs/create-dirs dir)
+      (spit (str (fs/path dir hex)) content)
+      (let [pointer (evidence/write! dir content)]
+        (is (= 1 (count (fs/list-dir dir)))
+            "stored under the old name is stored: no second, identical copy")
+        (is (= hex (str (fs/file-name (first (fs/list-dir dir)))))
+            "and the bytes stay where they are — write-once means never rewritten")
+        (is (= (evidence/content-hash content) pointer)
+            "the tagged name is the identity new episodes carry, whatever the file is called")
+        (is (= content (evidence/fetch dir pointer))
+            "which is only safe because that pointer still resolves via the legacy name")))))
+
+(deftest a-directory-in-an-artifact-slot-is-not-a-stored-artifact
+  (testing "write! and fetch agree on what counts as present"
+    (let [dir (str (fs/create-temp-dir {:prefix "claimgraph-evidence-occupied"}))
+          content "occupied\n"
+          pointer (evidence/content-hash content)]
+      (fs/create-dirs (fs/path dir pointer))
+      (is (nil? (evidence/fetch dir pointer)))
+      (is (thrown? java.io.FileNotFoundException (evidence/write! dir content))
+          "a pointer to a directory is a pointer to nothing; better loud than recorded"))))
 
 (deftest session-extract-stamps-its-episode
   (let [dir (str (fs/create-temp-dir {:prefix "claimgraph-evidence-test"}))
