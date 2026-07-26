@@ -73,26 +73,80 @@
 ;; Pure: verdict parsing & resolution plan
 ;; ---------------------------------------------------------------------------
 
+(defn- parse-verdict
+  "One candidate JSON string -> verdict, or nil when it is not one. Anything
+  that throws is just another non-verdict: the caller keeps looking."
+  [s]
+  (try (let [m (json/parse-string s true)
+             relation (logic/->kw (:relation m))]
+         (when (relations relation)
+           {:relation relation
+            :confidence (let [c (:confidence m)]
+                          (if (number? c)
+                            (-> c double (max 0.0) (min 1.0))
+                            0.0))
+            :rationale (:rationale m)}))
+       (catch Exception _ nil)))
+
+;; Bounds on the brace-scan fallback. A verdict is a few hundred bytes; a
+;; megabyte of response, or a few dozen candidate objects, is already far past
+;; anything a judgment can be hiding in, and this runs inside the call the LLM
+;; timeout is there to bound. The candidate cap also keeps the substring copies
+;; linear when the braces are deeply nested.
+(def ^:private max-scan-chars 1048576)
+(def ^:private max-candidates 64)
+
+(defn- json-objects
+  "Every brace-balanced {...} run in text, in start order: one left-to-right
+  pass keeping a stack of open positions, not a fresh scan per '{' — that shape
+  walked to end-of-text for every brace that never closes, which is quadratic on
+  exactly the rambling response this fallback exists to rescue.
+
+  track-strings? decides whether a brace inside a JSON string counts. It must
+  not (a rationale may contain one), but tracking carries the model's own quote
+  parity forward, so a stray quote can hide the verdict below it — hence both
+  passes, string-aware first. Escapes are honoured, and a raw newline ends a
+  string, since a JSON string cannot contain one."
+  [^String text track-strings?]
+  (let [n (min (count text) max-scan-chars)]
+    (loop [i 0, in-string? false, escaped? false, opens (), spans []]
+      (if (>= i n)
+        (->> (sort-by first spans)
+             (take max-candidates)
+             (map (fn [[s e]] (subs text s e))))
+        (let [c (.charAt text i), j (inc i)]
+          (cond
+            escaped? (recur j true false opens spans)
+            (and in-string? (= \\ c)) (recur j true true opens spans)
+            (and in-string? (= \newline c)) (recur j false false opens spans)
+            in-string? (recur j (not= \" c) false opens spans)
+            (= \{ c) (recur j false false (conj opens i) spans)
+            (and (= \} c) (seq opens)) (recur j false false (pop opens)
+                                             (conj spans [(peek opens) j]))
+            ;; quotes only matter inside an object; at depth 0 they are prose
+            (and track-strings? (= \" c) (seq opens)) (recur j true false opens spans)
+            :else (recur j false false opens spans)))))))
+
 (defn parse-judgment
   "Tolerant parse of the judge's response: first JSON object with a known
-  relation wins. Unparseable responses become a zero-confidence verdict
-  rather than an exception — one bad judgment must not kill the batch."
+  relation wins. A one-line object is the common case and is tried first;
+  failing that the whole response is brace-scanned, which recovers a verdict
+  pretty-printed across lines or wrapped in a ```json fence. Unparseable
+  responses become a zero-confidence verdict rather than an exception — one
+  bad judgment must not kill the batch."
   [response]
-  (or (->> (str/split-lines (or response ""))
-           (map str/trim)
-           (remove #(or (str/blank? %) (str/starts-with? % "```")))
-           (keep #(try (let [m (json/parse-string % true)
-                             relation (logic/->kw (:relation m))]
-                         (when (relations relation)
-                           {:relation relation
-                            :confidence (let [c (:confidence m)]
-                                          (if (number? c)
-                                            (-> c double (max 0.0) (min 1.0))
-                                            0.0))
-                            :rationale (:rationale m)}))
-                       (catch Exception _ nil)))
-           first)
-      {:relation :unparseable :confidence 0.0}))
+  (let [text (or response "")]
+    (or (->> (str/split-lines text)
+             (map str/trim)
+             (remove #(or (str/blank? %) (str/starts-with? % "```")))
+             (keep parse-verdict)
+             first)
+        (first (keep parse-verdict
+                     (concat (json-objects text true)
+                             ;; lazy: the quote-blind retry is only paid for when
+                             ;; the string-aware pass found no verdict at all
+                             (lazy-seq (json-objects text false)))))
+        {:relation :unparseable :confidence 0.0})))
 
 (defn resolution-plan
   "Pure: verdict -> effect plan for one conflict pair.
