@@ -748,15 +748,13 @@
        vals
        (mapcat (fn [group]
                  (when (> (count group) 1)
-                   (let [[keep & retire] (sort-by (comp ms :recorded-at) group)]
-                     (map (fn [f] {:id (:id f) :survivor (:id keep)}) retire)))))
+                   ;; `survivor`, not `keep`: the threading chain right above
+                   ;; this one calls clojure.core/keep, and a local shadowing it
+                   ;; reads as correct right until someone adds one more step
+                   ;; here. It also says what the binding is.
+                   (let [[survivor & retire] (sort-by (comp ms :recorded-at) group)]
+                     (map (fn [f] {:id (:id f) :survivor (:id survivor)}) retire)))))
        vec))
-
-(defn collapse-duplicates-plan
-  "collapse-duplicates as the bare list of ids to invalidate, for callers that
-  record nothing about the twin that survived."
-  [facts at]
-  (mapv :id (collapse-duplicates facts at)))
 
 ;; ---------------------------------------------------------------------------
 ;; Conflicts

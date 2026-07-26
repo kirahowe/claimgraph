@@ -121,11 +121,22 @@
       (testing "the same claim under a different name collapsed by identity, not luck"
         (let [argon (filter #(= "argon2" (:object-lit %))
                             (:facts (core/get-facts (:store a) {:entity "AuthService"
-                                                                :include-invalidated true})))]
-          (is (= 1 (count (remove :t-invalid argon)))
+                                                                :include-invalidated true})))
+              live (remove :t-invalid argon)
+              retired (filter :t-invalid argon)]
+          (is (= 1 (count live))
               "one live copy; B's auth-service resolved to A's AuthService")
-          (is (= 1 (count (filter :t-invalid argon)))
-              "the duplicate closed, not erased")))
+          (is (= 1 (count retired))
+              "the duplicate closed, not erased")
+          (testing "and the collapse says so as structure, not only in prose"
+            ;; A nil kind here is indistinguishable from a write by a build that
+            ;; predates the kinds, and a retired row naming no counterpart reads
+            ;; as deleted for no reason a year later.
+            (is (= :reconcile-duplicate (:invalidation-kind (first retired))))
+            (is (= (:id (first live)) (:successor (first retired)))
+                "which twin survived is not recoverable from the graph afterwards")
+            (is (str/includes? (:invalidation-reason (first retired)) "across writers")
+                "the sentence stays for the human reading `claim history`"))))
 
       (testing "the contradiction neither writer could see is queued for the judge"
         (is (pos? (:sweep-candidates r)))))
@@ -179,6 +190,86 @@
         (is (= (range 1 (inc (count lines))) (map :seq lines))))
       (testing "the clock never repeats within a writer"
         (is (apply < (map :hlc lines)))))))
+
+(deftest an-invalidate-line-keeps-its-reason-a-sentence
+  ;; The line is on disk forever and read by builds that are not this one. A
+  ;; reader from before the kinds existed reads :reason and nothing else, so
+  ;; nesting {:kind :successor :reason} under it hands that reader a MAP for the
+  ;; field it treats as prose — and it applies the line, reports :applied and
+  ;; warns about nothing (on Datalevin the map is coerced into a string column
+  ;; and kept forever, which is what `claim history` then prints). Adding two
+  ;; fields is additive and correctly does not move the format version, so the
+  ;; gate cannot catch it either: the shape has to be right instead.
+  (let [a (machine "w-a")
+        b (machine "w-b")]
+    (core/assert-fact (:store a) {:subject "svc" :predicate :core/has-version
+                                  :object "1.0" :t-valid #inst "2026-01-01"})
+    (core/assert-fact (:store a) {:subject "svc" :predicate :core/has-version
+                                  :object "2.0" :t-valid #inst "2026-03-01"})
+    (let [line (first (filter #(= "invalidate" (:t %)) (log-lines (:db a) "w-a")))
+          successor (->> (:facts (core/get-facts (:store a) {:entity "svc"}))
+                         first :id)]
+      (is (string? (:reason line))
+          "an old reader's only field still holds a sentence")
+      (is (= "superseded" (:kind line)) "the kind is a sibling of it")
+      (is (= successor (:successor line)) "so is the successor"))
+    (testing "and a reader that knows the siblings prefers them"
+      (sync-log! a b)
+      (oplog/reconcile! (oplog/inner-store (:store b)) (:db b))
+      (let [retired (->> (:facts (core/get-facts (:store b) {:entity "svc"
+                                                             :include-invalidated true}))
+                         (filter :t-invalid)
+                         first)
+            live (->> (:facts (core/get-facts (:store b) {:entity "svc"})) first)]
+        (is (= :superseded (:invalidation-kind retired))
+            "a keyword after the JSON round trip; a string kind matches no reader's set")
+        (is (= (:id live) (:successor retired)))
+        (is (string? (:invalidation-reason retired)))))))
+
+(deftest a-caller-with-no-kind-still-logs-its-sentence
+  ;; The bare-string shape store/-invalidate documents: what every caller passed
+  ;; before kinds existed, and what a caller not yet taught its kind still
+  ;; passes. It is what lets the producers be converted one at a time instead of
+  ;; in one commit that has to be right everywhere, so it is worth an assertion
+  ;; rather than a call whose result nothing looks at.
+  (let [{:keys [db store]} (machine "w-a")
+        inner (oplog/inner-store store)
+        fid (get-in (core/assert-fact store {:subject "svc"
+                                             :predicate :core/deployed-via
+                                             :object "Heroku" :object-kind :literal})
+                    [:fact :id])]
+    (store/-invalidate store fid (java.util.Date.) "migrated to Fly.io")
+    (let [line (first (filter #(= "invalidate" (:t %)) (log-lines db "w-a")))]
+      (is (= "migrated to Fly.io" (:reason line)))
+      (is (nil? (:kind line)) "nothing is invented to fill the sibling")
+      (is (nil? (:successor line))))
+    (is (= "migrated to Fly.io"
+           (:invalidation-reason (first (store/-select-facts inner {:ids [fid]}))))
+        "and the fact records why it closed, structure or no structure")))
+
+(deftest an-invalidate-line-from-an-older-peer-keeps-its-reason
+  ;; The bare-string shape store/-invalidate documents, arriving from a writer
+  ;; that has no kinds to send: the sentence is all there is, and dropping it
+  ;; would leave the crossed fact retired for no recorded reason at all.
+  (let [a (machine "w-a")
+        inner (oplog/inner-store (:store a))
+        fid (get-in (core/assert-fact (:store a) {:subject "svc"
+                                                  :predicate :core/deployed-via
+                                                  :object "Heroku"
+                                                  :object-kind :literal})
+                    [:fact :id])]
+    (deliver-line! (:db a) "w-b" {:t "invalidate" :seq 1 :hlc 1000
+                                  :fact-id fid :at 1767225600000
+                                  :reason "superseded by f-elsewhere"})
+    (let [r (oplog/reconcile! inner (:db a))
+          f (first (store/-select-facts inner {:ids [fid]}))]
+      (is (= 1 (get-in r [:effects :applied])))
+      (is (some? (:t-invalid f)))
+      (is (= "superseded by f-elsewhere" (:invalidation-reason f))
+          "the sentence is recorded verbatim, not dropped for carrying no structure")
+      (is (nil? (:invalidation-kind f))
+          "and nothing is invented: no kind was sent")
+      (is (nil? (:successor f))))))
 
 (deftest entity-type-survives-the-crossing
   (let [a (machine "w-a")

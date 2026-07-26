@@ -435,8 +435,15 @@
                                     :languages (when-not complete?
                                                  (set (map :language ok-runs)))})
                 files (reduce + 0 (map :files ok-runs))]
+            ;; :code-absent as structure, not only in the sentence: a reader
+            ;; deciding whether a retired fact can be re-derived from the source
+            ;; has to know THAT it vanished from the code, and a prose-only
+            ;; reason leaves it matching a regex per producer. No successor —
+            ;; the declaration is gone, nothing took its place.
             (doseq [id stale]
-              (store/-invalidate s id at (str "code-invalidation: absent at " ref)))
+              (store/-invalidate s id at
+                                 {:kind :code-absent
+                                  :reason (str "code-invalidation: absent at " ref)}))
             (let [result (core/ingest s {:source-type :code :ref ref} facts)]
               (core/close-episode s {:episode (:episode result)
                                      :summary (str "code-analysis pass ("

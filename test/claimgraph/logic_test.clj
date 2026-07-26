@@ -3,7 +3,8 @@
   and BFS folds tested as plain functions over values — no store, no clock,
   no fixtures. The seeded vocabulary is a value too, so its invariants are
   checked here rather than through a store."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [babashka.fs :as fs]
+            [clojure.test :refer [deftest is testing]]
             [claimgraph.logic :as logic]
             [claimgraph.predicates :as preds]))
 
@@ -252,8 +253,41 @@
                (fact "f-late" t1)
                (fact "f-other-scope" t1 :scope "module:x")
                (fact "f-dead" t0 :t-invalid t1)]]
-    (is (= ["f-late"] (logic/collapse-duplicates-plan facts #inst "2026-12-01"))
+    (is (= [{:id "f-late" :survivor "f-early"}]
+           (logic/collapse-duplicates facts #inst "2026-12-01"))
         "only true duplicates collapse; scope-distinct and invalidated facts don't")))
+
+(deftest an-invalidation-normalizes-both-shapes
+  ;; The bare string is what every caller passed before kinds existed and what
+  ;; a caller that has not been taught its kind still passes; both backends
+  ;; route through here, so this is the one place the compatibility can be
+  ;; pinned. Dropping it would retire facts with no recorded reason at all.
+  (is (= {:kind nil :successor nil :reason "migrated"}
+         (logic/invalidation "migrated")))
+  (is (= {:kind :superseded :successor "f-new" :reason "superseded by f-new"}
+         (logic/invalidation {:kind :superseded :successor "f-new"
+                              :reason "superseded by f-new"})))
+  (is (= :superseded (:kind (logic/invalidation {:kind "superseded"})))
+      "a kind off the wire arrives as a string; a string matches no reader's set"))
+
+(deftest every-invalidation-kind-has-a-producer
+  ;; invalidation-kinds is a claim about the rest of the codebase — each kind
+  ;; names the call site that writes it — and two of the seven shipped with no
+  ;; call site at all: reconcile and the code ingester still passed a bare
+  ;; sentence, so their rows arrived with a nil kind, indistinguishable from a
+  ;; write by a build that predates kinds. Nothing failed, because nothing
+  ;; compared the set against the code. Grep is crude; a vocabulary that lies
+  ;; about what it records is worse.
+  (let [root (loop [d (fs/absolutize (or *file* "."))]
+               (when d
+                 (if (fs/exists? (fs/path d "bb.edn")) d (recur (fs/parent d)))))
+        written (->> (fs/glob (fs/path root "src") "**/*.clj")
+                     (mapcat #(re-seq #":kind\s+(:[a-z-]+)" (slurp (str %))))
+                     (map (comp keyword #(subs % 1) second))
+                     set)]
+    (is (some? root) "the checkout is locatable; this test is not vacuous")
+    (is (empty? (remove written logic/invalidation-kinds))
+        "every declared kind is written by some -invalidate call site")))
 
 (deftest duplicate-entity-clusters
   (let [entities [{:id "e1" :name "FooBar" :scope "project"}

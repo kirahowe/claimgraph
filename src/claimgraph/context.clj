@@ -50,28 +50,57 @@
 (defn- subject-str [f] (get-in f [:subject :name]))
 (defn- pred-str [f] (name (:predicate f)))
 
+(def ^:private legacy-supersession-re
+  "The two sentences claimgraph itself wrote for a supersession before the kind
+  existed: assert-fact's \"superseded by <id>\" and the judge's \"judged
+  superseded by <id>\". Anchored and single-token on purpose — a human's
+  `claim invalidate --reason \"superseded by a better plan\"` is prose, not a
+  fact id, and must not be read as a link."
+  #"^(?:judged )?superseded by (\S+)$")
+
+(defn- supersession
+  "The successor a closed fact names, as {:successor id-or-nil}, or nil when
+  this invalidation was not a supersession at all.
+
+  The kind decides it whenever there is one. When there is not, the prose is
+  parsed as a MIGRATION SHIM, and it can only ever fire on rows written before
+  :invalidation-kind existed, because every write since carries a kind: it is
+  deletable the day no store predates the kinds (or a migration has backfilled
+  them). Without it, every fact a user's store already retired matches nothing
+  the moment they upgrade and drops out of the \"Changed recently\" briefing —
+  a silent loss of the one section that reports what changed, in the stores
+  that have the most history to report. The same shim covers the receiving end
+  of replication, where a log written by an older peer restores a fact with no
+  kind at all."
+  [f]
+  (if-let [kind (:invalidation-kind f)]
+    (when (logic/supersession-kinds kind) {:successor (:successor f)})
+    (when-let [[_ id] (re-matches legacy-supersession-re
+                                  (str (:invalidation-reason f)))]
+      {:successor id})))
+
 (defn recent-supersessions
   "Pure: facts invalidated by supersession within the window, newest first,
   each paired with its successor.
 
   Selection is on :invalidation-kind and the pairing is on :successor, both
-  structural. They were recovered from the reason sentence by matching
-  ^superseded by (\\S+)$, and the producers did not all agree with that
-  regex: the judge wrote \"judged superseded by <id>\", which whole-string
-  matching never matches, so a supersession an LLM resolved could not appear
-  here at all. A successor that is not in `facts` — invalidated itself,
-  filtered out, or not yet loaded — renders as \"no longer\" rather than
-  dropping the line: that the claim stopped holding is the part the reader
-  needs."
+  structural (see `supersession` for the pre-kind fallback). They were
+  recovered from the reason sentence by matching ^superseded by (\\S+)$, and
+  the producers did not all agree with that regex: the judge wrote \"judged
+  superseded by <id>\", which whole-string matching never matches, so a
+  supersession an LLM resolved could not appear here at all. A successor that
+  is not in `facts` — invalidated itself, filtered out, or not yet loaded —
+  renders as \"no longer\" rather than dropping the line: that the claim
+  stopped holding is the part the reader needs."
   [facts now window-days]
   (let [by-id (into {} (map (juxt :id identity)) facts)
         cutoff (- (logic/ms now) (* window-days 86400000))]
     (->> facts
          (keep (fn [f]
                  (when-let [ti (:t-invalid f)]
-                   (when (and (>= (logic/ms ti) cutoff)
-                              (logic/supersession-kinds (:invalidation-kind f)))
-                     {:old f :new (get by-id (:successor f)) :at ti}))))
+                   (when (>= (logic/ms ti) cutoff)
+                     (when-let [{:keys [successor]} (supersession f)]
+                       {:old f :new (get by-id successor) :at ti})))))
          (sort-by (comp - logic/ms :at))
          vec)))
 

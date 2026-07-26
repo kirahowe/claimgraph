@@ -68,6 +68,11 @@
   instead: already exact, and unambiguous without a date format at all.
   Lines written before this (format 0) are still read; see rehydrate.
 
+  Fields added to a payload go in BESIDE what is already there, never inside
+  it: invalidate's kind and successor are siblings of its reason sentence
+  precisely so a reader that predates them still finds prose where it looks.
+  See invalidate-line, which is where getting that wrong corrupts a peer.
+
   ## What reconcile promises
 
   A per-writer high-water mark advances only over effects that actually
@@ -266,6 +271,42 @@
 
 (defn- ms-of [d] (some-> ^java.util.Date d .getTime))
 
+(defn- invalidate-line
+  "The wire shape of an invalidation: the sentence under :reason, with the kind
+  and the successor as its SIBLINGS.
+
+  Nesting the whole {:kind :successor :reason} map under :reason would be the
+  obvious encoding and it is the wrong one. A reader from before the kinds
+  existed reads :reason and nothing else, so it applies such a line — reporting
+  :applied, warning about nothing — and writes a MAP into the field every
+  reader treats as prose: its own regex in context.clj, `claim history`, the
+  string column the Datalevin schema declares (which coerces it to
+  \"{:kind \\\"superseded\\\", …}\" and keeps it forever). The format version
+  cannot save that reader either: adding two fields is additive, so the version
+  correctly does not move and the gate passes the line straight through.
+
+  Siblings leave that reader RIGHT rather than merely refusing, and leave the
+  version bump unspent for a change that genuinely needs one. Absent keys
+  rather than nulls for a kind or successor nobody supplied: an old reader and
+  a new one both read absent and null the same way, and the line stays as short
+  as the effect it describes."
+  [fact-id at invalidation]
+  (let [{:keys [kind successor reason]} (logic/invalidation invalidation)]
+    (cond-> {:t "invalidate" :fact-id fact-id :at at}
+      reason (assoc :reason reason)
+      kind (assoc :kind kind)
+      successor (assoc :successor successor))))
+
+(defn- line-invalidation
+  "The invalidation an \"invalidate\" line carries, read back. The structured
+  siblings win; a line with only :reason came from a peer that predates them
+  and keeps its sentence, which is the bare-string shape store/-invalidate
+  documents and logic/invalidation normalizes. The kind arrives from JSON as a
+  string and is coerced there, so a replayed supersession is the same keyword a
+  locally written one is — a string kind matches no reader's set."
+  [line]
+  {:kind (:kind line) :successor (:successor line) :reason (:reason line)})
+
 ;; ---------------------------------------------------------------------------
 ;; The logging decorator
 ;; ---------------------------------------------------------------------------
@@ -346,9 +387,9 @@
   (-predicate-usage [_] (store/-predicate-usage inner))
   (-entity-usage [_] (store/-entity-usage inner))
   (-get-history [_ id pred] (store/-get-history inner id pred))
-  (-invalidate [_ fact-id at reason]
-    (let [r (store/-invalidate inner fact-id at reason)]
-      (append! ctx {:t "invalidate" :fact-id fact-id :at (ms-of at) :reason reason})
+  (-invalidate [_ fact-id at invalidation]
+    (let [r (store/-invalidate inner fact-id at invalidation)]
+      (append! ctx (invalidate-line fact-id (ms-of at) invalidation))
       r))
   (-link-conflicts [_ fact-id ids]
     (let [r (store/-link-conflicts inner fact-id ids)]
@@ -519,7 +560,7 @@
     (if (fact-exists? s (:fact-id e))
       (do (store/-invalidate s (:fact-id e)
                              (java.util.Date. (long (:at e)))
-                             (:reason e))
+                             (line-invalidation e))
           :applied)
       :deferred)
 
@@ -754,12 +795,20 @@
                                 (get @emap (keyword (get-in e [:fact :subject :id]))))))
                       distinct
                       vec)
-         dup-ids (vec (mapcat (fn [subj]
-                                (logic/collapse-duplicates-plan
-                                 (store/-get-facts s subj {:direction :out}) now))
-                              touched))
-         _ (doseq [id dup-ids]
-             (store/-invalidate s id now "duplicate across writers (reconcile)"))
+         ;; The whole plan, survivor included: which twin outlived the collapse
+         ;; is knowable only inside this grouping, and a row retired against no
+         ;; counterpart reads as deleted for no reason a year later. The kind
+         ;; rides along for the same reason — a nil kind here is
+         ;; indistinguishable from a write by a build that predates the kinds.
+         dups (vec (mapcat (fn [subj]
+                             (logic/collapse-duplicates
+                              (store/-get-facts s subj {:direction :out}) now))
+                           touched))
+         _ (doseq [{:keys [id survivor]} dups]
+             (store/-invalidate s id now
+                                {:kind :reconcile-duplicate
+                                 :successor survivor
+                                 :reason "duplicate across writers (reconcile)"}))
          preds-by-id (into {} (map (juxt :id identity)) (store/-list-predicates s {}))
          candidates (logic/conflict-candidates
                      (store/-select-facts s {:valid-cheap true}) preds-by-id now)
@@ -808,7 +857,7 @@
       :held (count held)
       :abandoned abandoning
       :warnings warnings
-      :duplicates-collapsed (count dup-ids)
+      :duplicates-collapsed (count dups)
       :sweep-candidates (count candidates)
       :hint (cond
               (seq unknown)

@@ -170,13 +170,39 @@
                        :invalidation-kind :superseded :successor "f-x"})]
                now context/supersession-window-days))))
 
-(deftest supersessions-are-selected-by-kind-not-by-prose
-  (testing "the reason sentence is cosmetic: nothing reads it any more"
+(deftest supersessions-are-selected-by-kind-with-a-legacy-prose-fallback
+  (testing "a row from before the kinds still reports what changed"
+    ;; This assertion used to read the other way — "a reason that merely says
+    ;; 'superseded by' carries no link" — which made every fact a user's store
+    ;; had already retired vanish from this section the moment they upgraded:
+    ;; those rows carry the sentence and nothing else. Selecting on the kind
+    ;; alone was right about new writes and silently lossy about every old one.
+    (let [[{:keys [old new]}] (context/recent-supersessions
+                               [(fact {:id "f-a" :t-invalid #inst "2026-07-01"
+                                       :invalidation-reason "superseded by f-b"})
+                                (fact {:id "f-b"})]
+                               now context/supersession-window-days)]
+      (is (= "f-a" (:id old)))
+      (is (= "f-b" (:id new)) "the successor comes out of the old sentence"))
+    (is (= 1 (count (context/recent-supersessions
+                     [(fact {:id "f-a" :t-invalid #inst "2026-07-01"
+                             :invalidation-reason "judged superseded by f-b"})
+                      (fact {:id "f-b"})]
+                     now context/supersession-window-days)))
+        "including the judge's sentence, which the original regex never matched"))
+  (testing "the fallback is bounded: prose is read only where a kind is absent"
     (is (empty? (context/recent-supersessions
                  [(fact {:id "f-a" :t-invalid #inst "2026-07-01"
-                         :invalidation-reason "superseded by f-b"})]
+                         :invalidation-kind :merge-duplicate :successor "f-b"
+                         :invalidation-reason "superseded by f-b"})
+                  (fact {:id "f-b"})]
                  now context/supersession-window-days))
-        "a reason that merely says 'superseded by' carries no link"))
+        "a kind that says duplicate outranks a sentence that says superseded")
+    (is (empty? (context/recent-supersessions
+                 [(fact {:id "f-a" :t-invalid #inst "2026-07-01"
+                         :invalidation-reason "superseded by the new plan"})]
+                 now context/supersession-window-days))
+        "a human's prose is not a fact id: `claim invalidate --reason` is free text"))
   (testing "every supersession kind reaches the section, however it was decided"
     (doseq [kind [:superseded :judged-superseded]]
       (is (= 1 (count (context/recent-supersessions
@@ -204,6 +230,21 @@
                                now context/supersession-window-days)]
       (is (= "f-a" (:id old)))
       (is (nil? new) "that it stopped holding is still worth reporting"))))
+
+(deftest a-store-written-before-the-kinds-still-briefs
+  ;; The upgrade case, end to end: nothing backfills :invalidation-kind, so a
+  ;; store that has been in use since before it existed holds rows carrying only
+  ;; the sentence — and so does any fact restored from an older peer's log. The
+  ;; section that reports what changed is exactly the section with the most to
+  ;; lose in a store with history.
+  (let [facts [(fact {:id "f-old" :object-lit "Heroku" :predicate :core/deployed-via
+                      :t-invalid #inst "2026-07-01"
+                      :invalidation-reason "superseded by f-new"})
+               (fact {:id "f-new" :object-lit "Fly" :predicate :core/deployed-via})]
+        lines (:lines (first (filter #(= :supersessions (:key %))
+                                     (context/compiled-sections
+                                      {:facts facts :conflicts [] :now now}))))]
+    (is (= ["- svc deployed-via: \"Heroku\" → \"Fly\" (2026-07-01)"] lines))))
 
 (deftest judge-resolved-supersessions-reach-the-briefing
   ;; The live bug this section was rebuilt for: judge.clj wrote "judged

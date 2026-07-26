@@ -3,6 +3,7 @@
   functions, plus the full pass against an in-memory store on a real
   temp directory."
   (:require [babashka.fs :as fs]
+            [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [claimgraph.core :as core]
             [claimgraph.ingest.clj-code :as code]
@@ -71,9 +72,19 @@
           (is (empty? (:facts (core/get-facts s {:entity "app.a"
                                                  :predicate :core/depends-on}))))
           (let [{:keys [history]} (core/get-history s {:subject "app.a"
-                                                       :predicate :core/depends-on})]
+                                                       :predicate :core/depends-on})
+                dead (first history)]
             (is (= 1 (count history)) "the dead dependency survives in history")
-            (is (some? (:t-invalid (first history))))))
+            (is (some? (:t-invalid dead)))
+            (testing "and says why as structure, not only in its sentence"
+              ;; Whether a retired fact can be re-derived from the source is a
+              ;; question about the KIND. Left in prose it is a regex per
+              ;; producer, which is the condition the kinds replaced.
+              (is (= :code-absent (:invalidation-kind dead)))
+              (is (nil? (:successor dead))
+                  "a declaration that vanished has no replacement to name")
+              (is (str/includes? (:invalidation-reason dead) "absent at")
+                  "the sentence still names the ref a human would go looking at"))))
         (testing "non-code facts are untouched"
           (is (= 1 (count (:facts (core/get-facts s {:entity "app.a"
                                                      :predicate :core/prefers})))))))
