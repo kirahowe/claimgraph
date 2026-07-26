@@ -51,12 +51,18 @@ external entity Harness {
 }
 
 -- Governed by claims.allium. The fields declared here are the ones
--- maintenance touches: interval closure on judged resolutions, the
--- reinforcement clock on accepted outcomes, conflict links.
+-- maintenance touches: interval closure on judged resolutions — kind and
+-- successor included, because a closure the judge reached has to be
+-- selectable by the same structure a locally superseded fact carries, and
+-- for a long time it was not — the reinforcement clock on accepted
+-- outcomes, conflict links.
 external entity Fact {
     confidence: Decimal
     t_invalid: Timestamp?
+    invalidation_kind: String?       -- claims.allium's InvalidationKind, named
+                                     -- across the module boundary as its value
     invalidation_reason: String?
+    successor: Fact?
     last_reinforced_at: Timestamp
     conflicts_with: Set<Fact>
 }

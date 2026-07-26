@@ -100,12 +100,20 @@ entity Episode {
 
 -- Raw input kept past extraction (the write-before-query barrier:
 -- extraction decides what to keep before knowing what a future query will
--- hinge on). Write-once by construction — the identity IS the sha-256 of
--- the content, so identical content is a no-op and nothing can be edited
--- in place. Local audit trail only: artifacts do not ride the dump; the
--- episode's pointer does.
+-- hinge on). Write-once by construction — the identity is derived from the
+-- content and nothing else, so identical content is a no-op and nothing can
+-- be edited in place. Local audit trail only: artifacts do not ride the dump;
+-- the episode's pointer does.
+--
+-- The pointer names the function that produced it: `sha256-<hex>`. A pointer
+-- that cannot say which function minted it cannot be told apart from the next
+-- function's output, and this string is already in stores and in dumps.
+-- Pointers written before the tag are bare hex; they still resolve, and
+-- nothing produces one again — content already stored under either spelling
+-- counts as stored, so an upgraded store does not accumulate a second copy of
+-- every artifact it already had.
 entity EvidenceArtifact {
-    hash: String                     -- sha-256 of content; the identity
+    hash: String                     -- the identity: evidence_pointer(content)
     content: String
 }
 
@@ -132,8 +140,19 @@ config {
 
 -- Black box functions (pure, deterministic):
 --
---   sha256(content)                  content hash (artifact identity;
---                                    12-hex prefix for note deltas)
+--   sha256(content)                  the raw content hash; a 12-hex prefix of
+--                                    it is what note refs carry as the delta
+--                                    state, where the string is a revision
+--                                    marker inside a ref and never a pointer
+--                                    to anything
+--   evidence_pointer(content)        "sha256-" + sha256(content): an evidence
+--                                    artifact's identity. Minted in exactly
+--                                    one place — a caller holding the untagged
+--                                    form would silently disagree with what
+--                                    the episode's pointer names. The
+--                                    separator is a hyphen and not the
+--                                    conventional colon because this string is
+--                                    a FILENAME before it is an identifier
 --   current_code_ref(root)           <git-sha>, plus +<digest of the dirty
 --                                    working-tree status> when uncommitted
 --                                    edits exist — sessions that end dirty
@@ -247,7 +266,7 @@ rule IngestBatch {
     ensures:
         let ep = Episode.created(source: source, ref: ref, opened_at: now, status: open)
         if evidence_content != null:
-            let ev = EvidenceArtifact.created(hash: sha256(evidence_content), content: evidence_content)
+            let ev = EvidenceArtifact.created(hash: evidence_pointer(evidence_content), content: evidence_content)
             ep.evidence = ev
         for line in lines:
             AssertFact(agent: agent, subject: line.subject, predicate: line.predicate,
@@ -312,7 +331,7 @@ rule ExtractSession {
     when: ExtractSession(agent, transcript, ref)
     ensures:
         let candidates = clamped(extract("session", transcript), config.session_cap, config.session_default)
-        let ev = EvidenceArtifact.created(hash: sha256(transcript), content: transcript)
+        let ev = EvidenceArtifact.created(hash: evidence_pointer(transcript), content: transcript)
         let ep = Episode.created(source: session_log, ref: ref, opened_at: now, status: open,
                                  evidence: ev)
         for c in admitted(candidates):
@@ -346,7 +365,7 @@ rule IngestNotes {
         for note in changed_notes(notes):
             let content = stripped_of_managed_section(note.content)
             let candidates = demoted_to_inference(clamped(extract("notes", content), config.notes_cap, config.notes_default))
-            let ev = EvidenceArtifact.created(hash: sha256(content), content: content)
+            let ev = EvidenceArtifact.created(hash: evidence_pointer(content), content: content)
             let ep = Episode.created(source: agent_note,
                                      ref: note_ref(harness, note),
                                      opened_at: now, status: open,
@@ -378,7 +397,7 @@ rule ExtractFailure {
     when: ExtractFailure(agent, material, context, ref)
     ensures:
         let candidates = clamped(extract("failure", material), config.session_cap, config.session_default)
-        let ev = EvidenceArtifact.created(hash: sha256(material), content: material)
+        let ev = EvidenceArtifact.created(hash: evidence_pointer(material), content: material)
         let ep = Episode.created(source: failure_report, ref: ref, opened_at: now, status: open,
                                  evidence: ev)
         for c in admitted(candidates):
@@ -428,7 +447,7 @@ rule IngestDecisionRecords {
 
 invariant EvidenceIsContentAddressed {
     for a in EvidenceArtifacts:
-        a.hash = sha256(a.content)
+        a.hash = evidence_pointer(a.content)
 }
 
 ------------------------------------------------------------

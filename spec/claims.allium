@@ -93,6 +93,39 @@ enum SourceType { decision_record | user_assertion | code | session_log | failur
 -- Caller override of the epistemic-class-derived conflict policy.
 enum ConflictOverride { supersede | flag | ignore }
 
+-- WHY a validity interval closed, as structure. The reason sentence survives
+-- beside it for humans, and nothing parses it — it used to be the only
+-- record, and each producer phrased itself differently, so a reader matching
+-- one phrasing silently missed every other producer's closures.
+--
+--   superseded           the write path closed it for a newer assertion
+--                        (including an epistemic escalation)
+--   judged_superseded    the judge ruled the newer fact its legitimate
+--                        successor (maintenance.allium)
+--   judged_duplicate     the judge ruled it a restatement of another
+--   merge_duplicate      an entity merge left the same claim twice
+--                        (entities.allium)
+--   reconcile_duplicate  two writers made the same claim independently
+--                        (replication.allium)
+--   code_absent          the declaration is gone from the source it was
+--                        derived from (ingestion.allium) — nothing took its
+--                        place, so there is no successor
+--   manual               a human closed it by hand
+--
+-- superseded and judged_superseded are the SUPERSESSION kinds: a successor
+-- took this claim's place, which is what "what changed" is asking about
+-- (maintenance.allium's compiled briefing selects on exactly those two).
+-- Duplicate collapses are deliberately outside that subset — nothing changed,
+-- one of two identical rows was retired, and rendering X -> X is noise.
+--
+-- The set is explicitly OPEN. A store outlives the build that wrote it, so a
+-- dump or a foreign writer's log can carry a kind this reader has never heard
+-- of; it is kept verbatim and simply matches nothing. Adding a kind is
+-- additive and does NOT move the persisted-format version
+-- (replication.allium), which is precisely why no reader may assume the set
+-- it knows is the whole set.
+enum InvalidationKind { superseded | judged_superseded | judged_duplicate | merge_duplicate | reconcile_duplicate | code_absent | manual }
+
 -- Predicate lifecycle: core/* rows are born stable (curated seed); x/*
 -- coinages are born testing and either earn promotion (a NEW stable core
 -- row is minted; the staging row deprecates with a forwarding pointer) or
@@ -124,7 +157,7 @@ enum ValueExclusivity { exclusive | accumulating }
 
 -- A registry row: every predicate is a first-class queryable row in the
 -- same store, with a maps_to anchor to an established standard (PROV-O /
--- SPDX / DOAP / Dublin Core). ~22 curated core/* rows are seeded; unknown
+-- SPDX / DOAP / Dublin Core). 23 curated core/* rows are seeded; unknown
 -- predicates are refused with a did-you-mean suggestion — the cheap
 -- defense against LLM-driven predicate proliferation.
 entity Predicate {
@@ -172,9 +205,24 @@ entity Fact {
     episode: Episode?                -- provenance: which ingestion produced it
 
     conflicts_with: Set<Fact>        -- links live on the NEWER fact of each pair
-    superseded_by: Fact?             -- set when a successor closed this interval,
-                                     -- so "what replaced it" survives invalidation
+
+    -- WHY this interval closed, written when it closes. The kind is what a
+    -- reader selects on; the sentence survives beside it for humans and
+    -- nothing parses it; the successor is the claim that took this one's
+    -- place. A successor is recorded for duplicate collapses too, not only
+    -- supersessions — a row retired against no named counterpart reads as
+    -- deleted for no reason a year later — and is absent only when nothing
+    -- took the claim's place (code_absent, manual).
+    invalidation_kind: InvalidationKind?
     invalidation_reason: String?
+    successor: Fact?                 -- a plain fact id, deliberately NOT a
+                                     -- resolved reference: a dump restores in
+                                     -- file order and a foreign log replays in
+                                     -- clock order, so the successor routinely
+                                     -- does not exist yet when the predecessor
+                                     -- closes. An id that resolves to nothing
+                                     -- degrades to "no successor known" on
+                                     -- read; it never refuses the write
 
     is_currently_valid: t_valid <= now and (t_invalid = null or t_invalid > now)
 
@@ -217,6 +265,17 @@ config {
 --                                  user_assertion). Drives the defense: a
 --                                  weaker source never silently supersedes
 --                                  a stronger one.
+--   ceiling(source_type)           the most a fact from this source may ever
+--                                  claim: decision_record 1.0, code 0.95,
+--                                  user_assertion 0.9, session_log 0.7,
+--                                  agent_note 0.65, inferred 0.6, and 0.9 for
+--                                  a source the table does not list — a fact
+--                                  re-derived 500 times stays distinguishable
+--                                  from a human decision. BOTH ends of a
+--                                  fact's life are capped by it: birth (see
+--                                  AssertFact's `base`) and reinforcement.
+--                                  Birth has to be capped because nothing
+--                                  later brings a fact back down.
 --   reinforced(base, incoming, source_type)
 --                                  the new base after a re-assertion:
 --                                  max(base, min(ceiling(source_type),
@@ -224,14 +283,19 @@ config {
 --                                  evidence, raised only up to the
 --                                  EXISTING fact's source ceiling, and a
 --                                  base already above its ceiling is
---                                  preserved, not clawed back. Ceilings:
---                                  decision_record 1.0, code 0.95,
---                                  user_assertion 0.9, session_log 0.7,
---                                  agent_note 0.65, inferred 0.6 — a fact
---                                  re-derived 500 times stays
---                                  distinguishable from a human decision.
+--                                  preserved, not clawed back.
 --   resolved_class(explicit, pred) caller's class > the predicate's
 --                                  default_epistemic > observation
+--   stronger(stated, held)         the class the caller STATED binds harder
+--                                  than the one the standing fact holds, in
+--                                  the order observation < preference <
+--                                  commitment. Keyed off what was stated and
+--                                  nothing else: false when the caller stated
+--                                  no class at all, because resolved_class
+--                                  fills in the predicate's default and
+--                                  comparing RESOLVED values would make every
+--                                  code or notes pass escalate the facts it
+--                                  wrote last time, unboundedly and silently.
 --   resolved_kind(explicit, pred, object)
 --                                  the object kind per the registry row:
 --                                  entity_only / literal_only are forced
@@ -272,7 +336,10 @@ config {
 --   1. An exact duplicate of a currently-valid fact REINFORCES it: the
 --      world (or the user) just confirmed the fact, so its disuse clock
 --      resets and its base may rise toward the source ceiling — never
---      above it, never down, and never by repetition alone.
+--      above it, never down, and never by repetition alone. With one
+--      exception: a duplicate re-asserted with an explicitly STATED class
+--      stronger than the standing fact's is an ESCALATION, and escalation
+--      supersedes rather than reinforces (see the branch).
 --   2. A conflicting set is gathered: for one_value predicates, the other
 --      currently-valid values of (subject, predicate); plus, for any
 --      predicate in an exclusion group, currently-valid facts on the
@@ -303,6 +370,14 @@ rule AssertFact {
 
     let effective_at = valid_from ?? now
     let overridden = on_conflict != null
+    let source = source_type ?? user_assertion
+    -- A fact cannot be BORN above the trust its own source declares — the
+    -- default confidence included. The ingestion tiers already clamp their
+    -- own candidates, so this closes the direct-assert hole behind them, and
+    -- it has to close at birth: reinforcement is a high-water mark that never
+    -- claws a base back down, so a fact minted above its ceiling sits above
+    -- it permanently and the trust model is defeated for that row.
+    let base = min(ceiling(source), confidence ?? config.default_confidence)
 
     ensures:
         if not exists pred:
@@ -323,10 +398,10 @@ rule AssertFact {
                 object_kind: resolved_kind(object_kind, coined, object),
                 t_valid: effective_at, t_invalid: valid_until,
                 recorded_at: now, last_reinforced_at: now,
-                confidence: confidence ?? config.default_confidence,
+                confidence: base,
                 epistemic: resolved_class(epistemic, coined),
                 scope: scope ?? "project",
-                source_type: source_type ?? user_assertion,
+                source_type: source,
                 episode: episode, conflicts_with: {}
             )
         else:
@@ -342,9 +417,51 @@ rule AssertFact {
             let rivals = if pred.cardinality = one_value: different_valued(existing, kind, object) else: {}
             let conflicting = rivals + antagonists
 
-            if duplicate != null:
+            if duplicate != null and stronger(epistemic, duplicate.epistemic):
+                -- Epistemic escalation. The caller did not restate the claim,
+                -- they raised what it BINDS as — "this isn't just something we
+                -- observed, we decided it" — and reinforcement would carry the
+                -- old class forward and report the escalation as recorded. The
+                -- difference is not cosmetic: an observation supersedes
+                -- silently on the next contradiction and fades by disuse,
+                -- while a commitment flags for a human and never decays.
+                -- Superseding rather than mutating the standing row is what
+                -- makes the history read observation-then-commitment.
+                if duplicate.t_valid > effective_at:
+                    -- A backdated escalation flags for the same reason a
+                    -- backdated supersede does: closing the predecessor at a
+                    -- valid-from earlier than its own leaves it valid at no
+                    -- instant at all.
+                    let escalation_flag = Fact.created(
+                        subject: subject, predicate: pred, object_kind: kind,
+                        t_valid: effective_at, t_invalid: valid_until,
+                        recorded_at: now, last_reinforced_at: now,
+                        confidence: base,
+                        epistemic: klass, scope: scope ?? "project",
+                        source_type: source,
+                        episode: episode, conflicts_with: {duplicate}
+                    )
+                    ConflictFlagged(fact: escalation_flag, reason: "backdated-overlap")
+                else:
+                    let escalated = Fact.created(
+                        subject: subject, predicate: pred, object_kind: kind,
+                        t_valid: effective_at, t_invalid: valid_until,
+                        recorded_at: now, last_reinforced_at: now,
+                        confidence: base,
+                        epistemic: klass, scope: scope ?? "project",
+                        source_type: source,
+                        episode: episode, conflicts_with: {}
+                    )
+                    duplicate.t_invalid = effective_at
+                    duplicate.invalidation_kind = superseded
+                    duplicate.successor = escalated
+                    duplicate.invalidation_reason = "superseded by <successor>"
+            else if duplicate != null:
                 -- Reinforcement: clock reset is the mechanism; base is a
-                -- ceiling-capped high-water mark.
+                -- ceiling-capped high-water mark. A weaker or equal stated
+                -- class reinforces like any other restatement, and an unstated
+                -- one changes nothing even on a predicate whose registry
+                -- default is commitment.
                 duplicate.last_reinforced_at = now
                 duplicate.confidence = reinforced(duplicate.confidence, confidence, duplicate.source_type)
                 FactReinforced(fact: duplicate)
@@ -355,9 +472,9 @@ rule AssertFact {
                     subject: subject, predicate: pred, object_kind: kind,
                     t_valid: effective_at, t_invalid: valid_until,
                     recorded_at: now, last_reinforced_at: now,
-                    confidence: confidence ?? config.default_confidence,
+                    confidence: base,
                     epistemic: klass, scope: scope ?? "project",
-                    source_type: source_type ?? user_assertion,
+                    source_type: source,
                     episode: episode, conflicts_with: {}
                 )
             else if conflicting.count > 0:
@@ -385,9 +502,9 @@ rule AssertFact {
                         subject: subject, predicate: pred, object_kind: kind,
                         t_valid: effective_at, t_invalid: valid_until,
                         recorded_at: now, last_reinforced_at: now,
-                        confidence: confidence ?? config.default_confidence,
+                        confidence: base,
                         epistemic: klass, scope: scope ?? "project",
-                        source_type: source_type ?? user_assertion,
+                        source_type: source,
                         episode: episode, conflicts_with: conflicting
                     )
                     if wants_flag:
@@ -408,15 +525,16 @@ rule AssertFact {
                         subject: subject, predicate: pred, object_kind: kind,
                         t_valid: effective_at, t_invalid: valid_until,
                         recorded_at: now, last_reinforced_at: now,
-                        confidence: confidence ?? config.default_confidence,
+                        confidence: base,
                         epistemic: klass, scope: scope ?? "project",
-                        source_type: source_type ?? user_assertion,
+                        source_type: source,
                         episode: episode, conflicts_with: {}
                     )
                     for f in conflicting:
                         f.t_invalid = effective_at
-                        f.superseded_by = successor
-                        f.invalidation_reason = "superseded"
+                        f.invalidation_kind = superseded
+                        f.successor = successor
+                        f.invalidation_reason = "superseded by <successor>"
             else if not trusted(source_type)
                     and revenant_of(subject, pred, object)
                     and existing.count > 0
@@ -430,9 +548,9 @@ rule AssertFact {
                     subject: subject, predicate: pred, object_kind: kind,
                     t_valid: effective_at, t_invalid: valid_until,
                     recorded_at: now, last_reinforced_at: now,
-                    confidence: confidence ?? config.default_confidence,
+                    confidence: base,
                     epistemic: klass, scope: scope ?? "project",
-                    source_type: source_type ?? user_assertion,
+                    source_type: source,
                     episode: episode, conflicts_with: existing
                 )
                 ConflictFlagged(fact: revenant, reason: "revenant")
@@ -441,20 +559,26 @@ rule AssertFact {
                     subject: subject, predicate: pred, object_kind: kind,
                     t_valid: effective_at, t_invalid: valid_until,
                     recorded_at: now, last_reinforced_at: now,
-                    confidence: confidence ?? config.default_confidence,
+                    confidence: base,
                     epistemic: klass, scope: scope ?? "project",
-                    source_type: source_type ?? user_assertion,
+                    source_type: source,
                     episode: episode, conflicts_with: {}
                 )
 }
 
 -- Close a fact's validity interval by hand. The timestamp is the
 -- VALID-time end — when it stopped being true, not merely when we noticed.
+-- The kind is manual and there is no successor: a human closing a claim is
+-- saying it stopped holding, not naming what replaced it. Whatever prose they
+-- give stays prose — a reason reading "superseded by a better plan" is a
+-- sentence, never a link, which is exactly what a reader parsing reasons
+-- instead of kinds could not tell.
 rule InvalidateFact {
     when: InvalidateFact(agent, fact, reason?, at?)
     requires: (at ?? now) >= fact.t_valid
     ensures:
         fact.t_invalid = at ?? now
+        fact.invalidation_kind = manual
         fact.invalidation_reason = reason ?? "manually invalidated"
 }
 
@@ -549,8 +673,17 @@ surface ClaimStore {
 
     @guarantee NothingHardDeleted
         -- No operation removes a fact. Contradiction and reconciliation
-        -- close validity intervals; history — including invalidation
-        -- reasons and successors — remains queryable forever.
+        -- close validity intervals; history — including every closure's
+        -- kind, reason and successor — remains queryable forever.
+
+    @guarantee ClosuresCarryTheirReason
+        -- Every interval this system closes records WHY as a kind, and
+        -- WHICH claim took its place when one did. Selection is on the kind
+        -- alone: the sentence beside it is for humans, no reader parses it,
+        -- and so no producer can phrase itself out of a reader's selection
+        -- the way each of them once did. Rows closed before the kinds
+        -- existed carry none, and a reader that needs them says so rather
+        -- than inventing one.
 
     @guarantee TimeTravel
         -- Reads accept an as-of instant and answer from facts valid at
@@ -584,5 +717,5 @@ surface ClaimStore {
 -- Open Questions
 ------------------------------------------------------------
 
-open question "Confidence is never range-validated on the direct assert path — the extraction tiers clamp to their caps, but a CLI assert or batch ingest line can store confidence above 1.0 (or a session_log-typed fact above the 0.7 tier cap). Should build-time validation clamp to [0,1] and per-source ceilings, or is trusting the caller intended?"
+open question "Confidence is clamped to the source's ceiling at birth, but it is still never RANGE-validated: a negative confidence is stored exactly as given, and the top is bounded only incidentally, because the highest ceiling (decision_record) happens to be 1.0. Should build-time validation also clamp to [0,1], or is the ceiling the only bound worth having?"
 open question "Reinforcement caps the base at the EXISTING fact's source ceiling, so a human re-assertion of a code-derived fact can never raise it above 0.95 nor upgrade its source type. Intended asymmetry, or should stronger evidence be able to re-source a fact?"
