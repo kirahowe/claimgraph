@@ -538,3 +538,7 @@ Quarto book. Build it with `bb book` (needs a JVM and the
   consult, write, and how to phrase facts. Generated from
   `resources/claimgraph/SKILL.md` (the template `claim setup` installs into
   projects) — edit the template, not this copy; a test keeps them in sync.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
