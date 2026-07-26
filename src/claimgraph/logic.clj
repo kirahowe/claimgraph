@@ -82,14 +82,55 @@
 (defn- date-fields [m ks]
   (reduce (fn [a k] (if (some? (get a k)) (update a k parse-instant) a)) m ks))
 
+(def dump-discriminator
+  "The key a dump record says its kind under. Emphatically NOT :type: an
+  entity's wire shape already owns :type (store/Store), so a discriminator
+  written there overwrites the entity's real type with the word \"entity\" —
+  and unrecoverably, because the reader then strips the very key it read. A
+  :service dumped and loaded came back typed nothing at all, which quietly
+  disarms type-guarded resolution and empties `entity list --type`."
+  :record)
+
+(def dump-kinds
+  "Every record kind a dump carries. Kept beside the discriminator so a reader
+  can ask \"is this line one of ours?\" without reaching into
+  rehydrate-dump-record's `case`, which cannot be interrogated. A test pins
+  the two together."
+  #{:predicate :entity :episode :fact})
+
+(def pre-alpha-dump-discriminator
+  "Where a pre-alpha claimgraph stamped a record's kind, before the stamp
+  moved to :record. Kept — as the name of a mistake, never as a reader — so a
+  loader can tell a lossy claimgraph dump from a JSONL file that was never a
+  claimgraph dump at all, and say so. Reading a kind out of here is what
+  destroyed entity types in the first place; only recognition happens here."
+  :type)
+
+(defn pre-alpha-dump-record?
+  "Does this unstamped record look like it came from a pre-alpha claimgraph —
+  i.e. does it carry one of our kinds on the old discriminator? A file whose
+  records carry neither stamp is somebody else's JSONL, and telling its owner
+  to \"re-dump the source database\" sends them after a database that has
+  nothing to do with the file."
+  [rec]
+  (contains? dump-kinds (->kw (get rec pre-alpha-dump-discriminator))))
+
 (defn rehydrate-dump-record
-  "Pure: one JSON-parsed dump record -> [type wire-map], keywords and dates
-  restored exactly as the store protocol documents them. The inverse of what
-  JSON serialization flattened; unknown record types come back as
-  [:unknown m] for the caller to report."
-  [m]
-  (let [t (->kw (:type m))
-        m (dissoc m :type)]
+  "Pure: one JSON-parsed dump record -> [kind wire-map], keywords and dates
+  restored exactly as the store protocol documents them — the inverse of what
+  JSON serialization flattened. The kind is read from :record and stripped;
+  every other key is payload, including an entity's own :type, which comes
+  back the keyword it went out as.
+
+  Two shapes have no payload to hand back, and both return the line verbatim
+  so the caller can name what it saw: [:unknown m] for a kind this build has
+  no reader for, and [:unstamped m] for a record carrying no kind at all —
+  the shape of a dump written before the discriminator moved off :type.
+  Neither is this function's to resolve; guessing at either is how a load
+  half-restores a graph and reports success."
+  [rec]
+  (let [t (->kw (get rec dump-discriminator))
+        m (dissoc rec dump-discriminator)]
     (case t
       :predicate [t (-> m
                         (kw-fields [:id :category :object-kind :cardinality
@@ -109,7 +150,8 @@
                    (update :object-ref #(some-> % (kw-fields [:type]) strip-nils))
                    (update :confidence #(some-> % double))
                    strip-nils)]
-      [:unknown m])))
+      nil [:unstamped rec]
+      [:unknown rec])))
 
 ;; ---------------------------------------------------------------------------
 ;; Assertion decisions

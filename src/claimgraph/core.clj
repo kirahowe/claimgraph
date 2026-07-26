@@ -7,7 +7,8 @@
   (:require [clojure.string :as str]
             [claimgraph.logic :as logic]
             [claimgraph.predicates :as preds]
-            [claimgraph.store :as store]))
+            [claimgraph.store :as store]
+            [claimgraph.version :as version]))
 
 (defn now ^java.util.Date [] (java.util.Date.))
 
@@ -662,13 +663,136 @@
   (assoc (store/-stats s) :open-conflicts (:open (conflicts s))))
 
 (defn dump
-  "Export everything as a seq of typed records (the portability path)."
+  "Export everything as a seq of records, each stamped with its kind under
+  logic/dump-discriminator (the portability path). Records only — the format
+  header belongs to the serializer (wire/dump-lines), because it describes the
+  file, not the graph."
   [s]
-  (concat
-   (map #(assoc % :type "predicate") (store/-list-predicates s {}))
-   (map #(assoc % :type "entity") (store/-list-entities s {}))
-   (map #(assoc % :type "episode") (store/-list-episodes s))
-   (map #(assoc % :type "fact") (store/-all-facts s))))
+  (let [stamp (fn [kind xs] (map #(assoc % logic/dump-discriminator kind) xs))]
+    (concat
+     (stamp "predicate" (store/-list-predicates s {}))
+     (stamp "entity" (store/-list-entities s {}))
+     (stamp "episode" (store/-list-episodes s))
+     (stamp "fact" (store/-all-facts s)))))
+
+(defn- dump-format
+  "The format a dump declares, read off the header line, or nil when the
+  records arrived without one (an in-memory caller rather than a file — every
+  file wire/dump-lines writes leads with a header).
+
+  A format ABOVE this build's is refused rather than attempted: the fields a
+  newer format added are exactly the ones this reader would drop, so an
+  optimistic load half-restores the graph and reports success. A format BELOW
+  is fine and stays fine — that is the whole reason the format version is not
+  the release version.
+
+  A :format that is not an integer is refused here rather than coerced,
+  because coercion is what a header exists to make unnecessary: `null` and
+  `\"2\"` used to reach `long` and come out of the CLI as a bare
+  NullPointerException (ex-message literally nil) or ClassCastException — a
+  stack trace where the caller was promised claimgraph's JSON error contract.
+  Absent is not defaulted either: the header arrived WITH format 1, so a
+  header that declares no format is damaged, not old."
+  [header]
+  (when header
+    (let [raw (:format header)]
+      (when-not (int? raw)
+        (logic/fail (str "This dump's header declares no readable format: :format is "
+                         (pr-str raw))
+                    {:type :dump-format-invalid
+                     :dump-format raw
+                     :readable-format version/format-version
+                     :written-by (:version header)
+                     :hint (str "every claimgraph dump header carries an integer :format; "
+                                "this file's has been edited or was written by something "
+                                "that is not claimgraph — re-dump the source database "
+                                "with `claim dump`")}))
+      (let [f (long raw)]
+        (when (> f version/format-version)
+          (logic/fail (str "This dump is format " f "; this claimgraph reads format "
+                           version/format-version " and older")
+                      {:type :dump-format-too-new
+                       :dump-format f
+                       :readable-format version/format-version
+                       :written-by (:version header)
+                       :hint (str "upgrade claimgraph to a release that reads format "
+                                  f ", or re-dump from the claimgraph that wrote it")}))
+        f))))
+
+(defn- reject-unidentifiable!
+  "Refuse input that nothing identifies as a dump, before a single write.
+
+  Two things can vouch for a dump: the header line, which says what the FILE
+  is, and the per-record kind stamp, which says what each LINE is. Records
+  handed over in process (core/dump's return value, straight into load-dump)
+  carry the second and not the first, which is why a missing header is not
+  refused on its own. Input carrying neither — an empty file, a file
+  truncated to nothing, a redirect that never wrote — carried nothing to
+  refuse, and used to come back {:status :loaded} with every count zero: the
+  silent success that makes a lost graph look like a restored one."
+  [header records]
+  (when-not (or header (seq records))
+    (logic/fail "Refusing to load: this input holds no dump header and no records"
+                {:type :not-a-dump
+                 :records 0
+                 :hint (str "every dump `claim dump` writes leads with a "
+                            "{\"record\":\"claimgraph-dump\"} header line; an empty file "
+                            "is not an empty graph, it is a file that lost its contents — "
+                            "check the path, then re-dump the source database")})))
+
+(defn- reject-unreadable!
+  "Refuse a dump this build cannot read in full, before a single write. The
+  alternative claimgraph shipped with — restore what parses, report the rest
+  as an :unknown-records count — loses data at the one moment a user believes
+  it is being preserved, and leaves a store that looks complete.
+
+  Unstamped records get their diagnosis from the header, not from their own
+  absence: \"written by a pre-alpha claimgraph\" was once the verdict on every
+  unreadable file, so `claim load` of somebody else's JSONL told the user to
+  re-dump a database that had nothing to do with it. A pre-alpha dump is
+  recognisable — it stamped its kinds onto :type — and refused because that
+  stamp landed on the entity's own type field and erased it at WRITE time;
+  loading one restores untyped entities and calls it success."
+  [header unstamped unknown]
+  (when (seq unstamped)
+    (cond
+      (some logic/pre-alpha-dump-record? unstamped)
+      (logic/fail (str "This dump was written by a pre-alpha claimgraph: "
+                       (count unstamped) " records stamp their kind on :type")
+                  {:type :dump-pre-alpha
+                   :records (count unstamped)
+                   :hint (str "re-dump the source database with this claimgraph and load "
+                              "that instead — a pre-alpha dump stamped each record's kind "
+                              "onto :type, the same field that holds an entity's own type, "
+                              "so the entity types in this file are already gone")})
+
+      header
+      (logic/fail (str "This dump carries " (count unstamped)
+                       " records with no record kind")
+                  {:type :dump-records-unstamped
+                   :records (count unstamped)
+                   :hint (str "the header says claimgraph wrote this file, but these lines "
+                              "say nothing about what they are — the file has been edited "
+                              "or spliced; re-dump the source database with `claim dump`")})
+
+      :else
+      (logic/fail (str "This is not a claimgraph dump: no header, and none of its "
+                       (count unstamped) " records says what it is")
+                  {:type :not-a-dump
+                   :records (count unstamped)
+                   :hint (str "a claimgraph dump leads with a "
+                              "{\"record\":\"claimgraph-dump\"} header and stamps every "
+                              "line's kind under :record; this file does neither, so it "
+                              "was written by something else — check the path")})))
+  (when (seq unknown)
+    (let [kinds (distinct (map #(get % logic/dump-discriminator) unknown))]
+      (logic/fail (str "This dump holds record kinds this claimgraph cannot read: "
+                       (str/join ", " kinds))
+                  {:type :unknown-dump-records
+                   :kinds (vec kinds)
+                   :records (count unknown)
+                   :readable-format version/format-version
+                   :hint "upgrade claimgraph; loading the rest would drop these records and call it success"}))))
 
 (defn load-dump
   "Restore a store from dump records: the other half of portability, so
@@ -678,7 +802,19 @@
   reasons, and conflict links round-trip exactly. Entity ids are re-minted
   (they're internal); facts re-point through an identity map keyed on the
   dumped id. Refuses a store that already holds data — load restores, it
-  does not merge."
+  does not merge.
+
+  Takes the dump's lines whole, header included, because deciding whether
+  these bytes are readable at all is load's job and nobody else's. Anything
+  it cannot read in full it refuses outright: a partial restore that returns
+  :loaded is the failure mode worth the most noise.
+
+  The header is optional only because core/dump's records reach here directly
+  as well as through a file, and those records vouch for themselves one kind
+  stamp at a time. Input that neither leads with a header NOR stamps its
+  records is refused rather than loaded as an empty graph — see
+  reject-unidentifiable! and reject-unreadable! for which refusal each shape
+  earns, and why one message for all of them was worse than none."
   [s records]
   (let [st (store/-stats s)]
     (when (or (pos? (long (:entities st 0)))
@@ -688,13 +824,16 @@
                   {:type :store-not-empty
                    :stats (select-keys st [:entities :facts :episodes])
                    :hint "load restores a dump into a fresh store; point --db somewhere empty"}))
-    (let [parsed (mapv logic/rehydrate-dump-record records)
-          of-type (fn [t] (into [] (comp (filter #(= t (first %))) (map second)) parsed))
-          preds (of-type :predicate)
-          ents (of-type :entity)
-          eps (of-type :episode)
-          facts (of-type :fact)
-          unknown (of-type :unknown)
+    (let [header (when (version/header? (first records)) (first records))
+          body (if header (rest records) records)
+          _ (reject-unidentifiable! header body)
+          fmt (dump-format header)
+          parsed (group-by first (map logic/rehydrate-dump-record body))
+          of-kind (fn [k] (mapv second (parsed k)))
+          preds (of-kind :predicate)
+          ents (of-kind :entity)
+          eps (of-kind :episode)
+          facts (of-kind :fact)
           id-map (atom {})
           remap (fn [emb]
                   (when emb
@@ -704,6 +843,7 @@
                         (let [e (ensure-entity s (select-keys emb [:name :type :scope]))]
                           (swap! id-map assoc (:id emb) e)
                           e))))]
+      (reject-unreadable! header (of-kind :unstamped) (of-kind :unknown))
       (doseq [p preds] (store/-register-predicate s p))
       (doseq [e ents]
         (let [e' (store/-ensure-entity s (select-keys e [:name :type :scope]))]
@@ -732,4 +872,4 @@
                :facts (count facts)
                :invalidated (count (filter :t-invalid facts))
                :conflict-links (count (mapcat :conflicts facts))}
-        (seq unknown) (assoc :unknown-records (count unknown))))))
+        fmt (assoc :format fmt)))))

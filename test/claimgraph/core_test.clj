@@ -7,6 +7,7 @@
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [claimgraph.core :as core]
+            [claimgraph.logic :as logic]
             [claimgraph.store :as store]
             [claimgraph.store.memory :as mem]))
 
@@ -569,12 +570,31 @@
 
 (deftest dump-is-complete
   (with-stores [s]
-    (core/assert-fact s {:subject "A" :predicate :core/depends-on :object "B"})
+    (core/assert-fact s {:subject "A" :subject-type :service
+                         :predicate :core/depends-on :object "B"})
     (let [records (core/dump s)
-          types (frequencies (map :type records))]
-      (is (= 23 (types "predicate")))
-      (is (= 2 (types "entity")))
-      (is (= 1 (types "fact"))))))
+          kind #(get % logic/dump-discriminator)
+          kinds (frequencies (map kind records))]
+      (is (= 23 (kinds "predicate")))
+      (is (= 2 (kinds "entity")))
+      (is (= 1 (kinds "fact")))
+      ;; the discriminator lives under its own key precisely so it cannot
+      ;; overwrite this: stamping it on :type erased every entity's own type
+      (is (= #{:service} (set (keep :type (filter #(= "entity" (kind %)) records))))
+          "an entity's own :type survives the dump"))))
+
+(deftest dump-carries-every-entity-field
+  ;; dump reads entities through -list-entities, so a field that projection
+  ;; omits is a field the dump drops silently. It omitted aliases, which are
+  ;; how resolution finds a renamed entity — a restore without them answers
+  ;; "not found" for every name the graph learned.
+  (with-stores [s]
+    (core/assert-fact s {:subject "AuthService" :subject-type :service
+                         :predicate :core/depends-on :object "Redis"})
+    (core/alias-entity s {:name "AuthService" :alias "auth-svc"})
+    (let [rec (first (filter #(= "AuthService" (:name %)) (core/dump s)))]
+      (is (= ["auth-svc"] (:aliases rec)))
+      (is (= :service (:type rec))))))
 
 (deftest predicate-promotion
   (with-stores [s]
