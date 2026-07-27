@@ -202,6 +202,18 @@
     {:considered (count candidates)
      :enriched enriched}))
 
+(defn sub-stage-errors
+  "The internally-caught failures a consolidate! report carries, keyed by
+  stage. The stamp gate reads this (spec/maintenance.allium, decided
+  2026-07-26): a pass with any of these is not CLEAN — it must stay due and
+  retry next session rather than wait out a full consolidation window.
+  (Episode summaries never appear here: the mechanical digest means that
+  stage always makes progress.)"
+  [{:keys [conflicts sweep enrichment]}]
+  (into {}
+        (keep (fn [[stage r]] (when (:error r) [stage (:error r)])))
+        {:conflicts conflicts :sweep sweep :enrichment enrichment}))
+
 (defn consolidate!
   "Run the full consolidation pass.
   opts: :command (LLM command; default $CLAIMGRAPH_LLM_CMD or claude -p)

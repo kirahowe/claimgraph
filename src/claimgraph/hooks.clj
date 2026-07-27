@@ -110,12 +110,25 @@
         due? (consolidate-due? db days (core/now))
         consolidated (if-not due?
                        {:status :skipped :reason (str "ran within the last " days " days")}
+                       ;; The stamp is earned, not scheduled (spec/
+                       ;; maintenance.allium, decided 2026-07-26): only a pass
+                       ;; whose sub-stages all ran clean writes it. An errored
+                       ;; judge, sweep or enrichment stays in the report
+                       ;; without aborting its siblings — but withholding the
+                       ;; stamp keeps the pass DUE, so a broken LLM costs a
+                       ;; retry next session, not a silent wait for the next
+                       ;; consolidation window.
                        (let [r (attempt #((requiring-resolve 'claimgraph.consolidate/consolidate!)
                                           s (select-keys opts [:command :summarize-fn :judge-fn
-                                                               :resolve :min-confidence])))]
-                         (when-not (= :error (:status r))
-                           (spit (stamp-path db) (str (.toInstant ^java.util.Date (core/now)))))
-                         r))]
+                                                               :resolve :min-confidence])))
+                             errors (when-not (= :error (:status r))
+                                      ((requiring-resolve 'claimgraph.consolidate/sub-stage-errors) r))]
+                         (cond
+                           (= :error (:status r)) r
+                           (seq errors) (assoc r :stamp :withheld :sub-stage-errors errors)
+                           :else (do (spit (stamp-path db)
+                                           (str (.toInstant ^java.util.Date (core/now))))
+                                     r))))]
     {:status (if (some #(contains? #{:error :partial} (:status %))
                        [code ingest compiled consolidated])
                :partial :ok)
