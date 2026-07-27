@@ -268,6 +268,7 @@
    :code 0.95
    :user-assertion 0.9
    :session-log 0.7
+   :failure-report 0.7
    :agent-note 0.65
    :inferred 0.6})
 
@@ -328,7 +329,12 @@
   a fact cannot be born above the trust its own source declares. The ingest
   tiers each clamp their own candidates already, so this is the direct-assert
   hole and their belt — and it has to be closed at birth, because
-  reinforced-confidence never claws a base back down (see source-ceilings)."
+  reinforced-confidence never claws a base back down (see source-ceilings).
+
+  Range before ceiling (spec/claims.allium, decided 2026-07-26): the stated
+  confidence is clamped into [0,1] first — a negative or >1 value is a caller
+  bug, corrected the same way the ceiling clamp corrects over-claiming, and
+  the top stops depending on the accident that the highest ceiling is 1.0."
   [{:keys [id now subject predicate object-kind object-ref object
            t-valid t-invalid confidence epistemic scope source-type episode]}]
   (let [t-valid (or t-valid now)
@@ -347,7 +353,7 @@
      :recorded-at now
      :last-reinforced-at now
      :confidence (min (confidence-ceiling source-type)
-                      (double (or confidence 0.8)))
+                      (-> (double (or confidence 0.8)) (max 0.0) (min 1.0)))
      :epistemic epistemic
      :scope (or scope default-scope)
      :source-type source-type
@@ -510,12 +516,29 @@
 ;; Confidence: reinforcement and disuse decay
 ;; ---------------------------------------------------------------------------
 
+(defn resourced-type
+  "Reinforcement re-sourcing (spec/claims.allium, decided 2026-07-26):
+  stronger evidence promotes the row it confirms. The incoming source wins
+  only when its ceiling is strictly higher than the standing one's — a
+  decision record re-asserting a code-derived fact lifts it toward 1.0, a
+  human re-asserting a session extraction lifts it out of the 0.7 band —
+  and never on a tie, so a plain re-assertion cannot churn the provenance."
+  [existing incoming-source-type]
+  (let [held (:source-type existing)]
+    (if (and incoming-source-type
+             (> (confidence-ceiling incoming-source-type)
+                (confidence-ceiling held)))
+      incoming-source-type
+      held)))
+
 (defn reinforced-confidence
   "New base confidence after a re-assertion: never lowered by weaker
-  evidence, raised by stronger evidence only up to the existing fact's
-  source ceiling (a base already above its ceiling is preserved, not clawed
-  back). Repetition alone never grows it — resetting the disuse clock is the
-  reinforcement mechanism; base is a ceiling-capped high-water mark."
+  evidence, raised by stronger evidence only up to the fact's source
+  ceiling as it stands after any re-sourcing — the caller applies
+  resourced-type first (a base already above its ceiling is preserved, not
+  clawed back). Repetition alone never grows it — resetting the disuse
+  clock is the reinforcement mechanism; base is a ceiling-capped high-water
+  mark."
   [existing incoming-confidence]
   (max (double (:confidence existing))
        (min (confidence-ceiling (:source-type existing))
@@ -763,18 +786,24 @@
   silently match a class). Two or more normalized matches is a detected
   collision, not a license to guess — it returns {:via :ambiguous} with the
   candidates so the caller can surface them. Zero candidates returns nil:
-  genuinely new, creating is correct."
+  genuinely new, creating is correct.
+
+  The alias layer holds the same line (spec/entities.allium, decided
+  2026-07-26): an alias held by two or more entities — possible in stores
+  written before alias-entity refused the clash — is a detected collision
+  too, never a silent pick of whichever entity came back first."
   [{:keys [name norm type]} candidates]
   (let [type-ok? (fn [e] (or (nil? type) (nil? (:type e)) (= type (:type e))))
         norm-of (fn [e] (cons (normalize-entity-name (:name e))
                               (map normalize-entity-name (:aliases e))))
         exact (first (filter #(= name (:name %)) candidates))
-        alias-hit (first (filter #(some #{name} (:aliases %)) candidates))
+        alias-hits (filterv #(some #{name} (:aliases %)) candidates)
         norm-hits (filterv #(and (type-ok? %) (some #{norm} (norm-of %)))
                            candidates)]
     (cond
       exact {:entity exact :via :exact}
-      alias-hit {:entity alias-hit :via :alias}
+      (= 1 (count alias-hits)) {:entity (first alias-hits) :via :alias}
+      (seq alias-hits) {:via :ambiguous :candidates alias-hits}
       (= 1 (count norm-hits)) {:entity (first norm-hits) :via :normalized}
       (seq norm-hits) {:via :ambiguous :candidates norm-hits}
       :else nil)))

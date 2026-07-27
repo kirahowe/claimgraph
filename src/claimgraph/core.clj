@@ -164,7 +164,9 @@
 
 (defn rename-entity
   "Rename in place: same entity, same facts, same history; the old name is
-  kept as an alias."
+  kept as an alias, and the NEW name is scrubbed from the alias list
+  (spec/entities.allium, decided 2026-07-26) — renaming back to a previous
+  name must not leave an entity aliased to itself."
   [s {:keys [from to scope]}]
   (when (str/blank? (str to))
     (logic/fail "New name required" {:type :missing-entity-name}))
@@ -176,14 +178,25 @@
         (logic/fail (str "Entity already exists: " to)
                     {:type :entity-exists :entity to
                      :hint "use `entity merge` to combine them"})))
-    (store/-update-entity s (:id e) {:name to :add-aliases [(:name e)]})
+    ;; Unconditional scrub: adds land before removes, so a no-op rename
+    ;; (X -> X) adds and immediately drops the self-alias instead of
+    ;; minting one — and renaming an entity to its own current name becomes
+    ;; the repair verb for legacy self-aliased rows.
+    (store/-update-entity s (:id e) {:name to
+                                     :add-aliases [(:name e)]
+                                     :remove-aliases [to]})
     {:status :renamed
      :entity (-> e
                  (assoc :name to)
-                 (update :aliases #(vec (distinct (conj (vec %) (:name e))))))}))
+                 (update :aliases #(vec (remove #{to}
+                                                (distinct (conj (vec %) (:name e)))))))}))
 
 (defn alias-entity
-  "Record an additional name for an entity."
+  "Record an additional name for an entity. Refused when another entity
+  already owns it — as its exact name OR among its aliases (spec/
+  entities.allium, decided 2026-07-26): a shared alias was the one name
+  collision resolution could not refuse, and the silent pick it forced is
+  exactly what the ambiguity defense exists to prevent."
   [s {:keys [name alias scope]}]
   (when (str/blank? (str alias))
     (logic/fail "Alias required" {:type :missing-alias}))
@@ -195,6 +208,14 @@
         (logic/fail (str "Another entity is named " alias)
                     {:type :entity-exists :entity alias
                      :hint "use `entity merge` to combine them"})))
+    (let [holders (->> (store/-find-entities s alias scope)
+                       (filter #(some #{alias} (:aliases %)))
+                       (remove #(= (:id %) (:id e))))]
+      (when (seq holders)
+        (logic/fail (str "Another entity already holds the alias " alias)
+                    {:type :alias-taken :alias alias
+                     :holders (mapv #(select-keys % [:id :name :type :scope]) holders)
+                     :hint "if these are the same thing, `entity merge` them"})))
     (store/-update-entity s (:id e) {:add-aliases [alias]})
     {:status :aliased
      :entity (update e :aliases #(vec (distinct (conj (vec %) alias))))}))
@@ -278,11 +299,21 @@
 (defn- execute-assert! [s {:keys [action fact existing invalidate link candidates
                                   effective-at reason]}]
   (case action
-    :reinforce (let [boosted (logic/reinforced-confidence existing (:confidence fact))
+    :reinforce (let [source (logic/resourced-type existing (:source-type fact))
+                     boosted (logic/reinforced-confidence
+                              (assoc existing :source-type source) (:confidence fact))
                      at (:recorded-at fact)]
-                 (store/-reinforce s (:id existing) {:at at :confidence boosted})
+                 ;; Re-sourcing (spec/claims.allium, decided 2026-07-26): a
+                 ;; higher-ceiling incoming source upgrades the row before the
+                 ;; base moves, so the raised ceiling applies to this very
+                 ;; reinforcement. Both assertions' episodes stay in history.
+                 (store/-reinforce s (:id existing)
+                                   (cond-> {:at at :confidence boosted}
+                                     (not= source (:source-type existing))
+                                     (assoc :source-type source)))
                  {:status :reinforced
-                  :fact (assoc existing :confidence boosted :last-reinforced-at at)})
+                  :fact (assoc existing :confidence boosted :last-reinforced-at at
+                               :source-type source)})
     :insert {:status :created :fact (store/-insert-fact s fact)}
     :supersede (do (doseq [id invalidate]
                      (store/-invalidate s id effective-at

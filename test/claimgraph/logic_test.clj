@@ -119,16 +119,23 @@
 (deftest a-fact-is-born-no-higher-than-its-source-ceiling
   (testing "an explicit confidence above the source's ceiling is clamped at birth"
     (is (= 0.7 (:confidence (candidate {:source-type :session-log :confidence 0.95}))))
+    (is (= 0.7 (:confidence (candidate {:source-type :failure-report :confidence 0.95})))
+        "failure-report has its own ceiling row — extraction grade, not the 0.9 fallback")
     (is (= 0.65 (:confidence (candidate {:source-type :agent-note :confidence 1.0}))))
     (is (= 0.9 (:confidence (candidate {:confidence 0.99})))
         "no source-type means :user-assertion, capped like any other"))
+  (testing "confidence is range-clamped into [0,1] before the ceiling applies"
+    (is (= 0.0 (:confidence (candidate {:confidence -0.4})))
+        "a negative confidence is a caller bug, corrected at birth like over-claiming")
+    (is (= 1.0 (:confidence (candidate {:source-type :decision-record :confidence 3.0})))
+        "the top is its own bound, not an accident of the 1.0 ceiling"))
   (testing "the 0.8 default is not an exemption"
     (is (= 0.6 (:confidence (candidate {:source-type :inferred})))))
   (testing "sources that outrank the default keep what they claim"
     (is (= 0.8 (:confidence (candidate {:source-type :code}))))
     (is (= 0.95 (:confidence (candidate {:source-type :code :confidence 0.99}))))
     (is (= 1.0 (:confidence (candidate {:source-type :decision-record :confidence 1.0}))))
-    (is (= 0.9 (:confidence (candidate {:source-type :failure-report :confidence 0.95})))
+    (is (= 0.9 (:confidence (candidate {:source-type :carrier-pigeon :confidence 0.95})))
         "a source-type with no ceiling row falls back to 0.9, not to no cap")))
 
 (deftest loose-object-matching

@@ -127,11 +127,13 @@
              s {:summarize-fn (fn [_] "summary")
                 :judge-fn (fn [_] "")
                 :enrich-fn (fn [_] "[\"identity service\", \"sso\"]")})]
-      (is (= [{:entity "AuthService" :aliases ["identity service"]}
-              (first (filter #(not= "AuthService" (:entity %))
-                             (:enriched (:enrichment r))))]
-             (vec (take 2 (sort-by :entity (:enriched (:enrichment r))))))
-          "the sso alias clashed with the sso entity and was skipped")
+      (is (= [{:entity "AuthService" :aliases ["identity service"]}]
+             (vec (sort-by :entity (:enriched (:enrichment r)))))
+          "AuthService's sso suggestion clashed with the sso ENTITY, and
+          sso's identity-service suggestion clashed with the ALIAS
+          AuthService had just taken — the guard refuses both kinds of
+          clash (spec/entities.allium, decided 2026-07-26), so no alias is
+          ever held by two entities")
       (is (contains? (set (:aliases (:entity (core/get-facts s {:entity "identity service"}))))
                      "identity service")
           "the alias resolves like any other name")

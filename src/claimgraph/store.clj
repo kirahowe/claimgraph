@@ -80,6 +80,23 @@
   [json-class]
   (into [] (comp (filter #(= json-class (:json %))) (map :key)) fact-fields))
 
+(def ^:dynamic *write-warnings*
+  "When bound to an atom (the CLI and MCP surfaces bind it per command), a
+  store decorator that degrades without failing the write — today the oplog
+  appender — pushes a structured warning here, and the command attaches the
+  batch to its report (spec/replication.allium, decided 2026-07-26): a log
+  that quietly stopped being written is a machine that quietly stopped
+  replicating, and stderr alone never reaches a parser. Unbound, warnings
+  still go to stderr; nothing blocks, nothing is lost."
+  nil)
+
+(defn push-write-warning!
+  "Record one degradation warning for the current command's report, when a
+  surface is collecting them. Safe to call from anywhere: a no-op unbound."
+  [warning]
+  (when *write-warnings*
+    (swap! *write-warnings* conj warning)))
+
 (defprotocol Store
   (-ensure-entity [s ent]
     "Exact name+scope match or create. ent = {:name :type :scope}. Returns entity.")
@@ -91,8 +108,11 @@
     Over-returning is fine — precedence and ambiguity are decided purely in
     logic/pick-entity-match.")
   (-update-entity [s entity-id updates]
-    "Apply {:name str, :type kw, :add-aliases [str]} to an entity. Stores
-    maintain any derived lookup fields (normalized names, indexes).")
+    "Apply {:name str, :type kw, :add-aliases [str], :remove-aliases [str]}
+    to an entity (adds land before removes). Stores maintain any derived
+    lookup fields (normalized names, indexes) — including not dropping a
+    normalized form a surviving alias still needs when a spelling that
+    shares it is removed.")
   (-repoint-facts [s from-entity-id to-entity-id]
     "Re-reference every fact whose subject or object is from-entity onto
     to-entity (the merge primitive). Returns the number of facts touched.")
@@ -155,9 +175,12 @@
     "Record conflict links from fact-id to each id in conflict-ids.")
   (-unlink-conflicts [s fact-id conflict-ids]
     "Remove conflict links from fact-id to each id in conflict-ids.")
-  (-reinforce [s fact-id {:keys [at confidence]}]
+  (-reinforce [s fact-id {:keys [at confidence source-type]}]
     "Reset a fact's disuse clock (:last-reinforced-at, plus any derived
-    mirror) and set its base confidence, in one write.")
+    mirror) and set its base confidence, in one write. :source-type, when
+    present, re-sources the fact — reinforcement by a higher-ceiling source
+    upgrades the row's provenance (spec/claims.allium, decided 2026-07-26);
+    absent, the source is untouched.")
   (-all-facts [s])
   (-open-episode [s ep]
     "ep = {:id :source-type :ref :opened-at}. Returns episode.")

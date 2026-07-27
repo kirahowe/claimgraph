@@ -408,7 +408,7 @@
                              (q-attr :entity/norm-aliases norm)))
            (mapv #(ent->wire (d/pull db entity-pull %))))))
 
-  (-update-entity [_ entity-id {:keys [name type add-aliases]}]
+  (-update-entity [_ entity-id {:keys [name type add-aliases remove-aliases]}]
     (d/transact! conn [(cond-> {:db/id [:entity/id entity-id]}
                          name (assoc :entity/name name
                                      :entity/norm-name (logic/normalize-entity-name name))
@@ -417,6 +417,26 @@
                          (assoc :entity/aliases (vec add-aliases)
                                 :entity/norm-aliases (mapv logic/normalize-entity-name
                                                            add-aliases)))])
+    (when (seq remove-aliases)
+      ;; Removes land after adds, against the post-add alias set. A normalized
+      ;; form is retracted only when no SURVIVING alias still needs it —
+      ;; "FooBar" and "foo-bar" share one norm, and dropping the norm with the
+      ;; first would disarm normalized lookup for the second.
+      (let [current (vec (:entity/aliases
+                          (d/pull (d/db conn) [:entity/aliases]
+                                  [:entity/id entity-id])))
+            gone (set remove-aliases)
+            survivors (remove gone current)
+            surviving-norms (set (map logic/normalize-entity-name survivors))
+            dead-norms (->> (filter gone current)
+                            (map logic/normalize-entity-name)
+                            (remove surviving-norms)
+                            distinct)]
+        (d/transact! conn
+                     (concat (for [a (filter gone current)]
+                               [:db/retract [:entity/id entity-id] :entity/aliases a])
+                             (for [n dead-norms]
+                               [:db/retract [:entity/id entity-id] :entity/norm-aliases n])))))
     entity-id)
 
   (-repoint-facts [_ from-id to-id]
@@ -490,11 +510,12 @@
                             conflict-ids))
     fact-id)
 
-  (-reinforce [_ fact-id {:keys [at confidence]}]
-    (d/transact! conn [{:fact/id fact-id
-                        :fact/confidence (double confidence)
-                        :fact/last-reinforced-at at
-                        :fact/last-reinforced-ms (.getTime ^java.util.Date at)}])
+  (-reinforce [_ fact-id {:keys [at confidence source-type]}]
+    (d/transact! conn [(cond-> {:fact/id fact-id
+                                :fact/confidence (double confidence)
+                                :fact/last-reinforced-at at
+                                :fact/last-reinforced-ms (.getTime ^java.util.Date at)}
+                         source-type (assoc :fact/source-type source-type))])
     fact-id)
 
   (-all-facts [_]

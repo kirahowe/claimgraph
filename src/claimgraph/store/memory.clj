@@ -88,7 +88,7 @@
            (filter matches?)
            vec)))
 
-  (-update-entity [_ entity-id {:keys [name type add-aliases]}]
+  (-update-entity [_ entity-id {:keys [name type add-aliases remove-aliases]}]
     (swap! state
            (fn [st]
              (let [e (get-in st [:entities entity-id])
@@ -99,7 +99,9 @@
                                       name (assoc :name name)
                                       type (assoc :type type)
                                       (seq add-aliases)
-                                      (update :aliases #(vec (distinct (into (vec %) add-aliases)))))))
+                                      (update :aliases #(vec (distinct (into (vec %) add-aliases))))
+                                      (seq remove-aliases)
+                                      (update :aliases #(vec (remove (set remove-aliases) %))))))
                  renamed?
                  (-> (update :by-name-scope dissoc (index-key (:name e) (:scope e)))
                      (assoc-in [:by-name-scope (index-key name (:scope e))] entity-id))))))
@@ -177,9 +179,11 @@
            (fn [ids] (vec (remove (set conflict-ids) ids))))
     fact-id)
 
-  (-reinforce [_ fact-id {:keys [at confidence]}]
+  (-reinforce [_ fact-id {:keys [at confidence source-type]}]
     (swap! state update-in [:facts fact-id]
-           assoc :last-reinforced-at at :confidence (double confidence))
+           (fn [f]
+             (cond-> (assoc f :last-reinforced-at at :confidence (double confidence))
+               source-type (assoc :source-type source-type))))
     fact-id)
 
   (-all-facts [_]
