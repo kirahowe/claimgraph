@@ -149,7 +149,12 @@ config {
 --   compiled_view(budget)          the deterministic managed-section
 --                                  content (see CompileContext)
 --   due_for_consolidation(at)      the consolidation stamp is absent or
---                                  older than consolidate_every
+--                                  older than consolidate_every; only a
+--                                  CLEAN pass stamps (see Consolidate)
+--   sub_stage_errors()             the internally-caught failures the
+--                                  running pass accumulated (episode
+--                                  summaries, judge, sweep, enrichment) —
+--                                  each is a report entry, never an abort
 --   retrieved_since_last_mark(agent)
 --                                  the facts the read verbs surfaced since
 --                                  the previous outcome mark (the local
@@ -211,6 +216,12 @@ rule SweepConflicts {
                                   min_confidence: min_confidence ?? config.judge_min_confidence)
 }
 
+-- Link every genuine hit into the pipeline at ANY verdict confidence —
+-- only RESOLUTION is confidence-gated, downstream in ApplyVerdict
+-- (decided 2026-07-26: intended tilt toward surfacing). A low-confidence
+-- duplicate verdict still opens a conflict for a human to clear: open
+-- conflicts are cheap to list, a later judge pass auto-closes the easy
+-- ones, and gating the LINK would drop possible duplicates silently.
 rule ApplySweepVerdict {
     when: SweepVerdictDelivered(judge, newer, established, verdict, confidence, resolve, min_confidence)
     requires: verdict = contradicts or verdict = duplicate or verdict = supersedes
@@ -227,6 +238,14 @@ rule ApplySweepVerdict {
 -- judge and sweep, enrich retrieval, report promotion candidates.
 -- Open-but-EMPTY episodes are left alone — they may belong to a session
 -- still in flight.
+--
+-- The stamp is earned, not scheduled (decided 2026-07-26): it is written
+-- only when every sub-stage ran clean. An errored sub-stage (a broken
+-- judge, a failed enrichment call) still lands in the report without
+-- aborting its siblings — but it withholds the stamp, so the pass stays
+-- DUE and the next session retries, mirroring ingestion's delta gate,
+-- where a degraded pass leaves the gate unsatisfied. Stamping over an
+-- error would postpone the failed stage a full consolidation window.
 rule Consolidate {
     when: Consolidate(agent, resolve)
     ensures:
@@ -241,6 +260,8 @@ rule Consolidate {
             -- resolution route honours them)
             AliasSuggestionsRequested(entity: e)
         PromotionReview(candidates: promotion_candidates())
+        if sub_stage_errors().count = 0:
+            ConsolidationStamped(at: now)
 }
 
 -- An episode summary lands (LLM, or the mechanical digest when the LLM is
@@ -297,7 +318,9 @@ rule CompileContext {
 -- and conflict ground truth are fresh, and it is delta-gated (free when
 -- nothing changed); the code-ingest setting opts a project with an
 -- expensive analyzer out. Consolidation runs at lower frequency, gated by
--- a stamp: due when the stamp is absent or older than the window.
+-- a stamp: due when the stamp is absent or older than the window — and
+-- only a clean pass stamps, so an errored sub-stage comes back due next
+-- session rather than next window.
 rule AmbientSessionEnd {
     when: SessionEnded(harness, agent, project)
     ensures:
@@ -338,7 +361,12 @@ rule OutcomeAccepted {
 -- A rejected mark reinforces NOTHING and reports the facts that were in
 -- play — the review candidates. The rejection's LESSON arrives separately
 -- through the failure tier (ingestion.allium) — the two halves of the
--- valence signal.
+-- valence signal. Rejection consumes the retrieval window deliberately
+-- (decided 2026-07-26): for those retrievals the outcome IS the
+-- rejection. When the fixed work later succeeds, its own reads re-logged
+-- whatever it actually used — the honest reinforcement signal — so the
+-- window does not stay open waiting for a redemption that would credit
+-- the failure's reads.
 rule OutcomeRejected {
     when: OutcomeRejected(agent)
     ensures:
@@ -418,10 +446,3 @@ surface HarnessIntegration {
         -- the compiled view — with no change to how anyone works.
 }
 
-------------------------------------------------------------
--- Open Questions
-------------------------------------------------------------
-
-open question "The consolidation stamp is written whenever the pass itself completes, even when its judge, sweep or enrichment sub-stages errored internally (each catches its own failure into the report) — so a broken LLM postpones those stages a full consolidation window rather than retrying next session. Intended cadence, or should sub-stage failure leave the pass due?"
-open question "A rejected outcome consumes the retrieval window, so facts surfaced before the rejection can never be reinforced by a later acceptance of the same work after fixes. Intended (the fixed work's own reads re-log), or should rejection leave the window open?"
-open question "Sweep links a hit into the conflict pipeline at ANY verdict confidence (only the RESOLUTION is confidence-gated), so a low-confidence duplicate verdict still creates an open conflict a human must clear. Intended tilt toward surfacing?"

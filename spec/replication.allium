@@ -130,10 +130,23 @@ config {
 --                                 order every machine agrees on
 --   applicable(entry)             false when the entry's target is unknown
 --                                 or already present here: a fact id never
---                                 seen, an entity id absent from the
---                                 foreign-id map, an already-inserted fact
---                                 or episode (idempotence) — such entries
+--                                 seen, an already-inserted fact or
+--                                 episode (idempotence) — such entries
 --                                 SKIP, counted, never error
+--   deferred(entry)               the entry's prerequisite has not synced
+--                                 HERE yet — most visibly an update-entity
+--                                 whose foreign entity id the foreign-id
+--                                 map cannot resolve because its creating
+--                                 writer's entries have not arrived
+--                                 (decided 2026-07-26: previously a silent
+--                                 skip that lost the rename). Deferred
+--                                 entries are named in the report, hold
+--                                 their writer's high-water mark, and
+--                                 retry next reconcile
+--   advanced_marks(entries)       per writer, the new high-water mark:
+--                                 just before that writer's first entry
+--                                 that neither landed nor was already
+--                                 present (NothingIsSkippedPastSilently)
 --   remapped(entry)               the effect with foreign entity
 --                                 references resolved to LOCAL entities by
 --                                 name (via entities.allium resolution,
@@ -185,6 +198,14 @@ rule LogEffect {
                               seq: next_seq(writer_log),
                               hlc: next_hlc(writer_log),
                               effect: effect)
+
+    @guidance
+        -- A failed append never blocks the write it records — replication
+        -- is an overlay, not a gate — but it is not silent either (decided
+        -- 2026-07-26): the failure rides the write's report as a warning.
+        -- A full disk otherwise forks the log from the store with no
+        -- symptom, and every peer under-replays this writer while it
+        -- reports success.
 }
 
 -- Apply every foreign effect this store hasn't seen, in canonical order,
@@ -193,12 +214,24 @@ rule LogEffect {
 -- writers made independently (closed, not erased), and count the conflict
 -- candidates the judge should look at — contradictions neither writer
 -- could see locally become ordinary open conflicts here.
+--
+-- A deferred entry — its prerequisite not yet synced, most visibly a
+-- foreign rename whose entity has not arrived — holds its writer's mark
+-- and retries next reconcile rather than skipping (decided 2026-07-26).
+-- Two machines that renamed the same entity divergently converge by
+-- alias, not by a rename-ordering protocol (decided 2026-07-26:
+-- intended) — each replays the other's rename as an ordinary
+-- update-entity effect, so display names may end up differing between
+-- machines while the entity's identity, facts and history converge
+-- exactly. The display name is cosmetic; what must converge, does.
 rule Reconcile {
     when: Reconcile(agent)
     let entries = canonical_order(unapplied_foreign_entries())
     ensures:
         for e in entries:
-            if applicable(e):
+            if deferred(e):
+                EffectDeferred(effect: e)
+            else if applicable(e):
                 EffectApplied(effect: remapped(e))
             else:
                 EffectSkipped(effect: e)
@@ -206,7 +239,7 @@ rule Reconcile {
             f.t_invalid = now
             f.invalidation_reason = "duplicate across writers"
         SweepRecommended(candidates: sweep_candidate_count())
-        HighWaterAdvanced(entries: entries)
+        HighWaterAdvanced(marks: advanced_marks(entries))
 }
 
 -- Export everything as typed records: predicates, entities, episodes,
@@ -341,9 +374,3 @@ surface Replication {
         -- finishing as though it had been serialized throughout.
 }
 
-------------------------------------------------------------
--- Open Questions
-------------------------------------------------------------
-
-open question "Oplog append failures are swallowed silently (a failed append never blocks the write it records) — a full disk quietly forks the log from the store, and later reconciles from this writer under-replay. Should append failure at least surface a warning on the write's report?"
-open question "A foreign entity RENAME (update-entity) reaches other machines only if the entity's id is already in their foreign-id map; otherwise the entry skips silently. Two machines that renamed the same entity divergently keep both names as mutual aliases — intended convergence-by-alias, or should renames reconcile more strongly?"

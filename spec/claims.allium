@@ -268,7 +268,8 @@ config {
 --   ceiling(source_type)           the most a fact from this source may ever
 --                                  claim: decision_record 1.0, code 0.95,
 --                                  user_assertion 0.9, session_log 0.7,
---                                  agent_note 0.65, inferred 0.6, and 0.9 for
+--                                  failure_report 0.7, agent_note 0.65,
+--                                  inferred 0.6, and 0.9 for
 --                                  a source the table does not list — a fact
 --                                  re-derived 500 times stays distinguishable
 --                                  from a human decision. BOTH ends of a
@@ -280,10 +281,14 @@ config {
 --                                  the new base after a re-assertion:
 --                                  max(base, min(ceiling(source_type),
 --                                  incoming)) — never lowered by weaker
---                                  evidence, raised only up to the
---                                  EXISTING fact's source ceiling, and a
---                                  base already above its ceiling is
---                                  preserved, not clawed back.
+--                                  evidence, raised only up to the fact's
+--                                  source ceiling as it stands AFTER any
+--                                  re-sourcing (decided 2026-07-26: a
+--                                  higher-ceiling incoming source upgrades
+--                                  the fact's source_type first — see the
+--                                  reinforcement branch), and a base
+--                                  already above its ceiling is preserved,
+--                                  not clawed back.
 --   resolved_class(explicit, pred) caller's class > the predicate's
 --                                  default_epistemic > observation
 --   stronger(stated, held)         the class the caller STATED binds harder
@@ -336,7 +341,10 @@ config {
 --   1. An exact duplicate of a currently-valid fact REINFORCES it: the
 --      world (or the user) just confirmed the fact, so its disuse clock
 --      resets and its base may rise toward the source ceiling — never
---      above it, never down, and never by repetition alone. With one
+--      above it, never down, and never by repetition alone. Stronger
+--      evidence re-sources first: an incoming source whose ceiling is
+--      higher upgrades the fact's source_type, and the raised ceiling
+--      applies from that reinforcement on. With one
 --      exception: a duplicate re-asserted with an explicitly STATED class
 --      stronger than the standing fact's is an ESCALATION, and escalation
 --      supersedes rather than reinforces (see the branch).
@@ -377,7 +385,12 @@ rule AssertFact {
     -- it has to close at birth: reinforcement is a high-water mark that never
     -- claws a base back down, so a fact minted above its ceiling sits above
     -- it permanently and the trust model is defeated for that row.
-    let base = min(ceiling(source), confidence ?? config.default_confidence)
+    -- Range before ceiling (decided 2026-07-26): the stated confidence is
+    -- clamped into [0,1] first — a negative or >1 value is a caller bug,
+    -- silently corrected the same way the ceiling clamp corrects
+    -- over-claiming, and the top stops depending on the accident that the
+    -- highest ceiling is 1.0.
+    let base = min(ceiling(source), max(0.0, min(1.0, confidence ?? config.default_confidence)))
 
     ensures:
         if not exists pred:
@@ -462,6 +475,16 @@ rule AssertFact {
                 -- class reinforces like any other restatement, and an unstated
                 -- one changes nothing even on a predicate whose registry
                 -- default is commitment.
+                -- Re-sourcing (decided 2026-07-26): stronger evidence may
+                -- promote the row it confirms. An incoming source whose
+                -- ceiling is higher than the standing one's re-sources the
+                -- fact before the base moves — a decision record
+                -- re-asserting a code-derived fact lifts it toward 1.0; a
+                -- human re-asserting a session extraction lifts it out of
+                -- the 0.7 band. Both assertions' episodes stay in history,
+                -- so the promotion is auditable.
+                if ceiling(source) > ceiling(duplicate.source_type):
+                    duplicate.source_type = source
                 duplicate.last_reinforced_at = now
                 duplicate.confidence = reinforced(duplicate.confidence, confidence, duplicate.source_type)
                 FactReinforced(fact: duplicate)
@@ -713,9 +736,3 @@ surface ClaimStore {
         -- current-truth view (maintenance.allium) until resolved.
 }
 
-------------------------------------------------------------
--- Open Questions
-------------------------------------------------------------
-
-open question "Confidence is clamped to the source's ceiling at birth, but it is still never RANGE-validated: a negative confidence is stored exactly as given, and the top is bounded only incidentally, because the highest ceiling (decision_record) happens to be 1.0. Should build-time validation also clamp to [0,1], or is the ceiling the only bound worth having?"
-open question "Reinforcement caps the base at the EXISTING fact's source ceiling, so a human re-assertion of a code-derived fact can never raise it above 0.95 nor upgrade its source type. Intended asymmetry, or should stronger evidence be able to re-source a fact?"

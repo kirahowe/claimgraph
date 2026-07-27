@@ -76,16 +76,25 @@ entity GraphEntity {
 --   resolved(name, type, scope)    the layered lookup over that scope's
 --                                  entities, in precedence order:
 --                                    1. exact name match
---                                    2. exact alias match
+--                                    2. exact alias match — held by ONE
+--                                       entity; a shared alias (possible
+--                                       in stores written before the
+--                                       write-side refusal below) is
+--                                       ambiguous, never a silent pick
+--                                       (decided 2026-07-26)
 --                                    3. a UNIQUE normalized match against
 --                                       name-or-aliases, type-guarded
 --                                  Null when nothing matches: genuinely new.
---   ambiguous(name, type, scope)   two or more normalized matches — a
+--   ambiguous(name, type, scope)   two or more normalized matches — or two
+--                                  or more entities holding the name as an
+--                                  exact alias — a
 --                                  DETECTED COLLISION; the refusal carries
 --                                  the candidates so the caller can surface
 --                                  them (ingestion routes such facts to its
 --                                  error bucket instead of minting a third
 --                                  entity)
+--   alias_holders(alias, scope)    the entities in that scope holding this
+--                                  name in their alias sets
 --   duplicate_groups(facts)        currently-valid facts identical in
 --                                  (subject, predicate, object, scope,
 --                                  epistemic class), grouped — the exposure
@@ -103,7 +112,12 @@ entity GraphEntity {
 -- subjects and entity objects, ingestion, reconcile's cross-machine name
 -- remapping).
 --
---   * An exact or alias hit resolves.
+--   * An exact or alias hit resolves — regardless of the caller's type.
+--     An existing type is never verified against the caller's (decided
+--     2026-07-26: intended leniency): callers legitimately disagree on
+--     granularity, and the type guard exists only for the normalized
+--     bridge, where a wrong guess would silently weld two different
+--     things together.
 --   * A unique normalized hit resolves AND self-heals: the queried
 --     spelling is recorded as an alias, so the next lookup is exact. A
 --     resolved entity with no type picks up the caller's type.
@@ -124,24 +138,30 @@ rule EnsureEntity {
 }
 
 -- Rename in place: same entity, same facts, same history; the old name is
--- kept as an alias so references through it keep resolving. A clash with
--- another entity's exact name is refused — combining them is `merge`, a
--- deliberate act.
+-- kept as an alias so references through it keep resolving, and the NEW
+-- name is scrubbed from the alias list (decided 2026-07-26), so renaming
+-- back to a previous name never leaves an entity aliased to itself. A
+-- clash with another entity's exact name is refused — combining them is
+-- `merge`, a deliberate act.
 rule RenameEntity {
     when: RenameEntity(agent, entity, new_name)
     requires: not exists GraphEntity{name: new_name, scope: entity.scope}
     ensures:
         entity.aliases.add(entity.name)
+        entity.aliases.remove(new_name)
         entity.name = new_name
 }
 
--- Record an additional name. Refused when another entity already owns it
--- as its exact name (merge them instead). The LLM enrichment pass
--- (maintenance.allium) funnels through this same rule, so enrichment can
--- never create ambiguity either.
+-- Record an additional name. Refused when another entity already owns it —
+-- as its exact name OR among its aliases (decided 2026-07-26): a shared
+-- alias was the one name collision resolution could not refuse, and the
+-- silent pick it forced is exactly what the one law forbids. Merge the
+-- entities instead. The LLM enrichment pass (maintenance.allium) funnels
+-- through this same rule, so enrichment can never create ambiguity either.
 rule AliasEntity {
     when: AliasEntity(agent, entity, alias)
     requires: not exists GraphEntity{name: alias, scope: entity.scope}
+    requires: alias_holders(alias, entity.scope).all(h => h = entity)
     ensures: entity.aliases.add(alias)
 }
 
@@ -239,10 +259,3 @@ surface EntityCuration {
         -- collapsed twin names the one that outlived it.
 }
 
-------------------------------------------------------------
--- Open Questions
-------------------------------------------------------------
-
-open question "Two entities can hold the SAME alias (AliasEntity only refuses a clash with another entity's exact NAME, not its aliases). Resolution's alias layer then silently picks one of them — the only name-collision the ambiguity defense does not catch. Should alias clashes be refused or resolved as ambiguous?"
-open question "Renaming an entity back to a previous name leaves that name as BOTH display name and alias (update-entity dedupes aliases against each other, not against the new name). Harmless for resolution (exact wins first), but should the rename verb scrub the new name from the alias list?"
-open question "EnsureEntity backfills a missing type from the caller but never verifies an existing one — a caller asserting type namespace against an entity typed class resolves anyway (the type guard applies only to the normalized layer). Intended leniency?"

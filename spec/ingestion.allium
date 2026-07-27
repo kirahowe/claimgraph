@@ -327,6 +327,12 @@ rule IngestCodeIfChanged {
 -- session_log episode. The raw transcript is kept as evidence when the
 -- evidence tier is configured. Incomplete triples are reported as
 -- rejected; inadmissible ones ride the report with their signals.
+--
+-- The episode is left OPEN deliberately (decided 2026-07-26): sessions
+-- and failures are exactly the episodes an LLM summary makes searchable,
+-- and consolidation (maintenance.allium) is where that summary happens —
+-- the mechanical passes close their own because a digest is all they
+-- will ever have. An open episode is visible in the store, not dangling.
 rule ExtractSession {
     when: ExtractSession(agent, transcript, ref)
     ensures:
@@ -391,8 +397,13 @@ rule IngestNotes {
 -- kill outcomes. Lessons land as failure-mode facts (subject = the
 -- tool/namespace/action, object = the lesson literal), corrective
 -- practices as prefers, explicit human rulings as decided-against. Same
--- clamps and admission as the session tier; the episode is typed
--- failure_report — the valence signal outcome tracking consumes.
+-- clamps and admission as the session tier; episode AND facts are typed
+-- failure_report (decided 2026-07-26) — the episode is the valence
+-- signal outcome tracking consumes, and the facts carry the source the
+-- trust ranking names, with an explicit 0.7 ceiling in claims.allium's
+-- table, so the ranked tier is reachable and no failure fact falls back
+-- to the 0.9 default ceiling above its own cap. The episode stays open
+-- for consolidation, like the session tier's.
 rule ExtractFailure {
     when: ExtractFailure(agent, material, context, ref)
     ensures:
@@ -403,7 +414,7 @@ rule ExtractFailure {
         for c in admitted(candidates):
             AssertFact(agent: agent, subject: c.subject, predicate: c.predicate,
                        object: c.object, confidence: c.confidence,
-                       source_type: "session-log", episode: ep)
+                       source_type: "failure-report", episode: ep)
 }
 
 -- Decision records: the highest-authority source, parsed MECHANICALLY —
@@ -489,9 +500,3 @@ surface Ingestion {
         -- pointer; nothing an extractor drops is unrecoverable.
 }
 
-------------------------------------------------------------
--- Open Questions
-------------------------------------------------------------
-
-open question "Failure-tier FACTS carry source type session_log (only their episode is failure_report), because the tier reuses the session clamp. The trust table ranks failure_report, but no fact path ever produces a failure_report-typed fact — and the ceiling table has no failure_report entry at all (such a fact would fall back to the 0.9 default ceiling, ABOVE its 0.7 cap). Should failure facts be source-typed failure_report with an explicit 0.7 ceiling?"
-open question "The session and failure tiers leave their episodes OPEN for consolidation to summarize and close, while code, notes and ADR passes close their own with mechanical summaries. Intended split, or should the extraction tiers close mechanically too so an un-consolidated store has no dangling episodes?"
