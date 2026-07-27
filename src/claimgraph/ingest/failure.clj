@@ -13,8 +13,12 @@
 
   Same machinery as the session ingester: pluggable extractor, roster
   prior, 0.7 confidence cap, full conflict machinery, raw input kept as
-  evidence. The episode is typed :failure-report — the valence signal the
-  outcome-reinforcement work (roadmap #24) consumes."
+  evidence. Episode AND facts are typed :failure-report (spec/
+  ingestion.allium, decided 2026-07-26) — the episode is the valence signal
+  the outcome-reinforcement work (roadmap #24) consumes, and the facts
+  carry the source the trust ranking names, with its own 0.7 entry in
+  logic/source-ceilings so nothing falls back to the 0.9 default ceiling
+  above the tier's cap."
   (:require [clojure.string :as str]
             [claimgraph.core :as core]
             [claimgraph.ingest.session :as session]
@@ -69,7 +73,8 @@
                                   (session/entity-roster entities
                                                          (store/-entity-usage s)
                                                          session/roster-limit))
-        {:keys [facts rejected]} (session/prepare-facts (session/parse-extraction (run prompt)))
+        {:keys [facts rejected]} (session/prepare-facts (session/parse-extraction (run prompt))
+                                                        :failure-report)
         {:keys [admitted inadmissible]} (logic/screen-candidates
                                          facts (logic/admission-ctx entities predicates))]
     (if dry-run

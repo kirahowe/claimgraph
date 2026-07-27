@@ -120,20 +120,23 @@
 
 (defn prepare-facts
   "Validate and clamp extracted candidates: complete triples become facts
-  with confidence capped at 0.7 and source-type forced to :session-log;
-  incomplete ones are returned as :rejected."
-  [extracted]
-  (let [complete? (fn [m] (every? #(not (str/blank? (str (get m %))))
-                                  [:subject :predicate :object]))
-        clamp (fn [m]
-                (let [c (:confidence m)]
-                  (-> m
-                      (assoc :confidence (min max-confidence
-                                              (if (number? c) (double c) default-confidence)))
-                      (assoc :source-type :session-log))))
-        {facts true rejected false} (group-by complete? extracted)]
-    {:facts (mapv clamp facts)
-     :rejected (vec rejected)}))
+  with confidence capped at 0.7 and source-type forced — :session-log by
+  default; the failure tier passes :failure-report so its facts carry the
+  source the trust ranking names (spec/ingestion.allium, decided
+  2026-07-26). Incomplete candidates are returned as :rejected."
+  ([extracted] (prepare-facts extracted :session-log))
+  ([extracted source-type]
+   (let [complete? (fn [m] (every? #(not (str/blank? (str (get m %))))
+                                   [:subject :predicate :object]))
+         clamp (fn [m]
+                 (let [c (:confidence m)]
+                   (-> m
+                       (assoc :confidence (min max-confidence
+                                               (if (number? c) (double c) default-confidence)))
+                       (assoc :source-type source-type))))
+         {facts true rejected false} (group-by complete? extracted)]
+     {:facts (mapv clamp facts)
+      :rejected (vec rejected)})))
 
 ;; ---------------------------------------------------------------------------
 ;; Shell: extractor process + ingestion

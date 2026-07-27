@@ -41,7 +41,9 @@
             f (first facts)]
         (is (= :core/failure-mode (:predicate f))
             "the new procedural predicate resolves from snake_case")
-        (is (= :session-log (:source-type f)))
+        (is (= :failure-report (:source-type f))
+            "facts carry the source the trust ranking names, not the session tier's
+            (spec/ingestion.allium, decided 2026-07-26)")
         (is (= 0.7 (:confidence f)) "capped like all extraction")))
     (testing "the episode carries the valence type and the raw material"
       (let [ep (store/-get-episode s (:episode r))]
