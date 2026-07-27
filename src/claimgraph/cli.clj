@@ -107,9 +107,18 @@
   "Every command's output, through the canonical encoder. Command output is
   not a lesser artifact than the dump: `facts`, `history` and `episode list`
   all hand a caller timestamps, and a caller that diffs them against the dump
-  or its own clock deserves the same millisecond truth the store holds."
+  or its own clock deserves the same millisecond truth the store holds.
+
+  Degradation warnings the store surfaced during the command (an oplog
+  append that failed without blocking the write) ride the report as
+  :warnings — appended to any the command already carries, never replacing
+  them."
   [opts data]
-  (println (wire/generate-string data {:pretty (boolean (:pretty opts))})))
+  (let [ws (some-> store/*write-warnings* deref seq)]
+    (println (wire/generate-string
+              (cond-> data
+                (and (map? data) ws) (update :warnings #(into (vec %) ws)))
+              {:pretty (boolean (:pretty opts))}))))
 
 (defn- tty?
   "True when stdout is an interactive terminal — a human at a prompt, not a
@@ -145,8 +154,9 @@
     ((requiring-resolve 'claimgraph.oplog/logged-store) s (db-path opts))))
 
 (defn- with-store [opts f]
-  (let [s (open-store opts)]
-    (try (f s) (finally (store/-close s)))))
+  (binding [store/*write-warnings* (atom [])]
+    (let [s (open-store opts)]
+      (try (f s) (finally (store/-close s))))))
 
 (defn- with-write-store
   "Write commands run under the write lease (multi-writer safety, #25):

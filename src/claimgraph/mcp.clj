@@ -51,6 +51,7 @@
   (:require [clojure.string :as str]
             [claimgraph.core :as core]
             [claimgraph.logic :as logic]
+            [claimgraph.store :as store]
             [claimgraph.version :as version]
             [claimgraph.wire :as wire]))
 
@@ -359,7 +360,13 @@
       (rpc-error id -32602 (str "Unknown tool: " (:name params))
                  {:type :unknown-tool :known (vec (sort tool-names))})
       (try
-        (let [r (call-tool s db (:name params) (:arguments params))]
+        ;; Same contract as the CLI report: store-level degradation warnings
+        ;; (a failed oplog append) ride the tool result as :warnings.
+        (let [r (binding [store/*write-warnings* (atom [])]
+                  (let [r (call-tool s db (:name params) (:arguments params))
+                        ws (seq @store/*write-warnings*)]
+                    (cond-> r
+                      (and (map? r) ws) (update :warnings #(into (vec %) ws)))))]
           (result id {:content [{:type "text"
                                  :text (wire/generate-string r)}]
                       :isError false}))

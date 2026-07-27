@@ -345,9 +345,21 @@
               :append true)
         (reset! counter {:high n :size (log-size db writer)})))
     (catch Exception e
+      ;; Never blocks the write it records — replication is an overlay, not
+      ;; a gate — but never silent either (spec/replication.allium, decided
+      ;; 2026-07-26): stderr for the human at the terminal, and a structured
+      ;; warning on the write's own report for everything that parses it. A
+      ;; full disk otherwise forks the log from the store with no symptom,
+      ;; and every peer under-replays this writer while it reports success.
       (warn! "could not append " (:t effect) " to " (str (log-file db writer))
              ": " (ex-message e)
-             " — this effect will not reach any other machine"))))
+             " — this effect will not reach any other machine")
+      (store/push-write-warning!
+       {:warning :oplog-append-failed
+        :effect (:t effect)
+        :log (str (log-file db writer))
+        :error (ex-message e)
+        :note "this effect will not reach any other machine until the log is writable again"}))))
 
 (defrecord LoggedStore [inner ctx]
   Logged
@@ -401,8 +413,12 @@
       r))
   (-reinforce [_ fact-id opts]
     (let [r (store/-reinforce inner fact-id opts)]
-      (append! ctx {:t "reinforce" :fact-id fact-id
-                    :at (ms-of (:at opts)) :confidence (:confidence opts)})
+      ;; :source-type rides BESIDE the fields peers already read (additive,
+      ;; per the payload rule): an older reader reinforces without the
+      ;; re-sourcing and loses nothing it understood.
+      (append! ctx (cond-> {:t "reinforce" :fact-id fact-id
+                            :at (ms-of (:at opts)) :confidence (:confidence opts)}
+                     (:source-type opts) (assoc :source-type (:source-type opts))))
       r))
   (-all-facts [_] (store/-all-facts inner))
   (-open-episode [_ ep]
@@ -582,8 +598,10 @@
     "reinforce"
     (if (fact-exists? s (:fact-id e))
       (do (store/-reinforce s (:fact-id e)
-                            {:at (java.util.Date. (long (:at e)))
-                             :confidence (:confidence e)})
+                            (cond-> {:at (java.util.Date. (long (:at e)))
+                                     :confidence (:confidence e)}
+                              (:source-type e)
+                              (assoc :source-type (logic/->kw (:source-type e)))))
           :applied)
       :deferred)
 
