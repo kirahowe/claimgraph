@@ -135,15 +135,26 @@ compile → ingest → compile cycle is a fixed point.)
 
 ## 4. Automation: the SessionEnd hook
 
-Claude Code hooks make the loop ambient today, no daemon required:
+Claude Code hooks make the loop ambient today, no daemon required — with one
+hard-won division of labor (spec/maintenance.allium, decided 2026-08-05): the
+hook is **capture**, and capture is deterministic. `claim hooks run` does the
+delta-gated code pass and the recompile in seconds, then spawns `claim curate`
+detached and exits without waiting on it.
 
-- **SessionEnd** (or Stop): `claim ingest-notes --harness claude-code
-  --changed && claim compile-context --harness claude-code` — every
-  session ends with capture + re-compilation; every next session starts with
-  the fresh view injected.
-- `consolidate` stays the offline pass (judge, sweep, episode summaries,
-  promotion review), run periodically or from the same hook at lower
-  frequency.
+Every model call belongs to the curator: notes extraction, conflict judging,
+episode summaries, alias enrichment — one budgeted, convergent, singleton
+pass whose log lands at `<db>.curate.log`. Convergent because every call
+records a durable outcome (a verdict episode, an enrichment attempt, a closed
+episode), so what remains to do is derived from the store and a converged
+graph makes the run a free no-op. There is no consolidation stamp and no
+cadence — nothing is scheduled, everything is owed-or-done.
+
+Two lessons are baked into that shape. Model work must never sit inside a
+bounded lifecycle hook: the inline predecessor hit its 600s timeout every
+session, landed nothing, and re-queued everything. And the extractor command
+must run hermetically (neutral cwd, no project settings): `claude -p` is
+itself an agent harness, and invoked from the project it fired this very
+SessionEnd hook on exit, recursively.
 
 The skill remains the home of judgment for the direct path (commitments,
 deliberate queries, curation); the hook is the zero-effort floor beneath it.

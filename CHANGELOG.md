@@ -13,6 +13,44 @@ the whole reason they are separate numbers (`src/claimgraph/version.clj`).
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+**format-version: still 1.** Curation episodes are new *data* (`:source-type
+:curation`, refs `verdict:…` / `enrich:…`), not a new *shape*: an older reader
+treats them as ordinary episodes it has no opinion about, so nothing it
+already holds reads wrong. The consolidation stamp's removal deletes a sidecar
+file, which no reader ever parsed as an artifact.
+
+### Changed
+
+- **Session end no longer waits on a model — at all.** `hooks run` is now
+  deterministic capture (delta-gated code pass, recompile) that spawns a
+  detached `claim curate` and exits; its installed timeout drops 600s → 60s.
+  The inline notes+consolidate pass it replaces hit the 600s hook timeout
+  every session, landed nothing, and re-queued everything. Re-run
+  `claim hooks install` in each wired project to pick up the new timeout.
+- **The LLM shell-out is hermetic.** The extractor/judge command runs from a
+  neutral working directory, never the project's. The default command
+  (`claude -p`) is itself an agent harness: invoked from the project cwd it
+  loaded the project's settings and fired the SessionEnd hook on exit,
+  recursively — a measured 65-second tax on every model call.
+- **Curation converges instead of repeating.** Every delivered verdict —
+  compatible included — and every enrichment attempt (including "no aliases")
+  is recorded as a curation episode whose ref is the delta state. Verdicts
+  are final per fact-id pair; supersession mints new ids, so re-judgment
+  tracks content change, not a clock. Enrichment skips entities that appear
+  only as external dependency targets.
+- **One model-call budget replaces the consolidation cadence.** `--budget`
+  (default 20) bounds each curation run; work past it is reported deferred by
+  name and stays pending by derivation. The consolidation stamp, its 7-day
+  window, and `--consolidate-days` are gone; `setup` persists `budget`
+  instead. Delete any lingering `<db>.last-consolidate` file.
+- **The write lease is never held across a model call.** The curator holds no
+  standing write lease: only decide-bearing writes (notes ingestion, alias
+  clash-refusal) take it, briefly, per outcome. A second lease
+  (`<db>.curate.lock`, try-acquire) makes the curator a singleton — a
+  concurrent `curate` reports `already-running` and exits 0.
+
 ## [0.1.0-alpha] — 2026-07-26
 
 **format-version: 1.** The first stamped format, not a bump. Everything written
