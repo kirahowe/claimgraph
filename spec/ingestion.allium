@@ -32,6 +32,12 @@
 --   - Extraction is pluggable and optional: the LLM command defaults to an
 --     already-authenticated agent CLI; without one, extraction tiers sit
 --     out while every deterministic tier still works.
+--   - Extraction is HERMETIC (decided 2026-08-05): the command runs from a
+--     neutral working directory with no ambient harness state, because the
+--     default extractor is itself an agent harness whose own lifecycle
+--     hooks fire on exit — invoked inside the project, every extraction
+--     call re-entered the session-end loop that made it. The prompt
+--     carries everything the extractor needs; the cwd carries nothing.
 --   - Source-type caps are enforced BY THE TIERS at preparation time (and
 --     preserved afterwards by claims.allium's per-source reinforcement
 --     ceilings); the store itself trusts callers.
@@ -66,7 +72,10 @@ value InterchangeUnit {
 -- Enumerations
 ------------------------------------------------------------
 
-enum EpisodeSource { decision_record | user_assertion | code | session_log | failure_report | agent_note }
+-- curation: maintenance.allium's recorded outcomes — verdict and
+-- enrichment-attempt episodes, closed at creation. Listed here because
+-- this enum is the episode's owner; minted only by the curator.
+enum EpisodeSource { decision_record | user_assertion | code | session_log | failure_report | agent_note | curation }
 
 enum EpisodeStatus { open | closed }
 
@@ -80,12 +89,15 @@ enum AnalyzerStatus { ok | skipped | error }
 
 -- The provenance bundle: which ingestion, of what, at what state, said
 -- these facts. Also the delta state: the newest code episode's ref IS the
--- code-freshness gate, and agent-note episode refs ARE the per-file
--- ingestion memory — no extra bookkeeping surface anywhere.
+-- code-freshness gate, agent-note episode refs ARE the per-file ingestion
+-- memory, and curation episode refs ARE the judge's memory
+-- (maintenance.allium) — no extra bookkeeping surface anywhere.
 entity Episode {
     source: EpisodeSource
     ref: String                      -- code: <git-sha>[+<dirty-digest>][+partial]
                                      -- notes: <harness>:<path>@<content-hash>
+                                     -- curation: verdict:<idA>+<idB>=<relation>@<conf>
+                                     --           enrich:<entity-id>@<normalized-name>
     opened_at: Timestamp
     status: EpisodeStatus
     summary: String when status = closed

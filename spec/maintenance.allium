@@ -2,16 +2,16 @@
 -- maintenance.allium
 --
 -- Scope: What keeps the graph healthy and useful without a human in the
--- loop — the LLM conflict judge and the deferred sweep, the offline
--- consolidation pass, the deterministic compiled-context write-back, the
--- ambient session-end loop that strings the stages together, the gated
--- per-prompt coach, and outcome-driven reinforcement.
+-- loop — the LLM conflict judge and the deferred sweep, the budgeted
+-- curation pass, the deterministic compiled-context write-back, the
+-- ambient session-end capture that triggers curation without waiting on
+-- it, the gated per-prompt coach, and outcome-driven reinforcement.
 --
 -- Includes: verdicts and resolution plans; sweep candidate generation;
 --   episode summarization with mechanical fallback; alias enrichment;
 --   promotion review; the compiled view (priority order, budget, echo
---   guard); the SessionEnd stage chain; the coach gate; the retrieval log
---   and outcome marks.
+--   guard); the SessionEnd capture / detached curation split; the coach
+--   gate; the retrieval log and outcome marks.
 -- Excludes:
 --   - The write path the resolutions execute against (claims.allium)
 --   - The ingestion tiers the loop invokes (ingestion.allium)
@@ -29,6 +29,20 @@
 --   - LLM verdicts and summaries are modelled as delivered stimuli
 --     (VerdictDelivered, ...): the machine decision that ACTS on a verdict
 --     is specified exactly; the verdict itself is an external input.
+--   - The session's exit is CAPTURE only — deterministic, seconds. Every
+--     model call belongs to the detached curator (decided 2026-08-05: a
+--     bounded lifecycle moment must never carry unbounded model work; the
+--     600s-timeout deaths this replaced landed nothing and re-queued
+--     everything).
+--   - Curation state derives from the store, exactly as ingestion's delta
+--     gates do: recorded outcomes — closed episodes, verdict records,
+--     enrichment attempts — ARE the curator's memory. No stamp files, no
+--     counters, no bookkeeping surface beside the graph (decided
+--     2026-08-05; supersedes the 2026-07-26 "stamp is earned" decision —
+--     with per-outcome records there is no pass left to stamp).
+--   - A verdict is FINAL per fact-id pair: fact ids are immutable
+--     snapshots of content, so supersession mints new ids and re-judgment
+--     happens exactly when content actually changed — never on a clock.
 
 ------------------------------------------------------------
 -- External Entities
@@ -40,7 +54,13 @@ external entity Agent {
 
 -- The LLM on the other side of every judged decision: pluggable (any
 -- command; defaults to an already-authenticated agent CLI), consulted off
--- the write path only.
+-- the write path only, and invoked HERMETICALLY — neutral working
+-- directory, no ambient harness state. The default judge is itself an
+-- agent harness with lifecycle hooks of its own; a judge invoked inside
+-- the project re-enters the loop that called it (decided 2026-08-05: a
+-- trivial completion measured 4.8s hermetic vs 70.4s from the project
+-- root, the difference being the judge's own session firing this spec's
+-- SessionEnd machinery recursively).
 external entity Judge {
     command: String
 }
@@ -67,7 +87,12 @@ external entity Fact {
     conflicts_with: Set<Fact>
 }
 
--- Governed by ingestion.allium; consolidation closes the open ones.
+-- Governed by ingestion.allium; curation closes the open ones and mints
+-- its own (source curation) as the durable record of judged outcomes:
+--   verdict:<idA>+<idB>=<relation>@<confidence>   (fact ids, sorted)
+--   enrich:<entity-id>@<normalized-name>
+-- The refs are the delta state — sweep and enrichment plan against them
+-- the way ingestion's tiers plan against note and code refs.
 external entity Episode {
     ref: String
     status: open | closed
@@ -97,11 +122,16 @@ enum SweepReason { exclusive_values | cross_predicate }
 
 config {
     judge_min_confidence: Decimal = 0.8   -- gate for ACTING on a verdict
-    consolidate_every: Duration = 7.days
+    curation_call_budget: Integer = 20    -- model calls per curation run; the
+                                          -- ONE bound (replaces the 7-day
+                                          -- cadence and the per-stage caps):
+                                          -- recorded outcomes make every call
+                                          -- durable progress, so runs converge
+                                          -- toward the free no-op pass and a
+                                          -- cadence has nothing left to ration
     context_budget_bytes: Integer = 25000 -- the harness's injection window
     max_context_facts: Integer = 50
     supersession_window: Duration = 30.days
-    max_enrichment_entities: Integer = 20
     max_aliases_per_entity: Integer = 3
     promotion_min_usage: Integer = 3
     coach_max_per_section: Integer = 3
@@ -116,11 +146,26 @@ config {
 --   open_conflict_pairs()          flagged fact + linked candidate, both
 --                                  currently valid: newer side vs
 --                                  established side
+--   recorded_verdict(a, b)         the verdict episode for this fact-id
+--                                  pair (relation and confidence parsed
+--                                  back out of its ref), or null. Final
+--                                  per pair: content changes mint new ids
+--   verdict_ref(a, b, relation, confidence)
+--                                  "verdict:<idA>+<idB>=<relation>@<conf>",
+--                                  ids sorted — one spelling, minted in
+--                                  one place, parsed by recorded_verdict
+--   enrichment_attempted(entity)   an "enrich:<entity-id>@<normalized-
+--                                  name>" episode exists: this entity was
+--                                  asked at this name. A rename changes
+--                                  the normalized name and reopens
+--                                  eligibility; an answered [] does not —
+--                                  no-aliases is an answer, not a failure
 --   sweep_candidates()             the judgeable pairs the write path
 --                                  can't see, generated per subject over
 --                                  its currently-valid facts (bounded per
 --                                  subject, never O(graph²)), skipping
---                                  already-linked pairs:
+--                                  already-linked pairs AND pairs with a
+--                                  recorded verdict:
 --                                    exclusive_values — multiple values of
 --                                      a value-exclusive predicate (two
 --                                      prefers on one subject tend to be
@@ -141,20 +186,37 @@ config {
 --                                  frequencies) — the pass always makes
 --                                  progress
 --   enrichment_candidates()        alias-less, fact-bearing entities,
---                                  most-used first, at most
---                                  max_enrichment_entities per pass
+--                                  most-used first, minus the attempted
+--                                  (enrichment_attempted) and minus
+--                                  entities the project's own knowledge
+--                                  never touches — one that appears ONLY
+--                                  as the target of external-scoped
+--                                  dependency edges is somebody else's
+--                                  library, and inventing searchable
+--                                  names for clojure.string is spent
+--                                  budget (observed 2026-08-05: the
+--                                  top-usage candidates were exactly
+--                                  those)
 --   promotion_candidates()         testing-status predicates used at least
 --                                  promotion_min_usage times — worth
 --                                  promoting to core/* (or pruning)
 --   compiled_view(budget)          the deterministic managed-section
 --                                  content (see CompileContext)
---   due_for_consolidation(at)      the consolidation stamp is absent or
---                                  older than consolidate_every; only a
---                                  CLEAN pass stamps (see Consolidate)
 --   sub_stage_errors()             the internally-caught failures the
 --                                  running pass accumulated (episode
 --                                  summaries, judge, sweep, enrichment) —
---                                  each is a report entry, never an abort
+--                                  each is a report entry, never an
+--                                  abort. Report only: a failed call
+--                                  minted no outcome record, so its work
+--                                  is still pending BY DERIVATION and the
+--                                  next run retries it
+--   curation_lease_available()     the curation lease (replication.allium
+--                                  mechanics, second instance beside the
+--                                  write lease) is free or expired — a
+--                                  try-acquire, never a wait: two
+--                                  curators racing would buy the same
+--                                  verdicts twice, and the loser's work
+--                                  is already derivable by the winner
 --   retrieved_since_last_mark(agent)
 --                                  the facts the read verbs surfaced since
 --                                  the previous outcome mark (the local
@@ -165,26 +227,50 @@ config {
 --                                  failure-mode facts, open conflicts on
 --                                  the entities in play
 
--- Ask the judge about every open conflict. Enrich-only by default: the
--- verdicts and plans are reported, nothing is acted on unless resolve was
--- requested.
+-- Ask the judge about every open conflict THE JUDGE HAS NOT ALREADY
+-- ANSWERED. Enrich-only by default: the verdicts and plans are reported,
+-- nothing is acted on unless resolve was requested. A pair with a
+-- recorded verdict never costs a second model call: an enrich-only run
+-- skips it (the record already enriches the conflict listing), and a
+-- resolve run re-delivers the RECORDED verdict to ApplyVerdict — acting
+-- on knowledge the graph holds is free (decided 2026-08-05).
 rule JudgeConflicts {
     when: JudgeConflicts(agent, resolve, min_confidence?)
     ensures:
         for pair in open_conflict_pairs():
-            VerdictRequested(newer: pair.fact, established: pair.candidate,
-                             resolve: resolve,
-                             min_confidence: min_confidence ?? config.judge_min_confidence)
+            let seen = recorded_verdict(pair.fact, pair.candidate)
+            if seen = null:
+                VerdictRequested(newer: pair.fact, established: pair.candidate,
+                                 resolve: resolve,
+                                 min_confidence: min_confidence ?? config.judge_min_confidence)
+            else if resolve:
+                VerdictDelivered(judge: seen.judge, newer: pair.fact,
+                                 established: pair.candidate,
+                                 verdict: seen.relation, confidence: seen.confidence,
+                                 resolve: resolve,
+                                 min_confidence: min_confidence ?? config.judge_min_confidence)
 }
 
--- Act on one delivered verdict. A contradicts verdict is NEVER
--- auto-resolved — surfacing genuine contradictions to the human is the
--- point of the flag machinery. Everything else acts only when resolve was
--- requested AND the verdict clears the confidence gate; otherwise the
--- pair stays open and the verdict merely enriches the report.
+-- Act on one delivered verdict, and RECORD it first: the verdict episode
+-- is the durable outcome that makes this call never happen again for
+-- this pair (idempotent on re-delivery — recording what is already
+-- recorded is a no-op, which is how a resolve run acts on a stored
+-- verdict without duplicating its record). A contradicts verdict is
+-- NEVER auto-resolved — surfacing genuine contradictions to the human is
+-- the point of the flag machinery. Everything else acts only when
+-- resolve was requested AND the verdict clears the confidence gate;
+-- otherwise the pair stays open and the verdict enriches the report and
+-- the record.
 rule ApplyVerdict {
     when: VerdictDelivered(judge, newer, established, verdict, confidence, resolve, min_confidence)
+    requires: verdict != unparseable   -- no delivery, no record: an
+                                       -- unanswered question is retried,
+                                       -- bounded by the budget, while a
+                                       -- recorded non-answer would skip a
+                                       -- real conflict forever
     ensures:
+        VerdictRecorded(ref: verdict_ref(newer, established, verdict, confidence),
+                        evidence: judge_raw_reply_when_evidence_configured)
         if verdict = contradicts:
             HumanReviewRequired(newer: newer, established: established)
         else if resolve and confidence >= min_confidence:
@@ -203,10 +289,17 @@ rule ApplyVerdict {
                 newer.conflicts_with.remove(established)
 }
 
--- The deferred sweep: generate candidates, judge each once, and LINK the
--- genuine hits into the same conflict pipeline the write path feeds.
--- Compatible and unparseable verdicts are dropped silently — a noisy
--- generator can't mutate anything. The LLM never runs on the write path.
+-- The deferred sweep: generate candidates, judge each ONCE EVER, and LINK
+-- the genuine hits into the same conflict pipeline the write path feeds.
+-- "Once ever" is structural, not remembered-in-place: sweep_candidates
+-- skips recorded pairs, and every delivered verdict — compatible
+-- included — cascades to ApplyVerdict, which records it (decided
+-- 2026-08-05; previously compatible verdicts were dropped silently, so
+-- the same benign pairs were re-bought from the judge every pass — 13 of
+-- them, every session, in the store that surfaced this). Only an
+-- unparseable reply leaves no record: a noisy generator still can't
+-- mutate anything, and an unanswered candidate retries under the next
+-- run's budget. The LLM never runs on the write path.
 rule SweepConflicts {
     when: SweepConflicts(agent, resolve, min_confidence?)
     ensures:
@@ -222,46 +315,63 @@ rule SweepConflicts {
 -- duplicate verdict still opens a conflict for a human to clear: open
 -- conflicts are cheap to list, a later judge pass auto-closes the easy
 -- ones, and gating the LINK would drop possible duplicates silently.
+-- Every parseable verdict cascades — the record is minted downstream in
+-- ApplyVerdict, one minting site for both the flagged and swept paths;
+-- for a compatible verdict on a never-linked pair the cascade's unlink
+-- is a no-op and the record is the entire effect.
 rule ApplySweepVerdict {
     when: SweepVerdictDelivered(judge, newer, established, verdict, confidence, resolve, min_confidence)
-    requires: verdict = contradicts or verdict = duplicate or verdict = supersedes
+    requires: verdict != unparseable
     ensures:
-        newer.conflicts_with.add(established)
+        if verdict = contradicts or verdict = duplicate or verdict = supersedes:
+            newer.conflicts_with.add(established)
         VerdictDelivered(judge: judge, newer: newer, established: established,
                          verdict: verdict, confidence: confidence, resolve: resolve,
                          min_confidence: min_confidence)
 }
 
--- The Dreaming-style offline pass, at consolidation cadence: close open
+-- The Dreaming-style maintenance stages: judge what's flagged, close open
 -- fact-bearing episodes with summaries (summaries are full-text indexed,
 -- so episodic history becomes searchable — "why did we do X" is a query),
--- judge and sweep, enrich retrieval, report promotion candidates.
--- Open-but-EMPTY episodes are left alone — they may belong to a session
--- still in flight.
+-- sweep, enrich retrieval, report promotion candidates. Open-but-EMPTY
+-- episodes are left alone — they may belong to a session still in flight.
 --
--- The stamp is earned, not scheduled (decided 2026-07-26): it is written
--- only when every sub-stage ran clean. An errored sub-stage (a broken
--- judge, a failed enrichment call) still lands in the report without
--- aborting its siblings — but it withholds the stamp, so the pass stays
--- DUE and the next session retries, mirroring ingestion's delta gate,
--- where a degraded pass leaves the gate unsatisfied. Stamping over an
--- error would postpone the failed stage a full consolidation window.
+-- There is no stamp and no cadence (decided 2026-08-05; supersedes the
+-- 2026-07-26 stamp decision): every model call lands a durable outcome —
+-- a recorded verdict, a closed episode, an attempted enrichment — so
+-- what remains to do is DERIVED, each run shrinks the remainder, and a
+-- converged store makes this pass a free no-op. The stamp existed to
+-- ration a pass that redid all its work every time; a pass that never
+-- redoes work has nothing to ration. Its failure mode is also gone: the
+-- stamp-withholding rule meant one errored sub-stage re-queued the WHOLE
+-- pass, and a pass that could not finish inside its caller's timeout was
+-- permanently due — every session paid the full timeout and landed
+-- nothing.
 rule Consolidate {
-    when: Consolidate(agent, resolve)
+    when: Consolidate(agent, resolve, budget?)
     ensures:
+        JudgeConflicts(agent: agent, resolve: resolve)
         for ep in open_fact_bearing_episodes():
             EpisodeSummaryRequested(episode: ep)
-        JudgeConflicts(agent: agent, resolve: resolve)
         SweepConflicts(agent: agent, resolve: resolve)
         for e in enrichment_candidates():
-            -- alias-less, fact-bearing entities, most-used first, bounded
-            -- per pass — aliases are the training-free path to
-            -- semantic-ish retrieval (full-text indexed; the entity
-            -- resolution route honours them)
+            -- aliases are the training-free path to semantic-ish
+            -- retrieval (full-text indexed; the entity resolution route
+            -- honours them)
             AliasSuggestionsRequested(entity: e)
         PromotionReview(candidates: promotion_candidates())
-        if sub_stage_errors().count = 0:
-            ConsolidationStamped(at: now)
+
+    @guidance
+        -- The stages share ONE model-call budget (budget ??
+        -- config.curation_call_budget), spent in the order written:
+        -- judgments before summaries before sweep before enrichment,
+        -- most valuable first. A stage the budget does not reach — or
+        -- reaches partway — defers the remainder BY NAME in the report
+        -- (no silent caps): deferred work is still pending by derivation
+        -- and the next run picks it up exactly where the budget ran out.
+        -- Requests that would re-ask a recorded outcome cost nothing and
+        -- are not requests at all — the budget meters the judge, not the
+        -- planner.
 }
 
 -- An episode summary lands (LLM, or the mechanical digest when the LLM is
@@ -279,9 +389,18 @@ rule CloseEpisodeWithSummary {
 -- clash with another entity's name is refused there and skipped here —
 -- enrichment must never create ambiguity. Failures skip silently:
 -- enrichment is a bonus, never a blocker.
+--
+-- The DELIVERY is recorded, whatever it contained: an "enrich:" episode
+-- marks this entity asked-at-this-name, so an answered [] is never asked
+-- again (decided 2026-08-05; previously an empty answer left the entity
+-- a candidate forever, and the same twenty entities were re-bought every
+-- pass). A call that ERRORS mints nothing — it retries under a later
+-- budget. A rename changes the normalized name in the ref, which is
+-- exactly when the question is genuinely new.
 rule ApplyAliasSuggestions {
     when: AliasSuggestionsDelivered(judge, entity, suggestions)
     ensures:
+        EnrichmentAttemptRecorded(entity: entity)
         for a in suggestions:
             AliasEntity(agent: judge, entity: entity, alias: a)
 }
@@ -311,24 +430,53 @@ rule CompileContext {
                                    content: compiled_view(config.context_budget_bytes))
 }
 
--- The SessionEnd pass: the whole ambient loop in one verb. Stages are
--- attempted INDEPENDENTLY — an analyzer or extractor failure must never
--- stop the deterministic recompile; a failed stage is an error entry in
--- the report, not an abort. Code runs FIRST so extraction's entity roster
--- and conflict ground truth are fresh, and it is delta-gated (free when
--- nothing changed); the code-ingest setting opts a project with an
--- expensive analyzer out. Consolidation runs at lower frequency, gated by
--- a stamp: due when the stamp is absent or older than the window — and
--- only a clean pass stamps, so an errored sub-stage comes back due next
--- session rather than next window.
+-- The detached curation run: everything the graph wants from a model, in
+-- one budgeted, convergent, SINGLETON pass. Notes extraction runs first
+-- (the just-ended session's knowledge is the freshest and the loop's
+-- whole point), then the maintenance stages, then the recompile so the
+-- next session's injected view carries what curation just learned.
+--
+-- Singleton by try-acquire on the curation lease (replication.allium's
+-- lease mechanics, second instance, wait 0): a live curator means this
+-- run's work is already in hand — exit quietly, the remainder derives.
+-- Stages are attempted INDEPENDENTLY (an extractor failure must never
+-- stop the recompile), and the write lease is never held across a model
+-- call — a curator mid-thought must not block the next session's
+-- capture. The lease guards DECISIONS, not appends: the curator takes it
+-- briefly around its decide-bearing writes — notes ingestion's conflict
+-- machinery, alias clash-refusal — so every decision reads the store as
+-- it is at apply time; its decide-free writes (verdict records, conflict
+-- links, episode closures) are append-shaped, idempotent on their refs,
+-- and take no lease at all, the same logic by which reads never do.
+rule Curate {
+    when: Curate(agent, harness, project, budget?)
+    let held = curation_lease_available()
+    requires: held   -- else: exit, not an error; the live curator owns it
+    ensures:
+        IngestNotes(agent: agent, harness: harness, notes: project)
+        Consolidate(agent: agent, resolve: false,
+                    budget: budget ?? config.curation_call_budget)
+        CompileContext(agent: agent, target_file: project)
+}
+
+-- The SessionEnd pass is CAPTURE, and capture is deterministic: the
+-- delta-gated code pass (first, so the curator's entity roster and
+-- conflict ground truth are fresh; the code-ingest setting opts a
+-- project with an expensive analyzer out), the recompile, and the
+-- DETACHED hand-off to curation. The session's exit never waits on a
+-- model (decided 2026-08-05): the curator is spawned, not awaited — its
+-- report lands in the curation episodes and its log, and a curator that
+-- dies leaves derived work pending for the next run rather than a
+-- half-done pass someone must notice. The recompile here is not
+-- redundant with the curator's: this one guarantees the freshest
+-- DETERMINISTIC view even if the curator never starts; the curator's
+-- adds what extraction and judging learned.
 rule AmbientSessionEnd {
     when: SessionEnded(harness, agent, project)
     ensures:
         IngestCodeIfChanged(agent: agent, root: project, scope: "code")
-        IngestNotes(agent: agent, harness: project, notes: project)
         CompileContext(agent: agent, target_file: project)
-        if due_for_consolidation(now):
-            Consolidate(agent: agent, resolve: false)
+        CurationDetached(harness: harness, agent: agent, project: project)
 }
 
 -- The gated push: given what the agent is about to do, decide WHETHER the
@@ -384,7 +532,8 @@ surface Maintenance {
     provides:
         JudgeConflicts(agent, resolve, min_confidence?)
         SweepConflicts(agent, resolve, min_confidence?)
-        Consolidate(agent, resolve)
+        Consolidate(agent, resolve, budget?)
+        Curate(agent, harness, project, budget?)
         CompileContext(agent, target_file)
         OutcomeAccepted(agent)
         OutcomeRejected(agent)
@@ -396,6 +545,18 @@ surface Maintenance {
     @guarantee EnrichOnlyByDefault
         -- Judge and sweep report; invalidation and unlinking happen only
         -- under an explicit resolve request, gated by verdict confidence.
+
+    @guarantee EveryCallLandsAnOutcome
+        -- Each model call the curator makes leaves a durable record — a
+        -- recorded verdict, a closed episode, an attempted enrichment —
+        -- so no unchanged pair is re-judged and no attempted entity is
+        -- re-asked, ever. Runs converge toward the free no-op pass;
+        -- "due" is derived from these records and from nowhere else.
+
+    @guarantee DeferredNeverSilent
+        -- Work the budget did not reach is named in the run's report,
+        -- and stays pending by derivation for the next run. A bounded
+        -- run never reads as a complete one.
 
     @guarantee DeterministicCompile
         -- The compiled view involves no LLM and depends only on the graph
@@ -429,7 +590,17 @@ surface JudgeIntegration {
         -- The LLM never runs on the write path; a slow, absent or
         -- unparseable judge degrades maintenance, never assertion. An
         -- unparseable response counts as a zero-confidence verdict — one
-        -- bad judgment never kills a batch.
+        -- bad judgment never kills a batch. And no caller holds the
+        -- write lease across a judge call: reads happen leaselessly, the
+        -- judge answers, and the outcome is applied under its own short
+        -- hold with the premise re-checked.
+
+    @guarantee HermeticJudge
+        -- The judge command runs with no ambient harness state: neutral
+        -- working directory, no project settings, no lifecycle hooks. A
+        -- judge that is itself an agent harness must not re-enter the
+        -- loop that invoked it — recursion here is not a bug in degree
+        -- but in kind, and it is excluded by construction, not by guard.
 }
 
 -- The harness boundary: the two hook events the ambient loop hangs off.
@@ -444,5 +615,12 @@ surface HarnessIntegration {
         -- Capture in, injection out: once the hooks are wired, the loop
         -- feeds the graph at session end and starts the next session with
         -- the compiled view — with no change to how anyone works.
+
+    @guarantee ExitNeverWaitsOnAModel
+        -- The SessionEnd path is deterministic end to end: delta-gated
+        -- code pass, recompile, detach. Every model call belongs to the
+        -- curator, which the exiting session spawns and does not await.
+        -- The hook's timeout is sized for capture, and hitting it is a
+        -- bug, not a budget.
 }
 

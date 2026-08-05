@@ -72,6 +72,14 @@ value Effect {
 -- short-lived CLI invocations, so waiting a few seconds covers real
 -- contention, and anything longer deserves a loud store-locked error
 -- naming the holder.
+--
+-- Two instances share these mechanics (decided 2026-08-05): the WRITE
+-- lease serializing store mutations, and the CURATION lease (a second
+-- file beside it) making maintenance.allium's curator a singleton. Same
+-- entity, same TTL, same heartbeat and token discipline; they differ
+-- only in what acquisition means — a write acquirer waits lease_wait
+-- then fails loud, a curation acquirer never waits at all (a live
+-- curator means the work is already in hand; exiting is success).
 entity Lease {
     holder: String
     token: String                    -- release is token-guarded: only the
@@ -363,14 +371,27 @@ surface Replication {
         -- against the live store regardless of who holds it.
 
     @guarantee LeaseOutlivesTheOperationItGuards
-        -- A lease is held for as long as its operation runs, however long
-        -- that is: the passes that hold it longest call out to a model
-        -- dozens of times, and a TTL short enough to free a crashed writer
-        -- promptly is far shorter than they take. Renewal is conditional on
-        -- still holding it — a holder that renews unconditionally overwrites
-        -- the writer who legitimately took over after a genuine expiry,
-        -- which is worse than the race, because the victim believes it holds
-        -- the store. A holder that loses its lease learns so rather than
-        -- finishing as though it had been serialized throughout.
+        -- A lease is held for as long as its operation runs, and renewal
+        -- is conditional on still holding it — a holder that renews
+        -- unconditionally overwrites the writer who legitimately took
+        -- over after a genuine expiry, which is worse than the race,
+        -- because the victim believes it holds the store. A holder that
+        -- loses its lease learns so rather than finishing as though it
+        -- had been serialized throughout.
+
+    @guarantee NeverHeldAcrossAModelCall
+        -- No operation holds the write lease while a model is thinking
+        -- (decided 2026-08-05; this rewrites the original rationale for
+        -- long holds, which was exactly the curator's dozens of calls).
+        -- The curator gathers its material and the model's answer
+        -- leaselessly, then takes the lease briefly around each
+        -- DECIDE-BEARING application — notes ingestion's conflict
+        -- machinery, alias clash-refusal — so the decision itself reads
+        -- the store as it is at apply time, which is what makes the
+        -- leaseless gathering safe. Decide-free applications (verdict
+        -- records, conflict links, episode closures) are append-shaped
+        -- and idempotent and take no lease, by the same reasoning that
+        -- reads never do. A session's capture must never queue behind
+        -- someone else's slow completion.
 }
 
