@@ -8,8 +8,19 @@
   under the SessionEnd hook a single hung call eats the hook's whole 600s
   budget. The bound is 120s, overridable per install via
   $CLAIMGRAPH_LLM_TIMEOUT_MS; on expiry the child's process tree dies with
-  the call rather than outliving it."
-  (:require [babashka.process :as p]
+  the call rather than outliving it.
+
+  Every call is also HERMETIC: the child runs from the system temp dir, never
+  the caller's cwd. The default command is itself an agent harness (Claude
+  Code CLI) — spawned from a project directory, it loads that project's
+  .claude/settings.json and fires the project's SessionEnd hooks on exit,
+  recursively re-entering the claimgraph hook machinery that made the call in
+  the first place. Measured: an identical trivial completion took 4.8s from a
+  neutral directory versus 70.4s from the project root, the difference being
+  exactly that recursive session teardown. A neutral cwd excludes the
+  recursion by construction rather than leaving it to be guarded against."
+  (:require [babashka.fs :as fs]
+            [babashka.process :as p]
             [clojure.string :as str]
             [claimgraph.logic :as logic]))
 
@@ -79,11 +90,20 @@
 (defn complete!
   "Send prompt on stdin to cmd; return stdout. Throws on non-zero exit, and on
   a timeout (opts :timeout-ms, else the env/default resolution above) after
-  killing the child's process tree."
+  killing the child's process tree.
+
+  Runs the child with :dir pinned to the system temp dir, resolved fresh on
+  every call rather than once at load time — a neutral cwd, never the
+  caller's. cmd is by default itself an agent harness (Claude Code CLI):
+  spawned inside a project it would load that project's settings and fire
+  its SessionEnd hooks on exit, re-entering the very hook machinery that is
+  making this call. Pinning the cwd excludes that recursion by construction."
   ([cmd prompt] (complete! cmd prompt nil))
   ([cmd prompt {ms :timeout-ms}]
    (let [ms (timeout-ms ms)
-         proc (p/process (p/tokenize cmd) {:in :pipe :out :string :err :string})
+         proc (p/process (p/tokenize cmd)
+                          {:in :pipe :out :string :err :string
+                           :dir (str (fs/temp-dir))})
          _ (feed-stdin! proc prompt)
          result (deref proc ms ::timeout)]
      (if (= ::timeout result)

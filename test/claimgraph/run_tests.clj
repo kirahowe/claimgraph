@@ -15,6 +15,7 @@
             [claimgraph.hooks-test]
             [claimgraph.judge-test]
             [claimgraph.lease-test]
+            [claimgraph.llm-test]
             [claimgraph.load-test]
             [claimgraph.mcp-test]
             [claimgraph.logic-test]
@@ -43,6 +44,7 @@
                                           'claimgraph.coach-test
                                           'claimgraph.outcome-test
                                           'claimgraph.lease-test
+                                          'claimgraph.llm-test
                                           'claimgraph.mcp-test
                                           'claimgraph.oplog-test
                                           'claimgraph.context-test
