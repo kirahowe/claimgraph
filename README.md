@@ -57,8 +57,8 @@ claim setup                           # the whole onboarding, one idempotent com
 ```
 
 `claim setup` creates and seeds the store (`./.claimgraph/db`), gitignores
-it and every sibling it writes — the lock, the evidence dir, the oplog, the
-retrieval log, the consolidation stamp, the format stamp — in one
+it and every sibling it writes — the write lock, the curation lock and log,
+the evidence dir, the oplog, the retrieval log, the format stamp — in one
 marker-delimited block, so a later release that adds a sibling edits the
 block instead of appending a second one (the committable artifacts are
 `claim dump` output and `.claimgraph/config.json`), installs the agent skill into
@@ -181,7 +181,7 @@ layer set it, and the fully resolved paths.
 | LLM command | `--extractor` / `--command` | `CLAIMGRAPH_LLM_CMD` | `claude -p` |
 | LLM call timeout (ms) | `--llm-timeout-ms` | `CLAIMGRAPH_LLM_TIMEOUT_MS` | `120000` |
 | raw-evidence dir | `--evidence-dir` | `CLAIMGRAPH_EVIDENCE_DIR` | `<db>.evidence` |
-| consolidation cadence (days) | `--consolidate-days` | `CLAIMGRAPH_CONSOLIDATE_DAYS` | `7` |
+| curation call budget | `--budget` | `CLAIMGRAPH_BUDGET` | `20` |
 | ambient code refresh | `--code-ingest` | `CLAIMGRAPH_CODE_INGEST` | `session-end` (or `manual`) |
 
 A setting's name is its flag, always: `--notes-dir` sets `notes-dir`. Where a
@@ -470,19 +470,34 @@ scans never reinforce — only intent writes do.
 
 - `hooks install` / `hooks run` — the ambient loop, automated: a Claude Code
   SessionEnd hook (wired by `hooks install` into the project's hook settings
-  — default `.claude/settings.json`, overridable via `--settings-file`)
-  runs `ingest-code-if-changed` → `ingest-notes` → `compile-context` →
-  `consolidate`-when-due (stamp-gated, default weekly) at the end of every
-  session. The code stage runs first (so extraction's entity roster and
-  conflict ground truth are fresh) and is delta-gated: every code pass
-  closes its episode with ref `<git-sha>[+<dirty-digest>]`, and the stage
-  skips in milliseconds when the current ref matches the newest code
-  episode's — teammates' pulled changes reconcile mechanically at the next
-  session end, no agent judgment in the loop. `code-ingest: manual` opts a
-  project with an expensive analyzer out; non-git projects always run
-  (matching manual semantics). Stages report independently — an analyzer or
-  extractor failure never blocks the deterministic recompile. Capture in,
-  injection out, zero behavior change required.
+  — default `.claude/settings.json`, overridable via `--settings-file`) runs
+  `ingest-code-if-changed` → `compile-context` → spawn `curate`, at the end
+  of every session. **The session's exit is capture, and capture is
+  deterministic**: it takes seconds and never waits on a model. The code
+  stage runs first (so the curator's entity roster and conflict ground truth
+  are fresh) and is delta-gated: every code pass closes its episode with ref
+  `<git-sha>[+<dirty-digest>]`, and the stage skips in milliseconds when the
+  current ref matches the newest code episode's — teammates' pulled changes
+  reconcile mechanically at the next session end, no agent judgment in the
+  loop. `code-ingest: manual` opts a project with an expensive analyzer out;
+  non-git projects always run (matching manual semantics). Stages report
+  independently — an analyzer failure never blocks the deterministic
+  recompile. Capture in, injection out, zero behavior change required.
+- `curate` — the detached run the hook hands off to, and where every model
+  call in the ambient loop lives: `ingest-notes` (the just-ended session's
+  knowledge is the freshest), then `consolidate` (enrich-only), then
+  `compile-context` so the next session's injected view carries what curation
+  learned. Spawned, never awaited; its output goes to `<db>.curate.log`. One
+  model-call budget spans the run (`--budget`, default 20) and every call
+  lands a durable outcome — a recorded verdict, a closed episode, a recorded
+  enrichment attempt — so what is left to do is *derived* from the store,
+  each run shrinks the remainder, and a converged store makes the pass a free
+  no-op. Whatever the budget did not reach is named in the report and picked
+  up next run. A singleton: a second curator finding the curation lease
+  (`<db>.curate.lock`) held reports `already-running` and exits 0, because
+  the live one's work covers it. It holds no standing write lease — it takes
+  one per applied outcome and never across a model call, so a session's
+  capture is never queued behind somebody else's completion.
 - `compile-context` — the write-back half of the ambient loop
   (`docs/consuming-auto-memory.md`): compiles the graph's current view into a
   marker-delimited managed section at the head of the file the harness

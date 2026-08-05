@@ -217,6 +217,52 @@
       (let [r (notes/ingest! s {:dir (str dir "/nope") :extractor-fn (fn [_] "")})]
         (is (= :no-notes-dir (:status r)))))))
 
+;; ---------------------------------------------------------------------------
+;; Shell: the budget gate and the write wrapper the curator drives this with
+;; ---------------------------------------------------------------------------
+
+(def ^:private one-fact
+  "{\"subject\":\"AuthService\",\"predicate\":\"prefers\",\"object\":\"Result types\",\"object_kind\":\"literal\",\"class\":\"preference\"}")
+
+(deftest a-file-the-budget-cannot-reach-is-deferred-not-dropped
+  (let [dir (temp-notes-dir)
+        s (doto (mem/create) (core/seed!))
+        calls (atom 0)
+        extractor (fn [_] (swap! calls inc) one-fact)
+        budget (fn [n] (let [spent (atom 0)]
+                         (fn [] (when (< @spent n) (swap! spent inc) true))))]
+    (spit (str dir "/a.md") "note a\n")
+    (spit (str dir "/b.md") "note b\n")
+
+    (let [r (notes/ingest! s {:dir dir :extractor-fn extractor :spend! (budget 1)})]
+      (is (= 2 (:files-changed r)) "the delta gate still names everything that moved")
+      (is (= 1 (count (:files r))))
+      (is (= 1 (:deferred r)) "and a bounded run never reads as a complete one")
+      (is (= 1 @calls) "the deferred file was never extracted"))
+
+    (testing "no bookkeeping brings it back — its hash still has no episode"
+      (let [r (notes/ingest! s {:dir dir :extractor-fn extractor})]
+        (is (= 1 (:files-changed r)))
+        (is (nil? (:deferred r)))
+        (is (= 2 @calls))))))
+
+(deftest the-write-runs-inside-apply-and-the-model-call-outside-it
+  (let [dir (temp-notes-dir)
+        s (doto (mem/create) (core/seed!))
+        trace (atom [])]
+    (spit (str dir "/a.md") "note a\n")
+    (notes/ingest! s {:dir dir
+                      :extractor-fn (fn [_] (swap! trace conj :extract) one-fact)
+                      :apply! (fn [f]
+                                (swap! trace conj :enter)
+                                (let [v (f)] (swap! trace conj :leave) v))})
+    (is (= [:extract :enter :leave] @trace)
+        "ingestion runs the full conflict machinery per fact, so its WRITE is what
+         has to be serialized — a wrapper around the extraction would hold a lease
+         across a completion and queue every other writer behind it")
+    (is (seq (:facts (core/get-facts s {:entity "AuthService"})))
+        "and the write still landed")))
+
 (defn- context-compile-into [dir s]
   ((requiring-resolve 'claimgraph.context/compile!) s {:harness "codex" :dir dir}))
 

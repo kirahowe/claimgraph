@@ -156,8 +156,16 @@
                     :hash (content-hash content)}))))
        vec))
 
-(defn- ingest-note! [s run harness-id {:keys [path content hash]}
-                     {:keys [predicates roster actx evidence-dir dry-run]}]
+(defn- ingest-note!
+  "Extract one note revision and write what it said.
+
+  The extraction call is OUTSIDE `apply!` and the write is INSIDE it: this is
+  the one write in the pass that decides anything (the full conflict machinery
+  runs per fact), so it is the one that has to be serialized against other
+  writers — and a lease held across the model call would block the next
+  session's capture for the length of a completion."
+  [s run harness-id {:keys [path content hash]}
+   {:keys [predicates roster actx evidence-dir dry-run apply!]}]
   (let [prompt (extraction-prompt path content predicates roster)
         {:keys [facts demoted rejected]} (prepare-note-facts (session/parse-extraction (run prompt)))
         {:keys [admitted inadmissible]} (logic/screen-candidates facts actx)
@@ -166,23 +174,25 @@
       (cond-> {:file path :hash hash :status :dry-run :facts facts
                :demoted demoted :rejected rejected}
         (seq inadmissible) (assoc :inadmissible inadmissible))
-      (let [ref (episode-ref harness-id path hash)
-            evidence (when evidence-dir
-                       ((requiring-resolve 'claimgraph.evidence/write!)
-                        evidence-dir content))
-            result (core/ingest s {:source-type :agent-note :ref ref
-                                   :evidence evidence}
-                                facts)]
-        (core/close-episode s {:episode (:episode result)
-                               :summary (str "notes ingest " ref ": "
-                                             (:total result) " facts ("
-                                             (pr-str (:counts result)) "), "
-                                             demoted " demoted, "
-                                             (count rejected) " rejected")})
-        (-> result
-            (assoc :file path :hash hash :demoted demoted)
-            (cond-> (seq inadmissible) (assoc :inadmissible inadmissible)
-                    (seq rejected) (assoc :rejected rejected)))))))
+      (apply!
+       (fn []
+         (let [ref (episode-ref harness-id path hash)
+               evidence (when evidence-dir
+                          ((requiring-resolve 'claimgraph.evidence/write!)
+                           evidence-dir content))
+               result (core/ingest s {:source-type :agent-note :ref ref
+                                      :evidence evidence}
+                                   facts)]
+           (core/close-episode s {:episode (:episode result)
+                                  :summary (str "notes ingest " ref ": "
+                                                (:total result) " facts ("
+                                                (pr-str (:counts result)) "), "
+                                                demoted " demoted, "
+                                                (count rejected) " rejected")})
+           (-> result
+               (assoc :file path :hash hash :demoted demoted)
+               (cond-> (seq inadmissible) (assoc :inadmissible inadmissible)
+                       (seq rejected) (assoc :rejected rejected)))))))))
 
 (defn ingest!
   "One notes pass: delta-detect the harness's auto-memory directory, extract
@@ -196,8 +206,17 @@
         :extractor (command string) :extractor-fn (injectable, tests)
         :evidence-dir (keep each ingested note revision as a content-
                        addressed artifact; skipped when absent)
-        :dry-run (extract and report, write nothing)"
-  [s {:keys [harness extractor extractor-fn evidence-dir dry-run] :as opts}]
+        :spend! (0-arg budget gate; truthy = one model call is affordable.
+                 Default unlimited)
+        :apply! (fn [thunk] ...) wrapping the write half of each file, so a
+                 caller can serialize it however it must. Default: run it)
+        :dry-run (extract and report, write nothing)
+
+  A file the budget did not reach is DEFERRED, not extracted, and counted in
+  :deferred — never silently dropped. It needs no bookkeeping to come back:
+  its content hash still has no episode, so the delta gate above finds it
+  again on the next run, which is what makes a budgeted pass convergent."
+  [s {:keys [harness extractor extractor-fn evidence-dir spend! apply! dry-run] :as opts}]
   (let [h (harness/resolve-harness harness)
         notes-dir (harness/notes-path h (select-keys opts [:dir :project :ctx]))]
     (if-not (fs/directory? notes-dir)
@@ -208,6 +227,7 @@
       (let [notes (read-notes notes-dir (:note-glob h))
             changed (changed-notes notes (seen-hashes (store/-list-episodes s) (:id h)))
             run (or extractor-fn (partial llm/complete! (llm/command extractor)))
+            spend! (or spend! (constantly true))
             entities (store/-list-entities s {})
             predicates (store/-list-predicates s {:status :stable})
             ctx {:predicates predicates
@@ -216,12 +236,20 @@
                                                 session/roster-limit)
                  :actx (logic/admission-ctx entities predicates)
                  :evidence-dir evidence-dir
+                 :apply! (or apply! (fn [f] (f)))
                  :dry-run dry-run}
-            results (mapv #(ingest-note! s run (:id h) % ctx) changed)]
-        {:status (if dry-run :dry-run :ok)
-         :harness (name (:id h))
-         :dir (str notes-dir)
-         :files-scanned (count notes)
-         :files-changed (count changed)
-         :counts (apply merge-with + (keep :counts results))
-         :files results}))))
+            deferred (atom 0)
+            results (into []
+                          (keep (fn [note]
+                                  (if-not (spend!)
+                                    (do (swap! deferred inc) nil)
+                                    (ingest-note! s run (:id h) note ctx))))
+                          changed)]
+        (cond-> {:status (if dry-run :dry-run :ok)
+                 :harness (name (:id h))
+                 :dir (str notes-dir)
+                 :files-scanned (count notes)
+                 :files-changed (count changed)
+                 :counts (apply merge-with + (keep :counts results))
+                 :files results}
+          (pos? @deferred) (assoc :deferred @deferred))))))

@@ -131,7 +131,8 @@
 ;; | `<db>.oplog/` | multi-writer | `writer` (this machine's id), `<writer>.jsonl` per-writer effect logs, `applied.json` high-water marks and entity map |
 ;; | `<db>.retrievals` | outcome signal | append-only log of which facts reads surfaced |
 ;; | `<db>.lock` | lease | same-machine write serialization (token, TTL) |
-;; | `<db>.last-consolidate` | hooks | stamp gating the weekly consolidate; the instant it records is the authority, not the file's mtime, which any syncer rewrites |
+;; | `<db>.curate.lock` | lease | the curation lease: a second instance of the same mechanics, making the detached curator a singleton (try-acquire, never a wait) |
+;; | `<db>.curate.log` | hooks | stdout+stderr of the curator the SessionEnd hook spawns and does not await — a detached process reports to nobody, so this is its whole crash-visibility surface |
 ;; | `<db>.version` | store backend | the persisted-format version this store was written at; a store from a future format is refused rather than schema-merged |
 ;;
 ;; ## Reading order

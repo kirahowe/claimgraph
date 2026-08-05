@@ -3,18 +3,27 @@
   a Claude Code SessionEnd hook can call, and an installer that wires it into
   the project's hook configuration.
 
-  `hooks run` = ingest-code-if-changed → ingest-notes → compile-context →
-  consolidate-if-due. Each stage is attempted independently: an analyzer or
-  extractor failure (no `claude` on PATH, not authenticated) must never
-  stop the deterministic compile — the next session still deserves the
-  freshest view the graph can produce. The code stage runs FIRST (so
-  extraction's entity roster and conflict ground truth are fresh) and is
-  delta-gated on <git-sha>+<dirty-digest> against the newest :code
-  episode's ref — free when nothing changed, reconciling when anything did,
-  including teammates' pulled changes; the `code-ingest` setting
-  (session-end | manual) opts it out. Consolidation runs at lower
-  frequency, gated by a sibling stamp file next to the db (default: at
-  most every 7 days).
+  `hooks run` is CAPTURE, and capture is deterministic (spec/maintenance.allium,
+  rule AmbientSessionEnd): ingest-code-if-changed → compile-context → spawn a
+  DETACHED curator. It runs in seconds and never waits on a model.
+
+  The code stage runs FIRST, so the curator's entity roster and conflict ground
+  truth are fresh, and is delta-gated on <git-sha>+<dirty-digest> against the
+  newest :code episode's ref — free when nothing changed, reconciling when
+  anything did, including teammates' pulled changes; the `code-ingest` setting
+  (session-end | manual) opts it out. The recompile is not redundant with the
+  curator's: this one guarantees the freshest DETERMINISTIC view even if the
+  curator never starts, and the curator's adds what extraction and judging
+  learned. Stages are attempted independently — a failed stage is an :error
+  entry, never an abort.
+
+  The hand-off is a spawn, not a call (decided 2026-08-05): `claim curate` is
+  started with its output redirected to <db>.curate.log and is never awaited,
+  so the session's exit costs what capture costs. This replaced an inline
+  ingest-notes + consolidate pass, which put dozens of LLM shell-outs inside a
+  bounded lifecycle hook: it hit the 600s timeout every session, landed
+  nothing, and re-queued everything. The timeout here is sized for capture and
+  hitting it is a bug, not a budget.
 
   `hooks install` merges a SessionEnd entry into the project's hook settings
   (default <project>/.claude/settings.json; overridable via --settings-file /
@@ -22,15 +31,17 @@
   updates the claimgraph entry in place and never duplicates it; everything
   else in the file is preserved."
   (:require [babashka.fs :as fs]
+            [babashka.process :as process]
             [cheshire.core :as json]
             [clojure.string :as str]
-            [claimgraph.context :as context]
-            [claimgraph.core :as core]
-            [claimgraph.logic :as logic]
-            [claimgraph.ingest.notes :as notes]))
+            [claimgraph.context :as context]))
 
-(def default-consolidate-days 7)
-(def hook-timeout-seconds 600)
+(def hook-timeout-seconds
+  "The SessionEnd hook's timeout, sized for what the hook actually does now:
+  a delta-gated code pass, a deterministic recompile, and a spawn. It was 600
+  when the hook owned the model calls, and every session paid all of it. A run
+  that reaches this bound is a bug to investigate, not a budget being spent."
+  60)
 
 ;; ---------------------------------------------------------------------------
 ;; hooks run
@@ -42,100 +53,94 @@
          (merge {:status :error :error (ex-message e)}
                 (dissoc (ex-data e) :claimgraph/error)))))
 
-(defn- stamp-path [db] (str db ".last-consolidate"))
+(defn curate-log
+  "Where a spawned curator's stdout and stderr land: a sibling of the store,
+  like every other artifact derived from it. A detached process reports to
+  nobody, so this file is its entire crash-visibility surface."
+  [db]
+  (str db ".curate.log"))
 
-(defn- stamped-at
-  "The instant the stamp records, falling back to its mtime when the payload
-  is unreadable, unparseable, or implausible (dated after `now`). nil when
-  neither can be read — the caller reads that as due."
-  ^java.util.Date [stamp ^java.util.Date now]
-  (try
-    (let [recorded (try (logic/parse-instant (slurp stamp))
-                        (catch Exception _ nil))]
-      (if (and recorded (<= (.getTime ^java.util.Date recorded) (.getTime now)))
-        recorded
-        (java.util.Date. (.toMillis (fs/last-modified-time stamp)))))
-    (catch Exception _ nil)))
+(defn curate-args
+  "Pure: the argv `claim curate` is spawned with. Only settings this run
+  actually resolved are passed — everything else the child resolves through
+  the same flag > env > config > default chain the parent would have, and
+  passing a value we merely defaulted would freeze the parent's default into
+  the child's command line."
+  [{:keys [harness db dir inject-file extractor budget]}]
+  (cond-> ["curate" "--harness" (name (or harness :claude-code)) "--db" (str db)]
+    dir (conj "--notes-dir" (str dir))
+    inject-file (conj "--inject-file" (str inject-file))
+    extractor (conj "--extractor" (str extractor))
+    budget (conj "--budget" (str budget))))
 
-(defn consolidate-due?
-  "Due when the stamp is absent, when it cannot be resolved at all, or when
-  the instant it records is at least `days` old. The stamp lives next to the
-  db directory (<db>.last-consolidate), so per-store cadence follows the
-  store.
+(defn- claim-bin
+  "The claim executable to spawn: a repo-local bin/claim when the project has
+  one, else whatever is on PATH. Absolute, because the child is started with
+  the project as its working directory but nothing guarantees the parent's."
+  [project]
+  (let [local (fs/path (or project ".") "bin" "claim")]
+    (if (fs/exists? local) (str local) "claim")))
 
-  The payload is the authority, not the mtime: a store is expected to travel
-  (rsync, a fresh checkout, a backup restore, the file syncer this project
-  supports for the oplog) and every one of those rewrites the mtime without
-  any consolidation having happened. The mtime is the fallback for a payload
-  we cannot believe — missing, truncated, hand-edited, or dated ahead of us,
-  which is another machine's clock writing into a synced store and not
-  evidence that anything ran. Never the later of the two, and never a hard
-  failure: the stamp can vanish under us mid-read (a concurrent `hooks run`,
-  a syncer replacing the file), and \"cannot tell\" has to mean due — a
-  consolidation run twice costs a pass, one skipped costs the cadence.
-  Elapsed time still floors at zero so a future mtime cannot outvote days=0."
-  [db days now]
-  (let [stamp (stamp-path db)
-        at (when (fs/exists? stamp) (stamped-at stamp now))]
-    (or (nil? at)
-        (>= (max 0 (- (.getTime ^java.util.Date now) (.getTime at)))
-            (* days 86400000)))))
+(defn spawn-curator!
+  "Start the curator and walk away. Not awaited, not deref'd: the exiting
+  session hands curation off and returns, and the child outlives it.
+
+  Both streams are redirected (in APPEND mode, so two descriptors onto one
+  file interleave instead of overwriting each other) into a log truncated per
+  run — a curator that dies leaves the reason there, and the work it did not
+  do is still pending by derivation for the next run."
+  [{:keys [db project] :as opts}]
+  (let [log (curate-log db)
+        args (curate-args opts)
+        bin (claim-bin project)]
+    (fs/create-dirs (fs/parent (fs/absolutize log)))
+    (fs/delete-if-exists log)
+    (apply process/process
+           {:dir (str (or project "."))
+            :out :append :out-file (fs/file log)
+            :err :append :err-file (fs/file log)}
+           bin args)
+    {:status :spawned :log log :command (into [bin] args)}))
 
 (defn run!
-  "The SessionEnd pass: refresh code facts when the code moved, capture
-  what the harness's auto-memory learned, recompile the injected view,
-  consolidate when due. Stages report independently; a failed stage is an
-  :error (or :partial) entry, not an abort.
+  "The SessionEnd pass: refresh code facts when the code moved, recompile the
+  injected view, hand curation to a detached process. Every stage here is
+  deterministic; every model call belongs to the curator.
 
-  opts: :db (the store path, for the consolidation stamp)
+  opts: :db (the store path — the curator's --db and its log's location)
         :code-ingest (\"session-end\" default | \"manual\")
         :command-fn :which :analyzers (ingest-code, injectable for tests)
-        :harness :project :dir :extractor :extractor-fn (ingest/compile)
+        :harness :project :dir :ctx (harness resolution)
         :inject-file (compile-context's write-target override)
-        :consolidate-days (default 7; 0 = every run)
-        :command :summarize-fn :judge-fn :resolve :min-confidence (consolidate)"
-  [s {:keys [db consolidate-days code-ingest] :as opts}]
+        :extractor :budget (forwarded to the curator when set)
+        :no-curate (skip the hand-off; run `claim curate` yourself)
+        :spawn-fn (injectable, tests)
+
+  Note :budget here is the curator's MODEL-CALL budget, not compile-context's
+  byte budget — the compile takes its own default, which is the only budget
+  the deterministic half of this pass has ever had."
+  [s {:keys [code-ingest no-curate spawn-fn] :as opts}]
   (let [code (if (= "manual" (some-> code-ingest name))
                {:status :skipped :reason "code-ingest is set to manual — run ingest-code yourself"}
                (attempt #((requiring-resolve 'claimgraph.ingest.code/ingest-if-changed!)
                           s (assoc (select-keys opts [:command-fn :which :analyzers])
                                    :dir (:project opts)))))
-        ingest (attempt #(notes/ingest! s (select-keys opts [:harness :project :dir :ctx
-                                                             :extractor :extractor-fn
-                                                             :evidence-dir])))
+        ;; before the hand-off, so the deterministic view lands even if the
+        ;; curator never starts
         compiled (attempt #(context/compile! s (select-keys opts [:harness :project :dir
-                                                                  :ctx :inject-file
-                                                                  :budget])))
-        days (or consolidate-days default-consolidate-days)
-        due? (consolidate-due? db days (core/now))
-        consolidated (if-not due?
-                       {:status :skipped :reason (str "ran within the last " days " days")}
-                       ;; The stamp is earned, not scheduled (spec/
-                       ;; maintenance.allium, decided 2026-07-26): only a pass
-                       ;; whose sub-stages all ran clean writes it. An errored
-                       ;; judge, sweep or enrichment stays in the report
-                       ;; without aborting its siblings — but withholding the
-                       ;; stamp keeps the pass DUE, so a broken LLM costs a
-                       ;; retry next session, not a silent wait for the next
-                       ;; consolidation window.
-                       (let [r (attempt #((requiring-resolve 'claimgraph.consolidate/consolidate!)
-                                          s (select-keys opts [:command :summarize-fn :judge-fn
-                                                               :resolve :min-confidence])))
-                             errors (when-not (= :error (:status r))
-                                      ((requiring-resolve 'claimgraph.consolidate/sub-stage-errors) r))]
-                         (cond
-                           (= :error (:status r)) r
-                           (seq errors) (assoc r :stamp :withheld :sub-stage-errors errors)
-                           :else (do (spit (stamp-path db)
-                                           (str (.toInstant ^java.util.Date (core/now))))
-                                     r))))]
+                                                                  :ctx :inject-file])))
+        curator (if no-curate
+                  {:status :skipped
+                   :reason "curation opted out (--no-curate) — run `claim curate` yourself"}
+                  (attempt #((or spawn-fn spawn-curator!)
+                             (select-keys opts [:harness :db :project :dir
+                                                :inject-file :extractor :budget]))))]
     {:status (if (some #(contains? #{:error :partial} (:status %))
-                       [code ingest compiled consolidated])
+                       [code compiled curator])
                :partial :ok)
      :ingest-code code
-     :ingest-notes ingest
      :compile-context compiled
-     :consolidate consolidated}))
+     :curator curator}))
 
 ;; ---------------------------------------------------------------------------
 ;; hooks install
@@ -164,9 +169,9 @@
         :settings-file (where the harness reads hook config from; default
         <project>/.claude/settings.json — override for settings.local.json,
         a relocated config dir, or another harness's layout)
-        :consolidate-days :coach :bin (the claim executable for the hook
-        command; auto-detects a repo-local bin/claim, else assumes PATH)"
-  [{:keys [project harness settings-file consolidate-days coach bin]}]
+        :coach :bin (the claim executable for the hook command; auto-detects
+        a repo-local bin/claim, else assumes PATH)"
+  [{:keys [project harness settings-file coach bin]}]
   (let [project (str (fs/canonicalize (or project ".")))
         settings-file (str (or settings-file
                                (fs/path project ".claude" "settings.json")))
@@ -176,8 +181,7 @@
         bin (or bin
                 (if (fs/exists? (fs/path project "bin" "claim"))
                   "bin/claim" "claim"))
-        run-cmd (str bin " hooks run --harness " (name (or harness :claude-code))
-                     (when consolidate-days (str " --consolidate-days " consolidate-days)))
+        run-cmd (str bin " hooks run --harness " (name (or harness :claude-code)))
         coach-cmd (str bin " coach --hook")
         updated (cond-> (install-plan settings :SessionEnd
                                       {:hooks [{:type "command" :command run-cmd
@@ -194,5 +198,8 @@
     (cond-> {:status (if added? :installed :updated)
              :settings settings-file
              :command run-cmd
-             :note "every session now ends with ingest-code-if-changed + ingest-notes + compile-context; consolidate runs when due"}
+             :note (str "every session now ends with ingest-code-if-changed + "
+                        "compile-context, then hands curation (notes extraction, "
+                        "judging, summaries, enrichment) to a detached `claim curate` "
+                        "it does not wait for — its log is <db>.curate.log")}
       coach (assoc :coach-command coach-cmd))))

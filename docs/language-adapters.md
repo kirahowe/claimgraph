@@ -183,7 +183,7 @@ pass, one episode, facts distinguished by `written-in` and entity types.
 entity roster and conflict ground truth are fresh):
 
 ```
-ingest-code-if-changed → ingest-notes → compile-context → consolidate-if-due
+ingest-code-if-changed → compile-context → spawn curate (ingest-notes → consolidate → compile-context)
 ```
 
 **The delta gate is already half-built**: every code pass closes its
@@ -228,7 +228,7 @@ detection (multi-language staleness for free) and keeps its honest
 | registry pattern | `harness/harnesses` (shape, docstring conventions, one-pinned-seam rule) |
 | shell-out + injectable for tests | `llm/complete!` command pattern; adapters take `:command-fn` the way extraction takes `:extractor-fn` |
 | per-adapter prereq check | `setup/check-prerequisites` `:which` pattern |
-| delta gate | `hooks/consolidate-due?` stamp precedent; episode refs via `store/-list-episodes` (see `notes/seen-hashes` for parsing refs back out) |
+| delta gate | episode refs via `store/-list-episodes` (see `notes/seen-hashes` for parsing refs back out, and `ingest/code`'s `<git-sha>+<dirty-digest>` ref for the shape) — derived state, never a stamp file |
 | config setting | `config/settings` registry (`code-ingest`); `code-analyzers` read straight from `config/read-config-file` (documented as config-file-only) |
 | audit code prong | `audit.clj` `ingest-code!` (replace `src/` + clj-glob hardcoding with registry detection) |
 

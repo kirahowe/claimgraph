@@ -1,7 +1,12 @@
 (ns claimgraph.hooks-test
   "The ambient loop's automation: install-plan as a pure function over
-  settings maps, install! against a temp project, and the hooks-run pass with
-  injected extractor/summarizer fns — no LLM, no subprocess, no real ~/.claude."
+  settings maps, install! against a temp project, and the SessionEnd pass with
+  its analyzer and its curator hand-off injected — no LLM, no real ~/.claude.
+
+  The pass under test is CAPTURE: a delta-gated code pass, a deterministic
+  recompile, and a spawn nobody waits for. What it must NOT do is as much the
+  subject as what it must — no extraction, no consolidation, no model call
+  inside a bounded lifecycle hook."
   (:require [babashka.fs :as fs]
             [babashka.process :as p]
             [cheshire.core :as json]
@@ -26,7 +31,7 @@
                                (entry "claim hooks run --harness claude-code")
                                "hooks run")
         v2 (hooks/install-plan v1 :SessionEnd
-                               (entry "claim hooks run --harness claude-code --consolidate-days 3")
+                               (entry "claim hooks run --harness codex")
                                "hooks run")]
     (testing "appends alongside foreign hooks, preserving everything else"
       (is (= 2 (count (get-in v1 [:hooks :SessionEnd]))))
@@ -34,7 +39,7 @@
       (is (= {:allow ["Bash(bb test)"]} (:permissions v1))))
     (testing "re-install replaces our entry in place, never duplicates"
       (is (= 2 (count (get-in v2 [:hooks :SessionEnd]))))
-      (is (= "claim hooks run --harness claude-code --consolidate-days 3"
+      (is (= "claim hooks run --harness codex"
              (-> v2 (get-in [:hooks :SessionEnd]) second :hooks first :command))))
     (testing "events are independent"
       (let [v3 (hooks/install-plan v2 :UserPromptSubmit
@@ -55,9 +60,15 @@
         (let [settings (json/parse-string (slurp (:settings r)) true)
               hook (-> settings :hooks :SessionEnd first :hooks first)]
           (is (= "command" (:type hook)))
-          (is (= hooks/hook-timeout-seconds (:timeout hook))))))
+          (is (= 60 (:timeout hook)))
+          (is (= hooks/hook-timeout-seconds (:timeout hook))
+              "sized for capture: the hook makes no model calls, so reaching this
+               bound is a bug rather than a budget being spent")
+          (is (not (str/includes? (:command hook) "--consolidate-days"))
+              "the cadence is gone with the pass it rationed — the curator's
+               budget is the only bound left"))))
     (testing "re-install updates in place"
-      (let [r (hooks/install! {:project project :consolidate-days 3})]
+      (let [r (hooks/install! {:project project :harness "codex"})]
         (is (= :updated (:status r)))
         (let [settings (json/parse-string (slurp (:settings r)) true)]
           (is (= 1 (count (get-in settings [:hooks :SessionEnd])))))))
@@ -77,122 +88,105 @@
         "the default location is not touched when overridden")))
 
 ;; ---------------------------------------------------------------------------
-;; The consolidation stamp
+;; Shell: the SessionEnd pass is capture, and the curator is detached
 ;; ---------------------------------------------------------------------------
 
-(deftest consolidate-due-reads-the-stamp-not-its-mtime
-  ;; The assertions that matter are the ones where payload and mtime DISAGREE:
-  ;; they are what a silent revert to mtime-only would break. Negative day
-  ;; counts here mean "ahead of now" — a foreign clock in a synced store.
-  (let [dir (str (fs/create-temp-dir {:prefix "claimgraph-hooks-stamp-test"}))
-        db (str dir "/db")
-        stamp (str db ".last-consolidate")
-        now (core/now)
-        days-ago (fn [n] (- (.getTime now) (long (* n 86400000))))
-        at (fn [n] (java.util.Date. (days-ago n)))
-        stamp! (fn [payload mtime-days-ago]
-                 (spit stamp payload)
-                 (fs/set-last-modified-time stamp (days-ago mtime-days-ago)))
-        recorded (fn [n] (str (.toInstant (at n))))]
-    (testing "an absent stamp is due"
-      (is (hooks/consolidate-due? db 7 now)))
-
-    (testing "a recent recorded instant is not due, however old the mtime"
-      (stamp! (recorded 1) 400)
-      (is (not (hooks/consolidate-due? db 7 now))))
-
-    (testing "an old recorded instant is due, however fresh the mtime"
-      ;; what rsync, a fresh checkout or a restore does to a travelling store
-      (stamp! (recorded 30) 0)
-      (is (hooks/consolidate-due? db 7 now)))
-
-    (testing "a payload we cannot believe hands the decision to the mtime"
-      ;; unparseable, empty, and dated ahead of us all fall back the same way:
-      ;; the mtime alone decides, in BOTH directions
-      (doseq [payload ["not an instant" "" "  \n" (recorded -21)]]
-        (stamp! payload 0)
-        (is (not (hooks/consolidate-due? db 7 now))
-            (str "a fresh mtime governs: " (pr-str payload)))
-        (stamp! payload 30)
-        (is (hooks/consolidate-due? db 7 now)
-            (str "an old mtime governs: " (pr-str payload)))))
-
-    (testing "a stamp dated ahead of us cannot suppress its whole skew window"
-      ;; another machine wrote now+21d into a synced store; our mtime is honest
-      (stamp! (recorded -21) 0)
-      (is (not (hooks/consolidate-due? db 7 now))
-          "the mtime says we consolidated just now")
-      (is (hooks/consolidate-due? db 7 (at -10))
-          "ten days on the mtime says due — the future payload must not veto it"))
-
-    (testing "days 0 is every run, even when the clock itself is ahead"
-      (stamp! (recorded -5) -5)
-      (is (hooks/consolidate-due? db 0 now))
-      (is (not (hooks/consolidate-due? db 7 now))))
-
-    (testing "a stamp that vanishes mid-read is due, never a crash"
-      ;; exists? → slurp → mtime: a concurrent `hooks run` or a syncer
-      ;; replacing the file can delete it between any two of those
-      (stamp! "not an instant" 0)
-      (with-redefs [fs/last-modified-time
-                    (fn [& _] (throw (java.nio.file.NoSuchFileException. stamp)))]
-        (is (hooks/consolidate-due? db 7 now))))))
-
-;; ---------------------------------------------------------------------------
-;; Shell: the SessionEnd pass
-;; ---------------------------------------------------------------------------
-
-(deftest hooks-run-drives-the-whole-loop
+(deftest hooks-run-captures-and-hands-curation-off
   (let [dir (str (fs/create-temp-dir {:prefix "claimgraph-hooks-run-test"}))
         project (str (fs/create-temp-dir {:prefix "claimgraph-hooks-run-project"}))
         db (str dir "/db")
-        s (mem/create)
-        _ (core/seed! s)
-        response "{\"subject\":\"AuthService\",\"predicate\":\"prefers\",\"object\":\"Result types\",\"class\":\"preference\",\"confidence\":0.9}"
-        base {:db db :dir dir :project project
-              :extractor-fn (fn [_] response)
-              :summarize-fn (fn [_] "episode summary")
-              :judge-fn (fn [_] "")}]
+        s (doto (mem/create) (core/seed!))
+        spawned (atom [])
+        extracted (atom 0)
+        base {:db db :dir dir :project project :harness "claude-code"
+              ;; if any of these ever runs, the hook is making model calls again
+              :extractor-fn (fn [_] (swap! extracted inc) "")
+              :summarize-fn (fn [_] (swap! extracted inc) "")
+              :judge-fn (fn [_] (swap! extracted inc) "")
+              :spawn-fn (fn [opts]
+                          (swap! spawned conj (hooks/curate-args opts))
+                          {:status :spawned :log (hooks/curate-log db)})}]
     (spit (str dir "/MEMORY.md") "# Notes\nprefers Result types\n")
 
-    (testing "one pass: code freshness, capture, recompile, consolidate (stamp absent = due)"
+    (testing "one pass: code freshness, deterministic recompile, detach"
       (let [r (hooks/run! s base)]
         (is (= :ok (:status r)))
+        (is (= #{:status :ingest-code :compile-context :curator} (set (keys r)))
+            "no :ingest-notes and no :consolidate: every model call moved to the curator")
         (is (= :skipped (get-in r [:ingest-code :status]))
             "an empty project has nothing to analyze — reported, not an error")
-        (is (= 1 (get-in r [:ingest-notes :files-changed])))
         (is (= :compiled (get-in r [:compile-context :status])))
-        (is (= :consolidated (get-in r [:consolidate :status])))
-        (is (fs/exists? (str db ".last-consolidate")))
+        (is (= :spawned (get-in r [:curator :status])))
+        (is (= (str db ".curate.log") (get-in r [:curator :log])))
+        (is (zero? @extracted) "the hook itself never waits on a model")
         (is (str/includes? (slurp (str dir "/MEMORY.md")) harness/begin-marker)
-            "the compiled view landed in the inject file")))
+            "the compiled view lands even if the curator never starts")))
 
-    (testing "the stamp run! writes is read back as its payload, not its mtime"
-      ;; age the mtime out from under a stamp written moments ago: nothing else
-      ;; ties the writer's format to the reader, and a garbage payload would
-      ;; hand the decision to a fresh mtime and look identical
-      (fs/set-last-modified-time (str db ".last-consolidate")
-                                 (- (.getTime (core/now)) (* 400 86400000)))
-      (is (not (hooks/consolidate-due? db 7 (core/now)))))
+    (testing "the curator is told where the store is and whose notes to read"
+      (let [argv (first @spawned)]
+        (is (= "curate" (first argv)))
+        (is (= ["--harness" "claude-code"] (subvec argv 1 3)))
+        (is (= db (nth argv (inc (.indexOf ^java.util.List argv "--db")))))
+        (is (= dir (nth argv (inc (.indexOf ^java.util.List argv "--notes-dir")))))))
 
-    (testing "within the window, consolidation is skipped"
-      (let [r (hooks/run! s base)]
+    (testing "--no-curate captures and stops there"
+      (let [r (hooks/run! s (assoc base :no-curate true))]
         (is (= :ok (:status r)))
-        (is (zero? (get-in r [:ingest-notes :files-changed])))
-        (is (= :skipped (get-in r [:consolidate :status])))))
+        (is (= :skipped (get-in r [:curator :status])))
+        (is (str/includes? (get-in r [:curator :reason]) "claim curate"))
+        (is (= 1 (count @spawned)) "nothing was spawned")))
 
-    (testing "--consolidate-days 0 forces the pass"
-      (is (= :consolidated (get-in (hooks/run! s (assoc base :consolidate-days 0))
-                                   [:consolidate :status]))))
-
-    (testing "a broken extractor degrades to :partial — the recompile still runs"
-      (spit (str dir "/MEMORY.md")
-            (str (slurp (str dir "/MEMORY.md")) "\nnew durable note\n"))
-      (let [r (hooks/run! s (assoc base :extractor-fn (fn [_] (throw (ex-info "no claude" {})))))]
+    (testing "a hand-off that fails degrades to :partial with the capture intact"
+      (let [r (hooks/run! s (assoc base :spawn-fn
+                                   (fn [_] (throw (ex-info "no claim on PATH" {})))))]
         (is (= :partial (:status r)))
-        (is (= :error (get-in r [:ingest-notes :status])))
-        (is (= :compiled (get-in r [:compile-context :status]))
-            "capture failing never blocks the deterministic view")))))
+        (is (= :error (get-in r [:curator :status])))
+        (is (= :compiled (get-in r [:compile-context :status])))))))
+
+(deftest curate-args-carry-only-what-this-run-resolved
+  (is (= ["curate" "--harness" "claude-code" "--db" "/s/db"]
+         (hooks/curate-args {:db "/s/db"}))
+      "a setting nobody set is left to the child's own flag > env > config chain
+       rather than frozen into its command line as the parent's default")
+  (is (= ["curate" "--harness" "codex" "--db" "/s/db"
+          "--notes-dir" "/n" "--inject-file" "view.md"
+          "--extractor" "llm -m small" "--budget" "7"]
+         (hooks/curate-args {:harness "codex" :db "/s/db" :dir "/n"
+                             :inject-file "view.md" :extractor "llm -m small"
+                             :budget 7}))))
+
+(deftest a-spawned-curator-outlives-the-hook-and-logs-where-it-said
+  ;; the riskiest part of the hand-off is the part no unit can see: two
+  ;; streams into one file, a log that does not accumulate across runs, and a
+  ;; child that is never awaited
+  (let [dir (str (fs/create-temp-dir {:prefix "claimgraph-hooks-spawn-test"}))
+        project (str (fs/create-temp-dir {:prefix "claimgraph-hooks-spawn-project"}))
+        db (str dir "/db")
+        log (hooks/curate-log db)
+        read-log (fn [] (if (fs/exists? log) (slurp log) ""))]
+    (fs/create-dirs (fs/path project "bin"))
+    (spit (str (fs/path project "bin" "claim"))
+          "#!/bin/sh\necho \"argv: $*\"\necho 'and stderr' 1>&2\n")
+    (fs/set-posix-file-permissions (fs/path project "bin" "claim") "rwxr-xr-x")
+    (spit log "a previous curator's crash\n")
+
+    (let [r (hooks/spawn-curator! {:db db :project project :harness "codex" :budget 5})]
+      (is (= :spawned (:status r)))
+      (is (= log (:log r)))
+      (is (str/ends-with? (first (:command r)) "/bin/claim")
+          "the project's own claim, absolute — the child's cwd is the project")
+      ;; not awaited, so wait on the output rather than on an exit status
+      (loop [n 0]
+        (when (and (< n 200) (not (str/includes? (read-log) "and stderr")))
+          (Thread/sleep 20)
+          (recur (inc n))))
+      (let [content (read-log)]
+        (is (str/includes? content "argv: curate --harness codex"))
+        (is (str/includes? content "--budget 5"))
+        (is (str/includes? content "and stderr")
+            "stderr shares the file: a curator that dies says why in one place")
+        (is (not (str/includes? content "a previous curator's crash"))
+            "and the log is this run's, not an accumulating pile")))))
 
 ;; ---------------------------------------------------------------------------
 ;; The ambient code stage (docs/language-adapters.md §5)
@@ -210,10 +204,7 @@
         s (mem/create)
         _ (core/seed! s)
         base {:db (str dir "/db") :dir dir :project project
-              :consolidate-days 9999
-              :extractor-fn (fn [_] "")
-              :summarize-fn (fn [_] "episode summary")
-              :judge-fn (fn [_] "")}]
+              :spawn-fn (fn [_] {:status :spawned})}]
     (spit (str project "/app.clj") "(ns app.core)")
     (git! project "init" "-q")
     (git! project "add" "-A")
@@ -258,10 +249,7 @@
     (spit (str project "/index.ts") "import './x';")
     (spit (str dir "/MEMORY.md") "# Notes\n")
     (let [r (hooks/run! s {:db (str dir "/db") :dir dir :project project
-                           :consolidate-days 9999
-                           :extractor-fn (fn [_] "")
-                           :summarize-fn (fn [_] "episode summary")
-                           :judge-fn (fn [_] "")
+                           :spawn-fn (fn [_] {:status :spawned})
                            :which (fn [_] "npx")
                            :command-fn (fn [_] (throw (ex-info "tool exploded" {})))})]
       (is (= :partial (:status r)))

@@ -39,7 +39,7 @@
   consulted, so the alias keeps working without the registry knowing."
   (array-map
    :db {:flag "--db" :env "CLAIMGRAPH_DB" :default ".claimgraph/db"
-        :desc "Store path (an LMDB directory; the format stamp, oplog, evidence, lock, and stamp files derive from it as siblings)."}
+        :desc "Store path (an LMDB directory; the format stamp, oplog, evidence, leases, and the curation log derive from it as siblings)."}
    :harness {:flag "--harness" :env "CLAIMGRAPH_HARNESS" :default "claude-code"
              :desc "Which harness's auto-memory the ambient loop consumes (claude-code | codex)."}
    :notes-dir {:flag "--notes-dir" :env "CLAIMGRAPH_NOTES_DIR"
@@ -57,9 +57,8 @@
                     :desc "How long any one LLM shell-out may run before its process tree is killed. Default: claimgraph.llm/default-timeout-ms (120000) — under the SessionEnd hook one wedged call would otherwise eat the hook's whole budget."}
    :evidence-dir {:flag "--evidence-dir" :env "CLAIMGRAPH_EVIDENCE_DIR"
                   :desc "Content-addressed raw-evidence store. Default: <db>.evidence."}
-   :consolidate-days {:flag "--consolidate-days" :env "CLAIMGRAPH_CONSOLIDATE_DAYS"
-                      :default 7 :coerce :long
-                      :desc "Consolidation cadence for hooks run, in days (0 = every run)."}
+   :budget {:flag "--budget" :env "CLAIMGRAPH_BUDGET" :default 20 :coerce :long
+            :desc "Model calls per curation pass (curate; consolidate defaults to the same bound). The ONE bound on a pass: every call lands a durable outcome, so runs converge and what a budget defers is named in the report."}
    :code-ingest {:flag "--code-ingest" :env "CLAIMGRAPH_CODE_INGEST" :default "session-end"
                  :desc "Whether hooks run refreshes code facts as its first stage (session-end | manual). Delta-gated either way; manual opts a project with an expensive analyzer out of the ambient pass. The code-analyzers map (config-file only) tunes which analyzers run."}))
 

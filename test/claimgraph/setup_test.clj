@@ -128,17 +128,17 @@
 (deftest chosen-settings-persist-to-project-config
   (let [project (temp-project)
         r (setup/run! (assoc base-opts :project project
-                             :harness "codex" :chosen {:harness "codex" :consolidate-days 3}))
+                             :harness "codex" :chosen {:harness "codex" :budget 3}))
         cfg (json/parse-string
              (slurp (str (fs/path project ".claimgraph" "config.json"))) true)]
     (is (= :installed (get-in r [:steps :config :status])))
-    (is (= {:harness "codex" :consolidate-days 3
+    (is (= {:harness "codex" :budget 3
             :config-version version/format-version}
            cfg))
     (testing "re-running with new choices merges, preserving earlier ones"
       (setup/run! (assoc base-opts :project project
                          :chosen {:extractor "llm -m small"}))
-      (is (= {:harness "codex" :consolidate-days 3 :extractor "llm -m small"
+      (is (= {:harness "codex" :budget 3 :extractor "llm -m small"
               :config-version version/format-version}
              (json/parse-string
               (slurp (str (fs/path project ".claimgraph" "config.json"))) true))))
@@ -269,7 +269,7 @@
       (let [content (slurp target)]
         (is (empty? (re-seq #"(?m)^\.claimgraph/db\.retrievals$" content))
             "the dropped entry left with the block, rather than stranding below it")
-        (is (= 1 (count (re-seq #"(?m)^\.claimgraph/db\.last-consolidate$" content)))
+        (is (= 1 (count (re-seq #"(?m)^\.claimgraph/db\.oplog/$" content)))
             "and nothing ended up both inside and outside the managed region"))
       (is (= :unchanged (:status (setup/ensure-gitignore! {:project project})))))))
 
@@ -278,13 +278,14 @@
   ;; from the block is one that turns up untracked in every project using
   ;; claimgraph and rides the next `git add -A` into someone's history
   (let [entries (set (setup/gitignore-entries ".claimgraph/db"))]
-    (doseq [sibling ["/"            ; the LMDB directory itself
-                     ".lock"        ; lease/lock-file
-                     ".evidence/"   ; evidence/default-dir
-                     ".oplog/"      ; oplog/oplog-dir
-                     ".retrievals"  ; outcome/log-file
-                     ".last-consolidate"
-                     ".version"]]   ; store.datalevin/version-file
+    (doseq [sibling ["/"             ; the LMDB directory itself
+                     ".lock"         ; lease/lock-file, on the write lease
+                     ".curate.lock"  ; lease/lock-file, on curate/curation-lease-key
+                     ".curate.log"   ; hooks/curate-log — the detached curator's output
+                     ".evidence/"    ; evidence/default-dir
+                     ".oplog/"       ; oplog/oplog-dir
+                     ".retrievals"   ; outcome/log-file
+                     ".version"]]    ; store.datalevin/version-file
       (is (contains? entries (str ".claimgraph/db" sibling))
           (str ".claimgraph/db" sibling " is written but not ignored")))))
 

@@ -296,7 +296,8 @@
       (fn [s]
         (emit opts (judge s {:command (:command opts)
                              :resolve (:resolve opts)
-                             :min-confidence (:min-verdict-confidence opts)}))))))
+                             :min-confidence (:min-verdict-confidence opts)
+                             :evidence-dir (evidence-dir opts)}))))))
 
 (defn cmd-entity-ensure
   "Reports {status, entity} like `entity rename` and `entity alias` do. It
@@ -501,37 +502,82 @@
       (fn [s] (emit opts (outcome! s (db-path opts) {:valence valence}))))))
 
 (defn cmd-hooks-run
-  "The SessionEnd pass. A partial pass still exits 0 — a hook that fails is
-  worse than a hook that reports, and a stage failing is exactly when the
-  next session most needs the view the other stages did recompile — but CI
-  and cron need to be able to see it, so --fail-on-partial turns the same
-  report into a non-zero status without changing what it says."
+  "The SessionEnd pass: deterministic capture, then a detached curator. It
+  makes no model calls of its own — the settings it resolves that the curator
+  needs (notes dir, inject file, extractor) are forwarded on the child's
+  command line, and everything else the child resolves for itself.
+
+  A partial pass still exits 0 — a hook that fails is worse than a hook that
+  reports, and a stage failing is exactly when the next session most needs the
+  view the other stages did recompile — but CI and cron need to be able to see
+  it, so --fail-on-partial turns the same report into a non-zero status
+  without changing what it says."
   [{:keys [opts]}]
   (let [opts (-> opts
                  (accept-alias :notes-dir :dir)
-                 (accept-alias :min-verdict-confidence :min-confidence)
                  (config/with-defaults [:harness :notes-dir :inject-file
-                                        :extractor :consolidate-days :code-ingest])
-                 llm-opts)
+                                        :extractor :code-ingest]))
         run (requiring-resolve 'claimgraph.hooks/run!)
         r (with-write-store opts
             (fn [s]
               (run s (assoc (select-keys opts [:harness :project :inject-file
-                                               :extractor :consolidate-days :command
-                                               :resolve :code-ingest])
+                                               :extractor :code-ingest :no-curate])
                             :dir (:notes-dir opts)
-                            :min-confidence (:min-verdict-confidence opts)
-                            :db (db-path opts)
-                            :evidence-dir (evidence-dir opts)))))]
+                            :db (db-path opts)))))]
     (emit opts r)
     (when (and (:fail-on-partial opts) (= :partial (:status r)))
       error-exit)))
 
 (defn cmd-hooks-install [{:keys [opts]}]
-  (let [opts (config/with-defaults opts [:harness :settings-file :consolidate-days])
+  (let [opts (config/with-defaults opts [:harness :settings-file])
         install (requiring-resolve 'claimgraph.hooks/install!)]
     (emit opts (install (select-keys opts [:project :harness :settings-file
-                                           :consolidate-days :coach :bin])))))
+                                           :coach :bin])))))
+
+(defn cmd-curate
+  "The detached curation run the SessionEnd hook spawns — also runnable by
+  hand, which is the same thing: notes extraction, then the maintenance
+  stages, then the recompile, under one model-call budget.
+
+  A SINGLETON by try-acquire on the curation lease (spec/maintenance.allium,
+  rule Curate; wait 0, never a wait): a live curator means this run's work is
+  already in hand, so exiting is SUCCESS and reports :already-running at exit
+  0. Two curators racing would buy the same verdicts twice and the loser's
+  work is derivable by the winner.
+
+  Inside the lease it opens the store WITHOUT the write lease. The curator
+  holds no standing write lease at all — it takes one per applied outcome and
+  never across a model call, so a session's capture is never queued behind a
+  completion (see claimgraph.curate)."
+  [{:keys [opts]}]
+  (let [opts (-> (accept-alias opts :notes-dir :dir)
+                 (config/with-defaults [:harness :notes-dir :inject-file
+                                        :extractor :budget])
+                 llm-opts)
+        curate! (requiring-resolve 'claimgraph.curate/curate!)
+        lease-key ((requiring-resolve 'claimgraph.curate/curation-lease-key)
+                   (db-path opts))
+        with-lease (requiring-resolve 'claimgraph.lease/with-lease)]
+    (try
+      (with-lease lease-key
+                  {:owner @(requiring-resolve 'claimgraph.curate/curator-owner)
+                   :wait-ms 0}
+                  (fn []
+                    (with-store opts
+                      (fn [s]
+                        (emit opts
+                              (curate! s (assoc (select-keys opts [:harness :project
+                                                                   :inject-file :extractor
+                                                                   :command :budget])
+                                                :dir (:notes-dir opts)
+                                                :db (db-path opts)
+                                                :evidence-dir (evidence-dir opts))))))))
+      (catch clojure.lang.ExceptionInfo e
+        (if (= :store-locked (:type (ex-data e)))
+          (emit opts {:status :already-running
+                      :holder (:holder (ex-data e))
+                      :note "another curator holds the curation lease; its run covers this one"})
+          (throw e))))))
 
 (defn cmd-dump
   "Export to stdout, or to --out with a report of what landed there.
@@ -585,12 +631,15 @@
 (defn cmd-consolidate [{:keys [opts]}]
   (let [opts (-> opts
                  (accept-alias :min-verdict-confidence :min-confidence)
+                 (config/with-defaults [:budget])
                  llm-opts)
         consolidate (requiring-resolve 'claimgraph.consolidate/consolidate!)]
     (with-write-store opts
       (fn [s]
-        (emit opts (consolidate s (assoc (select-keys opts [:command :resolve :min-usage])
-                                         :min-confidence (:min-verdict-confidence opts))))))))
+        (emit opts (consolidate s (assoc (select-keys opts [:command :resolve :min-usage
+                                                            :budget])
+                                         :min-confidence (:min-verdict-confidence opts)
+                                         :evidence-dir (evidence-dir opts))))))))
 
 (defn- audit-scan-dirs
   "audit's extra scan directories under both spellings. --scan-dir is what
@@ -643,7 +692,7 @@
   "Settings a `claim setup` invocation may persist to .claimgraph/config.json —
   only when passed explicitly, so the config file records choices, not defaults."
   [:db :harness :notes-dir :inject-file :settings-file :skills-dir
-   :extractor :consolidate-days])
+   :extractor :budget])
 
 (defn cmd-setup
   "Onboarding. :blocked exits non-zero: a blocked setup wired nothing, and a
@@ -654,11 +703,10 @@
   (let [opts (accept-alias opts :notes-dir :dir)
         chosen (select-keys opts setup-persist-keys)
         opts (config/with-defaults opts [:harness :notes-dir :settings-file
-                                         :skills-dir :consolidate-days])
+                                         :skills-dir])
         run! (requiring-resolve 'claimgraph.setup/run!)
         r (run! (assoc (select-keys opts [:project :bin :db :harness :settings-file
-                                          :skills-dir :consolidate-days :coach
-                                          :mcp :dry-run])
+                                          :skills-dir :coach :mcp :dry-run])
                        :chosen chosen
                        :init-fn (fn []
                                   (with-write-store opts
@@ -763,7 +811,7 @@ Commands:
                         (hooks install). [--project DIR] [--db PATH]
                         [--harness claude-code] [--notes-dir DIR]
                         [--inject-file F] [--settings-file F] [--skills-dir D]
-                        [--extractor CMD] [--consolidate-days 7] [--coach]
+                        [--extractor CMD] [--budget 20] [--coach]
                         [--mcp] (also register the MCP server in .mcp.json)
                         [--bin claim] [--dry-run]
   config              Show every setting: resolved value, which layer set it
@@ -984,32 +1032,49 @@ Commands:
                         --settings-file / $CLAIMGRAPH_SETTINGS_FILE /
                         settings-file in the project config.
                         [--project DIR] [--harness claude-code]
-                        [--settings-file F] [--consolidate-days 7] [--coach]
-                        [--bin claim]
+                        [--settings-file F] [--coach] [--bin claim]
                         --coach also wires a UserPromptSubmit hook running
                         the gated push (see coach).
-  hooks run           The SessionEnd pass: ingest-code-if-changed (first,
-                        so extraction's entity roster and conflict ground
-                        truth are fresh — delta-gated on
-                        <git-sha>+<dirty-digest> against the last :code
-                        episode, so it's free when nothing changed and
-                        reconciles when anything did, including teammates'
-                        pulled changes; non-git projects always run),
-                        ingest-notes, compile-context, and consolidate when
-                        due (stamp-gated, default every 7 days; 0 = always).
-                        Stages report independently — an analyzer or
-                        extractor failure never blocks the deterministic
-                        recompile, and the pass still exits 0 with
-                        \"status\":\"partial\" — a hook that fails is worse
-                        than a hook that reports. [--fail-on-partial] turns
-                        that same report into exit 1 for CI.
+  hooks run           The SessionEnd pass, and CAPTURE only — deterministic
+                        end to end, seconds, never waiting on a model:
+                        ingest-code-if-changed (first, so the curator's
+                        entity roster and conflict ground truth are fresh —
+                        delta-gated on <git-sha>+<dirty-digest> against the
+                        last :code episode, so it's free when nothing changed
+                        and reconciles when anything did, including
+                        teammates' pulled changes; non-git projects always
+                        run), compile-context, then a DETACHED `claim curate`
+                        it spawns and does not await (log: <db>.curate.log).
+                        Every model call belongs to that curator.
+                        Stages report independently — an analyzer failure
+                        never blocks the deterministic recompile, and the
+                        pass still exits 0 with \"status\":\"partial\" — a
+                        hook that fails is worse than a hook that reports.
+                        [--fail-on-partial] turns that same report into
+                        exit 1 for CI.
                         [--harness claude-code] [--project DIR]
-                        [--notes-dir D] [--inject-file F]
+                        [--notes-dir D] [--inject-file F] [--extractor CMD]
                         [--code-ingest session-end|manual] (manual opts the
                         code stage out of the ambient loop)
-                        [--consolidate-days 7] [--extractor CMD]
-                        [--command CMD] [--resolve]
-                        [--min-verdict-confidence 0.8]
+                        [--no-curate] (capture only; run curate yourself)
+  curate              The detached curation run `hooks run` spawns, also
+                        runnable by hand: ingest-notes (the just-ended
+                        session's knowledge is the freshest), then
+                        consolidate (judge, summaries, sweep, enrichment —
+                        enrich-only, never resolving unattended), then
+                        compile-context so the next session's injected view
+                        carries what curation learned. Stages are attempted
+                        independently.
+                        ONE model-call budget spans the run [--budget 20];
+                        every call lands a durable outcome, so runs converge
+                        toward a free no-op pass and whatever the budget did
+                        not reach is named as deferred and picked up next
+                        run. A SINGLETON: if another curator holds the
+                        curation lease (<db>.curate.lock) this reports
+                        \"already-running\" and exits 0 — the live one's
+                        work covers this run.
+                        [--harness claude-code] [--project DIR]
+                        [--notes-dir D] [--inject-file F] [--extractor CMD]
   outcome             Close the loop on retrieved facts: claim outcome
                         accepted|rejected. Read verbs (facts/search/recall/
                         coach) log which facts they surfaced (<db>.retrievals);
@@ -1060,9 +1125,12 @@ Commands:
                         unavailable), judge open conflicts (report-only unless
                         --resolve), sweep for conflict candidates the write
                         path can't see, and report x/* predicates earning
-                        promotion review.
+                        promotion review. One shared model-call budget,
+                        spent most-valuable-first; what it does not reach is
+                        reported per stage as deferred and stays pending by
+                        derivation for the next run.
                         [--resolve] [--min-verdict-confidence 0.8]
-                        [--min-usage 3]
+                        [--min-usage 3] [--budget 20]
                         [--command CMD | --extractor CMD] (default
                         $CLAIMGRAPH_LLM_CMD, then claude -p)
 ")
@@ -1116,7 +1184,7 @@ Commands:
   (expand-aliases
    [{:cmds ["setup"] :fn cmd-setup
      :spec {:coach {:coerce :boolean} :mcp {:coerce :boolean}
-            :dry-run {:coerce :boolean} :consolidate-days {:coerce :long}}}
+            :dry-run {:coerce :boolean} :budget {:coerce :long}}}
     {:cmds ["audit"] :fn cmd-audit
      :spec {:file {:coerce []} :dir {:coerce []} :scan-dir {:coerce []}
             :scorecard {:coerce :boolean}
@@ -1168,12 +1236,10 @@ Commands:
     {:cmds ["compile-context"] :fn cmd-compile-context
      :spec {:budget {:coerce :long} :dry-run {:coerce :boolean}}}
     {:cmds ["hooks" "run"] :fn cmd-hooks-run
-     :spec {:consolidate-days {:coerce :long} :resolve {:coerce :boolean}
-            :min-confidence {:coerce :double}
-            :min-verdict-confidence {:coerce :double}
-            :fail-on-partial {:coerce :boolean}}}
+     :spec {:fail-on-partial {:coerce :boolean} :no-curate {:coerce :boolean}}}
     {:cmds ["hooks" "install"] :fn cmd-hooks-install
-     :spec {:consolidate-days {:coerce :long} :coach {:coerce :boolean}}}
+     :spec {:coach {:coerce :boolean}}}
+    {:cmds ["curate"] :fn cmd-curate :spec {:budget {:coerce :long}}}
     {:cmds ["dump"] :fn cmd-dump}
     {:cmds ["load"] :fn cmd-load}
     {:cmds ["reconcile"] :fn cmd-reconcile}
@@ -1181,7 +1247,7 @@ Commands:
     {:cmds ["consolidate"] :fn cmd-consolidate
      :spec {:resolve {:coerce :boolean} :min-confidence {:coerce :double}
             :min-verdict-confidence {:coerce :double}
-            :min-usage {:coerce :long}}}
+            :min-usage {:coerce :long} :budget {:coerce :long}}}
     {:cmds ["help"] :fn cmd-help}
     {:cmds [] :fn cmd-unknown}]))
 

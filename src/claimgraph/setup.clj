@@ -80,10 +80,11 @@
   [db-rel]
   [(str db-rel "/")
    (str db-rel ".lock")
+   (str db-rel ".curate.lock")
+   (str db-rel ".curate.log")
    (str db-rel ".evidence/")
    (str db-rel ".oplog/")
    (str db-rel ".retrievals")
-   (str db-rel ".last-consolidate")
    (str db-rel ".version")])
 
 (defn gitignore-block [db-rel]
@@ -299,8 +300,7 @@
                         {:status :dry-run
                          :note "would wire the SessionEnd ambient loop (hooks install)"}
                         (attempt #(hooks/install!
-                                   (assoc (select-keys opts [:harness :settings-file
-                                                             :consolidate-days :coach])
+                                   (assoc (select-keys opts [:harness :settings-file :coach])
                                           :project project :bin bin))))
                :mcp (if mcp
                       (attempt #(install-mcp! {:project project :bin bin :dry-run dry-run}))
@@ -334,7 +334,7 @@
 
   opts: :project (default cwd) :bin (claim executable; auto-detects a
         repo-local bin/claim) :db :harness :settings-file :skills-dir
-        :consolidate-days :coach :mcp :dry-run
+        :coach :mcp :dry-run
         :chosen (explicit settings to persist to the project config)
         :which (prerequisite lookup, injectable for tests)
         :init-fn (opens/seeds the store; injectable so tests and --dry-run

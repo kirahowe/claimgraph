@@ -52,11 +52,11 @@
 
 (deftest numeric-coercion-from-env-and-config
   (is (= {:value 3 :source :env}
-         (config/resolve-setting :consolidate-days
-                                 {:opts {} :env {"CLAIMGRAPH_CONSOLIDATE_DAYS" "3"}})))
+         (config/resolve-setting :budget
+                                 {:opts {} :env {"CLAIMGRAPH_BUDGET" "3"}})))
   (is (= {:value 5 :source :config}
-         (config/resolve-setting :consolidate-days
-                                 {:opts {} :env {} :config {:consolidate-days 5}}))
+         (config/resolve-setting :budget
+                                 {:opts {} :env {} :config {:budget 5}}))
       "a JSON number needs no coercion"))
 
 (deftest a-settings-name-is-the-flag-that-sets-it
@@ -80,7 +80,7 @@
         "env layer fills an absent flag")
     (is (= {:harness "x"} (config/merge-defaults {:harness "x"} ctx [:harness]))
         "an explicit flag is never overwritten"))
-  (is (= {} (config/merge-defaults {} {:env {} :config nil} [:harness :consolidate-days]))
+  (is (= {} (config/merge-defaults {} {:env {} :config nil} [:harness :budget]))
       "static defaults stay owned by each consumer — merge fills nothing"))
 
 (deftest config-file-path-override
@@ -92,15 +92,15 @@
   (let [dir (fs/create-temp-dir {:prefix "claimgraph-config-test"})
         path (str (fs/path dir "config.json"))]
     (is (nil? (config/read-config-file path)) "absent file reads as nil")
-    (spit path "{\"harness\": \"codex\", \"consolidate-days\": 3}")
-    (is (= {:harness "codex" :consolidate-days 3} (config/read-config-file path)))))
+    (spit path "{\"harness\": \"codex\", \"budget\": 3}")
+    (is (= {:harness "codex" :budget 3} (config/read-config-file path)))))
 
 ;; ---------------------------------------------------------------------------
 ;; Unrecognised config keys
 ;; ---------------------------------------------------------------------------
 
 (deftest a-key-claimgraph-never-reads-is-named-not-ignored
-  (is (= [] (config/unknown-keys {:db "/d" :notes-dir "/n" :consolidate-days 3}))
+  (is (= [] (config/unknown-keys {:db "/d" :notes-dir "/n" :budget 3}))
       "every registry key is recognised")
   (is (= [] (config/unknown-keys {:llm-timeout-ms 30000}))
       "including the LLM call timeout, which read its environment variable
@@ -200,7 +200,7 @@
 (deftest the-file-setup-writes-reads-back-stamped
   (let [dir (fs/create-temp-dir {:prefix "claimgraph-config-stamp-test"})
         path (str (fs/path dir "config.json"))
-        written {:harness "codex" :consolidate-days 3
+        written {:harness "codex" :budget 3
                  :config-version version/format-version}]
     (spit path (json/generate-string written {:pretty true}))
     (is (= written (config/read-config-file path))
@@ -509,11 +509,15 @@
                                     :min-confidence)))
         "0.8 reads as \"high-confidence facts\" and silently meant \"act on
          verdicts\"; the old spelling still resolves to the gate")
-    (doseq [cmds [["judge"] ["consolidate"] ["hooks" "run"]]]
+    (doseq [cmds [["judge"] ["consolidate"]]]
       (is (contains? (:spec (table-entry cmds)) :min-verdict-confidence)
           (str (str/join " " cmds) " takes the verdict gate"))
       (is (contains? (:spec (table-entry cmds)) :min-confidence)
-          "and still parses the name its README teaches")))
+          "and still parses the name its README teaches"))
+    (is (not-any? #(contains? (:spec (table-entry ["hooks" "run"])) %)
+                  [:min-verdict-confidence :min-confidence :resolve])
+        "`hooks run` took the gate while it consolidated inline; it captures now
+         and every verdict belongs to the curator it spawns"))
   (testing "while the read verbs keep --min-confidence for what it filters"
     (doseq [cmds [["facts"] ["neighbor"]]]
       (is (contains? (:spec (table-entry cmds)) :min-confidence))

@@ -289,8 +289,14 @@
   therefore the count of candidates left UNREACHED, an upper bound on the
   calls still owed: some of them will turn out external-only and cost
   nothing. Naming an upper bound beats walking the whole tail on a store
-  where most alias-less entities are somebody else's library."
-  [s run spend!]
+  where most alias-less entities are somebody else's library.
+
+  `apply!` wraps the alias application and nothing else: adding an alias is
+  the one decide-bearing write in this pass (core/alias-entity refuses a clash
+  with another entity's name), so it is the one that has to be serialized
+  against other writers. The attempt record minted beside it decides nothing
+  and stays leaseless — and neither may be held across the model call above."
+  [s run spend! apply!]
   (let [now (core/now)
         attempted (attempted-enrich-refs (store/-list-episodes s))
         candidates (enrichment-candidates (store/-list-entities s {})
@@ -314,7 +320,7 @@
               (if-not reply
                 ;; errored: nothing recorded, so the entity stays a candidate
                 (recur more (inc asked) enriched)
-                (let [added (add-aliases! s e (parse-aliases (:text reply) e))]
+                (let [added (apply! #(add-aliases! s e (parse-aliases (:text reply) e)))]
                   (record-enrichment-attempt! s e added)
                   (recur more (inc asked)
                          (cond-> enriched
@@ -322,11 +328,14 @@
 
 (defn sub-stage-errors
   "The internally-caught failures a consolidate! report carries, keyed by
-  stage. The stamp gate reads this (spec/maintenance.allium, decided
-  2026-07-26): a pass with any of these is not CLEAN — it must stay due and
-  retry next session rather than wait out a full consolidation window.
-  (Episode summaries never appear here: the mechanical digest means that
-  stage always makes progress.)"
+  stage — a report aggregator, and nothing more.
+
+  It used to feed the stamp gate, which withheld the stamp when any of these
+  appeared so the whole pass stayed due. There is no stamp to withhold now
+  (spec/maintenance.allium, decided 2026-08-05): a failed call minted no
+  outcome record, so its work is still pending BY DERIVATION and the next run
+  retries exactly it rather than the pass around it. (Episode summaries never
+  appear here: the mechanical digest means that stage always makes progress.)"
   [{:keys [conflicts sweep enrichment]}]
   (into {}
         (keep (fn [[stage r]] (when (:error r) [stage (:error r)])))
@@ -340,6 +349,10 @@
         :min-usage (promotion-candidate threshold, default 3)
         :budget (model calls for the WHOLE pass; default 20)
         :evidence-dir (keep judge replies as content-addressed artifacts)
+        :apply! (fn [thunk] ...) wrapping the ONE decide-bearing write in the
+                pass — alias application, which refuses a name clash. Default:
+                run it. The curator passes a write-lease wrapper so that hold
+                lasts one application instead of the whole pass.
 
   The stages share one budget and are spent in the order written —
   judgments, summaries, sweep, enrichment: most valuable first, because a
@@ -352,8 +365,9 @@
   stamp and no cadence: what is due is whatever the records say is still
   undone."
   [s {:keys [command summarize-fn judge-fn enrich-fn resolve min-confidence min-usage
-             budget evidence-dir]}]
-  (let [allowed (max 0 (if (number? budget) (long budget) default-call-budget))
+             budget evidence-dir apply!]}]
+  (let [apply! (or apply! (fn [f] (f)))
+        allowed (max 0 (if (number? budget) (long budget) default-call-budget))
         spent (atom 0)
         spend! (fn [] (when (< @spent allowed) (swap! spent inc) true))
         run (or summarize-fn (partial llm/complete! (llm/command command)))
@@ -375,7 +389,7 @@
         episodes (summarize-episodes! s run spend! (plan-episodes all-episodes ep-facts))
         sweep (try (judge/sweep-conflicts! s judge-opts)
                    (catch Exception e {:error (ex-message e)}))
-        enrichment (try (enrich-entities! s (or enrich-fn run) spend!)
+        enrichment (try (enrich-entities! s (or enrich-fn run) spend! apply!)
                         (catch Exception e {:error (ex-message e)}))]
     {:status :consolidated
      :budget {:allowed allowed :spent @spent}
