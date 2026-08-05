@@ -14,3 +14,6 @@ bench/results/
 book/rendered/
 .clay/
 .cpcache/
+
+# clj-kondo lint cache (imports/ stays tracked: it pins the analyzed lib configs)
+.clj-kondo/.cache/
