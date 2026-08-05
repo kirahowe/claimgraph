@@ -8,14 +8,23 @@
     compatible  — both can hold; not actually in conflict
 
   Functional core / imperative shell: prompt construction, verdict parsing,
-  and the resolution plan are pure; `judge-conflicts!` iterates the store's
-  open conflicts through the pluggable LLM (same subscription-as-judge
-  mechanism as the session extractor; tests inject :judge-fn).
+  the verdict ref, and the resolution plan are pure; `judge-conflicts!`
+  iterates the store's open conflicts through the pluggable LLM (same
+  subscription-as-judge mechanism as the session extractor; tests inject
+  :judge-fn).
 
   By default the judge only enriches — it reports verdicts and acts on
   nothing. With :resolve it executes the plan for verdicts at or above
   :min-confidence, and even then a contradicts verdict is never auto-resolved:
-  surfacing those to the human is the point of the flag machinery."
+  surfacing those to the human is the point of the flag machinery.
+
+  Every delivered verdict is RECORDED as a curation episode whose ref is the
+  verdict itself (`record-verdict!`), so no unchanged pair is ever judged
+  twice: the episode log is the judge's memory, exactly as it is ingestion's
+  delta state. A pair whose verdict the graph already holds costs no model
+  call — an enrich-only run reports the record, a resolve run acts on it.
+  That is also what makes the sweep terminate: before records, the same
+  benign `compatible` pairs were re-bought from the judge every single pass."
   (:require [cheshire.core :as json]
             [clojure.string :as str]
             [claimgraph.core :as core]
@@ -177,8 +186,113 @@
             :compatible {:action :unlink})))
 
 ;; ---------------------------------------------------------------------------
+;; Pure: the verdict record (a curation episode ref)
+;; ---------------------------------------------------------------------------
+
+(def verdict-ref-prefix "verdict:")
+
+(defn- conf-str
+  "Confidence at two decimal places, LOCALE-FIXED. `format` follows the
+  default locale, and under a comma-decimal one (de_DE, fr_FR) the same
+  verdict would spell its ref \"@0,90\" — a second, unreadable record for a
+  verdict the graph already holds, which is precisely the re-judging this
+  record exists to end."
+  [confidence]
+  (String/format java.util.Locale/ROOT "%.2f" (to-array [(double confidence)])))
+
+(defn verdict-ref
+  "The curation episode ref that records one pair's verdict:
+
+    verdict:<idA>+<idB>=<relation>@<confidence>
+
+  The ids are sorted lexically and the confidence is fixed to two places, so
+  the spelling is CANONICAL: the same judgment about the same pair produces
+  a byte-identical ref no matter which side the caller called newer. That is
+  what lets `record-verdict!` be idempotent on re-delivery and what lets
+  `recorded-verdicts` answer for a pair without knowing its orientation.
+
+  Fact ids are immutable content snapshots, which is why a per-id-pair
+  record can be final: changed content mints a new id, so re-judgment happens
+  exactly when the claim actually changed and never on a clock."
+  [id-a id-b relation confidence]
+  (let [[x y] (sort [(str id-a) (str id-b)])]
+    (str verdict-ref-prefix x "+" y "=" (name relation) "@" (conf-str confidence))))
+
+(def ^:private verdict-ref-re #"^verdict:([^+]+)\+([^=]+)=([^@]+)@([^@]+)$")
+
+(defn recorded-verdicts
+  "Episodes -> {#{id-a id-b} {:relation kw :confidence double}}: the verdicts
+  the judge has already delivered, parsed back out of curation episode refs.
+  The episode log IS the judge's memory — no counters, no stamp files, no
+  bookkeeping surface beside the graph.
+
+  Tolerant like every other ref parser here: a ref that doesn't match the
+  shape, names a relation this build doesn't know, or carries a
+  non-numeric confidence is skipped silently. The cost of a ref we can't read
+  is one re-judgment, and that must never be an exception on an unrelated
+  read."
+  [episodes]
+  (reduce (fn [m {:keys [source-type ref]}]
+            (if-not (= :curation source-type)
+              m
+              (let [[_ a b relation confidence] (re-matches verdict-ref-re (str ref))
+                    relation (some-> relation logic/->kw)
+                    confidence (some-> confidence parse-double)]
+                (if (and (relations relation) confidence)
+                  (assoc m #{a b} {:relation relation :confidence confidence})
+                  m))))
+          {} episodes))
+
+(defn- fact-phrase [f]
+  (let [{:keys [subject predicate object]} (fact->summary f)]
+    (str subject " " (subs (str predicate) 1) " " object)))
+
+(defn verdict-summary
+  "The human-readable half of a verdict record: what was judged, how sure,
+  and why. The ref carries the machine-readable copy; this is what a person
+  reading `claim episodes` — or a full-text search over episode summaries —
+  actually sees."
+  [{:keys [fact candidate]} {:keys [relation confidence rationale]}]
+  (str "judged " (name relation) " (" (conf-str confidence) "): "
+       (fact-phrase fact) " vs " (fact-phrase candidate)
+       (when-not (str/blank? (str rationale)) (str " — " rationale))))
+
+;; ---------------------------------------------------------------------------
 ;; Shell
 ;; ---------------------------------------------------------------------------
+
+(defn record-verdict!
+  "Mint the curation episode that makes one delivered verdict durable:
+  source :curation, the canonical ref, closed at creation with a readable
+  summary. Returns the ref it recorded, or nil when it recorded nothing.
+
+  IDEMPOTENT on the ref — an episode already carrying it means this verdict
+  is already the graph's, and re-delivery (a resolve run acting on a stored
+  verdict, a re-run of the same pass) must not mint a second copy.
+
+  An UNPARSEABLE verdict records NOTHING: an unanswered question has to be
+  retried under a later budget, while a recorded non-answer would skip a
+  real conflict forever.
+
+  With :evidence-dir the judge's raw reply is kept as a content-addressed
+  artifact and pointed at by the episode, the same tier the ingest paths
+  write to — a verdict is a judgment call and the bytes behind it are what
+  makes it auditable. An evidence write that fails must not cost the record
+  itself: without the record the pair would be re-judged forever, so the
+  episode is minted regardless and simply carries no pointer."
+  [s pair {:keys [relation confidence] :as verdict} {:keys [evidence-dir reply]}]
+  (when (relations relation)
+    (let [ref (verdict-ref (:id (:fact pair)) (:id (:candidate pair)) relation confidence)]
+      (when-not (some #(= ref (str (:ref %))) (store/-list-episodes s))
+        (let [evidence (when (and evidence-dir reply)
+                         (try ((requiring-resolve 'claimgraph.evidence/write!)
+                               evidence-dir reply)
+                              (catch Exception _ nil)))
+              ep (core/open-episode s {:source-type :curation :ref ref
+                                       :evidence evidence})]
+          (core/close-episode s {:episode (:id ep)
+                                 :summary (verdict-summary pair verdict)})
+          ref)))))
 
 (defn- execute-resolution! [s at {:keys [fact candidate]} plan]
   (case (:action plan)
@@ -188,47 +302,91 @@
     nil))
 
 (defn judge-conflicts!
-  "Run the judge over every open conflict.
+  "Run the judge over every open conflict THE JUDGE HAS NOT ALREADY ANSWERED.
   opts: :command (LLM command string; default $CLAIMGRAPH_LLM_CMD or claude -p)
         :judge-fn (prompt -> response; injectable, used by tests)
         :resolve (execute resolution plans; default false = enrich only)
-        :min-confidence (gate for acting on a verdict; default 0.8)"
-  [s {:keys [command judge-fn resolve min-confidence]}]
+        :min-confidence (gate for acting on a verdict; default 0.8)
+        :spend! (0-arg budget gate; truthy = one model call is affordable.
+                 Default unlimited)
+        :evidence-dir (keep judge replies as content-addressed artifacts)
+
+  A pair whose verdict is already recorded never costs a second model call:
+  an enrich-only run reports the record (:from-record true, the conflict
+  listing enriched for free), and a resolve run runs the recorded relation
+  and confidence through the same resolution plan a fresh verdict would take
+  — acting on knowledge the graph holds is free, so it is not metered.
+
+  Pairs the budget did not reach are counted in :deferred rather than
+  dropped quietly: nothing was recorded for them, so they are still pending
+  by derivation and the next run picks them up where this one stopped."
+  [s {:keys [command judge-fn resolve min-confidence spend! evidence-dir]}]
   (let [at (java.util.Date.)
         run (or judge-fn (partial llm/complete! (llm/command command)))
+        spend! (or spend! (constantly true))
         min-confidence (double (or min-confidence default-min-confidence))
+        recorded (recorded-verdicts (store/-list-episodes s))
+        deferred (atom 0)
         results
-        (mapv (fn [{:keys [fact candidate] :as pair}]
-                (let [verdict (parse-judgment
-                               (run (judgment-prompt pair
-                                                     (store/-get-predicate s (:predicate fact))
-                                                     (store/-get-predicate s (:predicate candidate)))))
-                      plan (resolution-plan pair verdict min-confidence)]
-                  (when resolve
-                    (execute-resolution! s at pair plan))
-                  (cond-> {:fact (fact->summary fact)
-                           :candidate (fact->summary candidate)
-                           :verdict verdict
-                           :plan plan}
-                    resolve (assoc :executed (not= :none (:action plan))))))
+        (into []
+              (keep (fn [{:keys [fact candidate] :as pair}]
+                      (let [seen (recorded #{(:id fact) (:id candidate)})
+                            ;; wrapped, so a judge-fn answering nil is still a
+                            ;; delivery (it parses to unparseable) and not a
+                            ;; deferral
+                            reply (when-not seen
+                                    (if (spend!)
+                                      {:text (run (judgment-prompt
+                                                   pair
+                                                   (store/-get-predicate s (:predicate fact))
+                                                   (store/-get-predicate s (:predicate candidate))))}
+                                      (do (swap! deferred inc) nil)))]
+                        (when (or seen reply)
+                          (let [verdict (or seen (parse-judgment (:text reply)))
+                                plan (resolution-plan pair verdict min-confidence)]
+                            (when reply
+                              (record-verdict! s pair verdict
+                                               {:evidence-dir evidence-dir
+                                                :reply (:text reply)}))
+                            (when resolve
+                              (execute-resolution! s at pair plan))
+                            (cond-> {:fact (fact->summary fact)
+                                     :candidate (fact->summary candidate)
+                                     :verdict verdict
+                                     :plan plan}
+                              seen (assoc :from-record true)
+                              resolve (assoc :executed (not= :none (:action plan)))))))))
               (:conflicts (core/conflicts s)))]
-    {:conflicts (count results)
-     :resolved (count (filter :executed results))
-     :results results}))
+    (cond-> {:conflicts (count results)
+             :resolved (count (filter :executed results))
+             :results results}
+      (pos? @deferred) (assoc :deferred @deferred))))
 
 (defn sweep-conflicts!
   "Deferred candidate generation: propose judgeable pairs the write path
   can't see (pure, per-subject bounded — logic/conflict-candidates), run each
-  through the LLM verdict once, and link genuine hits into the same conflict
-  pipeline. Compatible and unparseable verdicts are dropped silently — a
-  noisy generator can't mutate anything. Linked contradictions surface in
-  `conflicts` for the human; with :resolve, duplicate/supersedes verdicts at
-  or above :min-confidence are executed immediately (same resolution plans
-  as judge-conflicts!)."
-  [s {:keys [command judge-fn resolve min-confidence]}]
+  through the LLM verdict ONCE EVER, and link genuine hits into the same
+  conflict pipeline. Linked contradictions surface in `conflicts` for the
+  human; with :resolve, duplicate/supersedes verdicts at or above
+  :min-confidence are executed immediately (same resolution plans as
+  judge-conflicts!).
+
+  \"Once ever\" is structural, not remembered in place: candidates skip pairs
+  that are already linked AND pairs with a recorded verdict, and EVERY
+  parseable verdict is recorded — compatible included, which is the whole
+  point. A compatible verdict still mutates nothing (the pair was never
+  linked), but dropping it silently is what made the sweep re-buy the same
+  benign pairs from the judge every pass. Only an unparseable reply leaves no
+  record and retries under a later budget.
+
+  opts: as judge-conflicts!, including :spend! and :evidence-dir."
+  [s {:keys [command judge-fn resolve min-confidence spend! evidence-dir]}]
   (let [at (java.util.Date.)
         run (or judge-fn (partial llm/complete! (llm/command command)))
+        spend! (or spend! (constantly true))
         min-confidence (double (or min-confidence default-min-confidence))
+        recorded (recorded-verdicts (store/-list-episodes s))
+        deferred (atom 0)
         preds (store/-list-predicates s {})
         preds-by-id (into {} (map (juxt :id identity)) preds)
         watched (->> preds
@@ -248,25 +406,33 @@
                 (store/-get-facts-for s subject-ids {:direction :out})
                 [])
         results
-        (mapv (fn [{:keys [fact candidate reason] :as pair}]
-                (let [verdict (parse-judgment
-                               (run (judgment-prompt pair
-                                                     (preds-by-id (:predicate fact))
-                                                     (preds-by-id (:predicate candidate)))))
-                      hit? (#{:contradicts :duplicate :supersedes} (:relation verdict))
-                      plan (when hit? (resolution-plan pair verdict min-confidence))]
-                  (when hit?
-                    (store/-link-conflicts s (:id fact) [(:id candidate)])
-                    (when resolve
-                      (execute-resolution! s at pair plan)))
-                  (cond-> {:fact (fact->summary fact)
-                           :candidate (fact->summary candidate)
-                           :reason reason
-                           :verdict verdict}
-                    hit? (assoc :linked true :plan plan)
-                    (and hit? resolve) (assoc :executed (not= :none (:action plan))))))
-              (logic/conflict-candidates facts preds-by-id at))]
-    {:candidates (count results)
-     :linked (count (filter :linked results))
-     :resolved (count (filter :executed results))
-     :results results}))
+        (into []
+              (keep (fn [{:keys [fact candidate reason] :as pair}]
+                      (if-not (spend!)
+                        (do (swap! deferred inc) nil)
+                        (let [reply (run (judgment-prompt pair
+                                                          (preds-by-id (:predicate fact))
+                                                          (preds-by-id (:predicate candidate))))
+                              verdict (parse-judgment reply)
+                              hit? (#{:contradicts :duplicate :supersedes} (:relation verdict))
+                              plan (when hit? (resolution-plan pair verdict min-confidence))]
+                          (record-verdict! s pair verdict {:evidence-dir evidence-dir
+                                                           :reply reply})
+                          (when hit?
+                            (store/-link-conflicts s (:id fact) [(:id candidate)])
+                            (when resolve
+                              (execute-resolution! s at pair plan)))
+                          (cond-> {:fact (fact->summary fact)
+                                   :candidate (fact->summary candidate)
+                                   :reason reason
+                                   :verdict verdict}
+                            hit? (assoc :linked true :plan plan)
+                            (and hit? resolve) (assoc :executed (not= :none (:action plan))))))))
+              (remove (fn [{:keys [fact candidate]}]
+                        (recorded #{(:id fact) (:id candidate)}))
+                      (logic/conflict-candidates facts preds-by-id at)))]
+    (cond-> {:candidates (count results)
+             :linked (count (filter :linked results))
+             :resolved (count (filter :executed results))
+             :results results}
+      (pos? @deferred) (assoc :deferred @deferred))))

@@ -12,7 +12,7 @@
             [claimgraph.core :as core]
             [claimgraph.judge :as judge]
             [claimgraph.llm :as llm]
-            [claimgraph.store]
+            [claimgraph.store :as store]
             [claimgraph.store.memory :as mem]))
 
 (deftest verdict-parsing-is-tolerant
@@ -136,6 +136,73 @@
       (is (= {:action :none :reason :unparseable}
              (judge/resolution-plan pair {:relation :unparseable :confidence 0.0} 0.8))))))
 
+(defn- verdict-fn [relation confidence]
+  (fn [_prompt]
+    (str "{\"relation\":\"" (name relation) "\",\"confidence\":" confidence "}")))
+
+(defn- counting-judge
+  "A verdict-fn that counts its invocations. The count is the assertion that
+  matters for records: a pair the graph already holds a verdict for must cost
+  no model call at all."
+  [calls relation confidence]
+  (let [answer (verdict-fn relation confidence)]
+    (fn [prompt] (swap! calls inc) (answer prompt))))
+
+(defn- refuse-to-judge [_prompt]
+  (throw (ex-info "the judge must not be called for a recorded verdict" {})))
+
+(defn- curation-refs
+  "The curation episode refs the store holds, by prefix — the whole of the
+  curator's memory, read the way the code reads it."
+  [s prefix]
+  (->> (store/-list-episodes s)
+       (filter #(= :curation (:source-type %)))
+       (map (comp str :ref))
+       (filterv #(str/starts-with? % prefix))))
+
+(deftest verdict-refs-are-canonical
+  (testing "ids sort and confidence is fixed to two places: one spelling per verdict"
+    (is (= "verdict:f-a+f-b=duplicate@0.90" (judge/verdict-ref "f-b" "f-a" :duplicate 0.9)))
+    (is (= (judge/verdict-ref "f-a" "f-b" :duplicate 0.9)
+           (judge/verdict-ref "f-b" "f-a" :duplicate 0.9))
+        "orientation must not change the record, or a re-judged pair mints a second one"))
+  (testing "recorded-verdicts reads them back, orientation-free"
+    (is (= {#{"f-a" "f-b"} {:relation :duplicate :confidence 0.9}}
+           (judge/recorded-verdicts
+            [{:source-type :curation :ref "verdict:f-a+f-b=duplicate@0.90"}]))))
+  (testing "refs that aren't curation verdicts are skipped, never thrown on"
+    ;; the cost of a ref this build can't read is one re-judgment; an
+    ;; exception here would be an exception on an unrelated episode read
+    (is (empty? (judge/recorded-verdicts
+                 [{:source-type :session-log :ref "verdict:f-a+f-b=duplicate@0.90"}
+                  {:source-type :curation :ref "enrich:e-1@authservice"}
+                  {:source-type :curation :ref "verdict:f-a+f-b=sideways@0.90"}
+                  {:source-type :curation :ref "verdict:f-a+f-b=duplicate@high"}
+                  {:source-type :curation :ref "verdict:nonsense"}
+                  {:source-type :curation}])))))
+
+(deftest record-verdict-is-idempotent
+  (let [s (mem/create)
+        pair {:fact {:id "f-new" :subject {:name "ADR-1"} :predicate :core/has-status
+                     :object-lit "superseded"}
+              :candidate {:id "f-old" :subject {:name "ADR-1"} :predicate :core/has-status
+                          :object-lit "accepted"}}
+        verdict {:relation :supersedes :confidence 0.9 :rationale "B is outdated"}]
+    (is (= "verdict:f-new+f-old=supersedes@0.90"
+           (judge/record-verdict! s pair verdict {})))
+    (testing "re-delivery records nothing: a resolve run acts on a stored verdict"
+      (is (nil? (judge/record-verdict! s pair verdict {})))
+      (is (= 1 (count (curation-refs s "verdict:")))))
+    (testing "the episode is closed at creation, with the readable half in its summary"
+      (let [ep (first (store/-list-episodes s))]
+        (is (some? (:closed-at ep)))
+        (is (= (str "judged supersedes (0.90): ADR-1 core/has-status superseded"
+                    " vs ADR-1 core/has-status accepted — B is outdated")
+               (:summary ep)))))
+    (testing "an unparseable verdict records NOTHING — an unanswered question retries"
+      (is (nil? (judge/record-verdict! s pair {:relation :unparseable :confidence 0.0} {})))
+      (is (= 1 (count (curation-refs s "verdict:")))))))
+
 (defn- store-with-conflict
   "A store holding one open commitment conflict: ADR-1 has-status accepted
   (established) vs superseded (newer, flagged)."
@@ -146,9 +213,6 @@
     (core/assert-fact s {:subject "ADR-1" :predicate :core/has-status :object "superseded"})
     s))
 
-(defn- verdict-fn [relation confidence]
-  (fn [_prompt]
-    (str "{\"relation\":\"" (name relation) "\",\"confidence\":" confidence "}")))
 
 (deftest judge-enriches-without-resolving-by-default
   (let [s (store-with-conflict)
@@ -196,28 +260,148 @@
   (let [s (store-with-conflict)]
     (is (= 1 (:open-conflicts (core/stats s))))))
 
+(deftest judged-pairs-are-recorded-and-never-re-judged
+  (let [s (store-with-conflict)
+        calls (atom 0)
+        r (judge/judge-conflicts! s {:judge-fn (counting-judge calls :duplicate 0.9)})]
+    (is (= 1 @calls))
+    (is (nil? (get-in r [:results 0 :from-record])) "a fresh verdict is not a record")
+    (is (= 1 (count (curation-refs s "verdict:"))))
+    (testing "an enrich-only re-run reports the record and calls nobody"
+      (let [again (judge/judge-conflicts! s {:judge-fn refuse-to-judge})]
+        (is (= 1 (:conflicts again)))
+        (is (true? (get-in again [:results 0 :from-record])))
+        (is (= {:relation :duplicate :confidence 0.9}
+               (get-in again [:results 0 :verdict])))
+        (is (= 1 (:open (core/conflicts s))) "reporting a record resolves nothing")))
+    (testing "a resolve run executes the RECORDED verdict, still without a model call"
+      (let [resolved (judge/judge-conflicts! s {:judge-fn refuse-to-judge :resolve true})]
+        (is (= 1 (:resolved resolved)))
+        (is (true? (get-in resolved [:results 0 :from-record])))
+        (is (zero? (:open (core/conflicts s))))
+        (is (= ["accepted"] (mapv :object-lit (:facts (core/get-facts s {:entity "ADR-1"}))))
+            "duplicate closes the newer fact, exactly as a fresh verdict would")))
+    (is (= 1 @calls) "one pair, one verdict, one call — ever")))
+
+(deftest a-recorded-verdict-keeps-the-judges-reply-as-evidence
+  (let [s (store-with-conflict)
+        dir (str (fs/create-temp-dir {:prefix "claimgraph-verdict-evidence"}))
+        reply "{\"relation\":\"duplicate\",\"confidence\":0.9,\"rationale\":\"A restates B\"}"]
+    (judge/judge-conflicts! s {:judge-fn (constantly reply) :evidence-dir dir})
+    (let [ep (first (filter #(= :curation (:source-type %)) (store/-list-episodes s)))]
+      (is (some? (:evidence ep)))
+      (is (= reply ((requiring-resolve 'claimgraph.evidence/fetch) dir (:evidence ep)))
+          "a verdict is a judgment call — the bytes behind it stay auditable"))))
+
+(deftest a-recorded-verdict-below-the-gate-still-costs-nothing
+  ;; The gate is on ACTING, not on remembering: a 0.5 duplicate is recorded
+  ;; and replayed as a plan that declines, rather than re-bought every pass in
+  ;; the hope of a more confident answer to an unchanged question.
+  (let [s (store-with-conflict)
+        calls (atom 0)]
+    (judge/judge-conflicts! s {:judge-fn (counting-judge calls :duplicate 0.5)})
+    (let [r (judge/judge-conflicts! s {:judge-fn refuse-to-judge :resolve true})]
+      (is (zero? (:resolved r)))
+      (is (= :low-confidence (get-in r [:results 0 :plan :reason])))
+      (is (= 1 (:open (core/conflicts s))))
+      (is (= 1 @calls)))))
+
+(deftest unparseable-verdicts-record-nothing-and-are-retried
+  (let [s (store-with-conflict)
+        calls (atom 0)
+        garbage (fn [_] (swap! calls inc) "I can't judge these two.")]
+    (judge/judge-conflicts! s {:judge-fn garbage})
+    (is (empty? (curation-refs s "verdict:"))
+        "a recorded non-answer would skip a real conflict forever")
+    (judge/judge-conflicts! s {:judge-fn garbage})
+    (is (= 2 @calls) "the question is asked again next run, bounded by the budget")))
+
+(deftest the-budget-defers-unjudged-pairs-instead-of-dropping-them
+  (let [s (store-with-conflict)
+        calls (atom 0)
+        r (judge/judge-conflicts! s {:judge-fn (counting-judge calls :duplicate 0.9)
+                                     :spend! (constantly false)})]
+    (is (zero? @calls))
+    (is (zero? (:conflicts r)))
+    (is (= 1 (:deferred r)) "a bounded run must never read as a complete one")
+    (is (empty? (curation-refs s "verdict:")))
+    (testing "and the next run, with budget, picks it up"
+      (judge/judge-conflicts! s {:judge-fn (counting-judge calls :duplicate 0.9)})
+      (is (= 1 @calls))
+      (is (= 1 (count (curation-refs s "verdict:")))))))
+
 (defn- seeded []
   (doto (mem/create) (core/seed!)))
 
-(deftest sweep-proposes-judges-and-links
+(defn- store-with-swept-pair
+  "Two exclusive preferences on one subject: invisible to the write path by
+  design, and exactly one candidate for the deferred sweep."
+  []
   (let [s (seeded)]
-    ;; two exclusive preferences: invisible to the write path by design
     (core/assert-fact s {:subject "fmt" :predicate :core/prefers :object "tabs"})
     (core/assert-fact s {:subject "fmt" :predicate :core/prefers :object "spaces"})
+    s))
+
+(deftest sweep-records-the-compatible-verdicts-it-acts-on-least
+  ;; The pair that mutates nothing is the one that used to be re-bought
+  ;; forever: compatible verdicts were dropped silently, so the same benign
+  ;; candidates went back to the judge every single pass. The record IS the
+  ;; entire effect here, and it is the reason a converged store's sweep is
+  ;; free.
+  (let [s (store-with-swept-pair)
+        calls (atom 0)
+        judge (counting-judge calls :compatible 0.9)]
     (is (zero? (:open (core/conflicts s))) "value exclusivity is not a write-time concern")
-    (testing "compatible verdicts are dropped silently — a noisy generator mutates nothing"
-      (let [r (judge/sweep-conflicts! s {:judge-fn (verdict-fn :compatible 0.9)})]
-        (is (= 1 (:candidates r)))
-        (is (zero? (:linked r)))
-        (is (zero? (:open (core/conflicts s))))))
+    (let [r (judge/sweep-conflicts! s {:judge-fn judge})]
+      (is (= 1 (:candidates r)))
+      (is (zero? (:linked r)))
+      (is (zero? (:open (core/conflicts s))) "a noisy generator still mutates nothing"))
+    (is (= 1 (count (curation-refs s "verdict:"))))
+    (testing "a second pass proposes nothing and asks nobody"
+      (let [again (judge/sweep-conflicts! s {:judge-fn judge})]
+        (is (zero? (:candidates again)))
+        (is (zero? (:linked again)))
+        (is (= 1 @calls))
+        (is (zero? (:open (core/conflicts s))))))))
+
+(deftest sweep-proposes-judges-links-and-records
+  (let [s (store-with-swept-pair)
+        calls (atom 0)
+        judge (counting-judge calls :contradicts 0.95)]
     (testing "a contradicts verdict links into the pipeline for the human"
-      (let [r (judge/sweep-conflicts! s {:judge-fn (verdict-fn :contradicts 0.95)})]
+      (let [r (judge/sweep-conflicts! s {:judge-fn judge})]
         (is (= 1 (:linked r)))
         (is (zero? (:resolved r)) "contradictions are never auto-resolved, even swept ones")
-        (is (= 1 (:open (core/conflicts s))))))
-    (testing "linked pairs are not proposed again"
-      (is (zero? (:candidates (judge/sweep-conflicts!
-                               s {:judge-fn (verdict-fn :contradicts 0.95)})))))))
+        (is (= 1 (:open (core/conflicts s))))
+        (is (= 1 (count (curation-refs s "verdict:"))) "the hit is recorded too")))
+    (testing "linked pairs are not proposed again, and cost nothing when they aren't"
+      (let [again (judge/sweep-conflicts! s {:judge-fn judge})]
+        (is (zero? (:candidates again)))
+        (is (= 1 @calls))
+        (is (= 1 (:open (core/conflicts s))) "and nothing is linked a second time")))))
+
+(deftest sweep-records-nothing-for-an-unparseable-reply
+  (let [s (store-with-swept-pair)
+        calls (atom 0)
+        garbage (fn [_] (swap! calls inc) "no idea")]
+    (let [r (judge/sweep-conflicts! s {:judge-fn garbage})]
+      (is (= 1 (:candidates r)))
+      (is (zero? (:linked r))))
+    (is (empty? (curation-refs s "verdict:")))
+    (is (= 1 (:candidates (judge/sweep-conflicts! s {:judge-fn garbage})))
+        "an unanswered candidate retries under the next run's budget")
+    (is (= 2 @calls))))
+
+(deftest sweep-defers-what-the-budget-cannot-reach
+  (let [s (store-with-swept-pair)
+        calls (atom 0)
+        r (judge/sweep-conflicts! s {:judge-fn (counting-judge calls :contradicts 0.9)
+                                     :spend! (constantly false)})]
+    (is (zero? @calls))
+    (is (zero? (:candidates r)))
+    (is (= 1 (:deferred r)))
+    (is (empty? (curation-refs s "verdict:")))
+    (is (zero? (:open (core/conflicts s))) "deferred is pending, not decided")))
 
 (deftest sweep-catches-decision-vs-structure
   (let [s (seeded)]

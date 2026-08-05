@@ -53,6 +53,24 @@
     (core/seed! s)
     s))
 
+(defn- curation-refs
+  "The curation episode refs the store holds, by prefix — the curator's whole
+  memory, read the way the code reads it."
+  [s prefix]
+  (->> (store/-list-episodes s)
+       (filter #(= :curation (:source-type %)))
+       (map (comp str :ref))
+       (filterv #(str/starts-with? % prefix))))
+
+(defn- enrich-recorder
+  "An enrich-fn that records WHICH entity each prompt asked about: with
+  attempts recorded, the calls a pass does not make are the behaviour under
+  test, and a count of aliases added cannot see them."
+  [asked reply]
+  (fn [prompt]
+    (swap! asked conj (str/trim (second (re-find #"(?m)^Entity: ([^\n\[]+)" prompt))))
+    reply))
+
 (deftest full-pass-with-injected-llm
   (let [s (seeded-store)
         ;; an open session episode with facts, including a staging predicate
@@ -103,14 +121,20 @@
     (is (some? (:summary (store/-get-episode s (:episode r)))))))
 
 (deftest enrichment-gives-entities-searchable-aliases
-  (testing "pure: candidates are alias-less, fact-bearing, bounded"
+  (testing "pure: candidates are alias-less, fact-bearing, most-used first, minus the attempted"
+    ;; The cap of 20 this used to carry is gone: the shared call budget is the
+    ;; only bound now, and with attempts recorded there is nothing left to
+    ;; ration — a hard cap would only hide the remainder from the report.
     (let [cands (consolidate/enrichment-candidates
                  [{:id "e1" :name "A" :aliases []}
                   {:id "e2" :name "B" :aliases ["already"]}
-                  {:id "e3" :name "C" :aliases []}]
-                 {"e1" 5 "e2" 9 "e3" 0})]
-      (is (= ["A"] (mapv :name cands))
-          "aliased and fact-less entities are skipped")))
+                  {:id "e3" :name "C" :aliases []}
+                  {:id "e4" :name "D" :aliases []}
+                  {:id "e5" :name "E" :aliases []}]
+                 {"e1" 5 "e2" 9 "e3" 0 "e4" 7 "e5" 6}
+                 #{(consolidate/enrich-ref {:id "e4" :name "D"})})]
+      (is (= ["E" "A"] (mapv :name cands))
+          "aliased, fact-less and already-asked entities are all skipped")))
   (testing "pure: alias parsing is tolerant and self-excluding"
     (is (= ["identity service" "sso"]
            (consolidate/parse-aliases
@@ -137,10 +161,136 @@
       (is (contains? (set (:aliases (:entity (core/get-facts s {:entity "identity service"}))))
                      "identity service")
           "the alias resolves like any other name")
-      (testing "second pass skips entities that now carry aliases"
-        (let [r2 (consolidate/consolidate!
+      (testing "second pass asks nobody: one is aliased now, the other was answered"
+        (let [asked (atom [])
+              r2 (consolidate/consolidate!
                   s {:summarize-fn (fn [_] "summary")
                      :judge-fn (fn [_] "")
-                     :enrich-fn (fn [_] "[\"more\"]")})]
+                     :enrich-fn (enrich-recorder asked "[\"more\"]")})]
+          (is (empty? @asked))
+          (is (zero? (get-in r2 [:enrichment :considered])))
           (is (not-any? #(= "AuthService" (:entity %))
                         (:enriched (:enrichment r2)))))))))
+
+(deftest an-answered-empty-enrichment-is-never-asked-again
+  (let [s (seeded-store)
+        asked (atom [])
+        opts {:summarize-fn (constantly "summary")
+              :judge-fn (constantly "{}")
+              :enrich-fn (enrich-recorder asked "[]")}]
+    (core/assert-fact s {:subject "AuthService" :predicate :core/prefers
+                         :object "argon2" :object-kind :literal})
+    (let [r (consolidate/consolidate! s opts)]
+      (is (= ["AuthService"] @asked))
+      (is (= 1 (get-in r [:enrichment :considered])))
+      (is (empty? (:enriched (:enrichment r)))))
+    (is (= [(consolidate/enrich-ref (:entity (core/get-facts s {:entity "AuthService"})))]
+           (curation-refs s "enrich:"))
+        "the DELIVERY is what is recorded, whatever it contained")
+    (testing "a second pass asks nobody: no-aliases is an answer, not a failure"
+      (reset! asked [])
+      (let [r2 (consolidate/consolidate! s opts)]
+        (is (empty? @asked))
+        (is (zero? (get-in r2 [:enrichment :considered])))
+        (is (zero? (get-in r2 [:budget :spent])) "a converged store's pass is free")))))
+
+(deftest an-errored-enrichment-call-records-nothing-and-retries
+  (let [s (seeded-store)
+        calls (atom 0)
+        boom (fn [_] (swap! calls inc) (throw (ex-info "LLM unavailable" {})))
+        opts {:summarize-fn (constantly "summary")
+              :judge-fn (constantly "{}")
+              :enrich-fn boom}]
+    (core/assert-fact s {:subject "AuthService" :predicate :core/prefers
+                         :object "argon2" :object-kind :literal})
+    (let [r (consolidate/consolidate! s opts)]
+      (is (= 1 @calls))
+      (is (empty? (curation-refs s "enrich:")))
+      (is (nil? (get-in r [:enrichment :error]))
+          "a failed enrichment is a skip, never a blocker"))
+    (consolidate/consolidate! s opts)
+    (is (= 2 @calls) "an errored call left the question open; it retries next budget")))
+
+(deftest external-only-entities-are-not-worth-a-model-call
+  (testing "pure: what the project's own knowledge touches"
+    (is (false? (consolidate/project-facing?
+                 {:id "e-lib"} [{:subject {:id "e-api"} :scope "external"}]))
+        "only ever the target of an external-scoped edge: somebody else's library")
+    (is (true? (consolidate/project-facing?
+                {:id "e-lib"} [{:subject {:id "e-lib"} :scope "external"}]))
+        "as the SUBJECT, the graph is saying something of its own about it")
+    (is (true? (consolidate/project-facing?
+                {:id "e-lib"} [{:subject {:id "e-api"} :scope "project"}]))))
+  (testing "the stage never buys aliases for clojure.string"
+    ;; observed 2026-08-05: entities like this are the most-depended-on in a
+    ;; code-ingested store, so usage order alone puts them first in line
+    (let [s (seeded-store)
+          asked (atom [])
+          opts {:summarize-fn (constantly "summary")
+                :judge-fn (constantly "{}")
+                :enrich-fn (enrich-recorder asked "[]")}]
+      (core/assert-fact s {:subject "shoply.api" :predicate :core/depends-on
+                           :object "clojure.string" :scope "external"})
+      (consolidate/consolidate! s opts)
+      (is (= ["shoply.api"] @asked))
+      (testing "but a fact the project asserts ABOUT it makes it a candidate"
+        (reset! asked [])
+        (core/assert-fact s {:subject "clojure.string" :predicate :core/prefers
+                             :object "the reader-friendly join" :object-kind :literal})
+        (consolidate/consolidate! s opts)
+        (is (= ["clojure.string"] @asked))))))
+
+(defn- pending-work-store
+  "Exactly three model calls of pending work, one per budgeted stage: an open
+  fact-bearing episode to summarize, an open conflict to judge, and one
+  alias-less entity to enrich. (The swept pair is the same one the write path
+  already flagged, so the sweep proposes nothing.)"
+  []
+  (let [s (seeded-store)]
+    (core/ingest s {:source-type :session-log :ref "sess-b"}
+                 [{:subject "ADR-1" :predicate "has-status" :object "accepted"}])
+    (core/assert-fact s {:subject "ADR-1" :predicate :core/has-status :object "superseded"})
+    s))
+
+(deftest the-budget-bounds-the-pass-and-names-what-it-deferred
+  (testing "budget 0: nothing is called, everything is named as deferred"
+    (let [s (pending-work-store)
+          calls (atom 0)
+          count-call (fn [reply] (fn [_] (swap! calls inc) reply))
+          r (consolidate/consolidate! s {:budget 0
+                                         :summarize-fn (count-call "summary")
+                                         :judge-fn (count-call "{}")
+                                         :enrich-fn (count-call "[]")})]
+      (is (zero? @calls))
+      (is (= {:allowed 0 :spent 0} (:budget r)))
+      (is (= 1 (get-in r [:conflicts :deferred])))
+      (is (= 1 (get-in r [:episodes :deferred])))
+      (is (= 1 (get-in r [:enrichment :deferred])))
+      (is (empty? (get-in r [:episodes :closed])))
+      (testing "and the episode the budget never reached stays OPEN for next run"
+        (is (nil? (:closed-at (first (remove #(= :curation (:source-type %))
+                                             (store/-list-episodes s)))))))))
+  (testing "a budget of 2 against 3 pending calls stops at 2 and defers the rest"
+    (let [s (pending-work-store)
+          calls (atom 0)
+          count-call (fn [reply] (fn [_] (swap! calls inc) reply))
+          r (consolidate/consolidate!
+             s {:budget 2
+                :summarize-fn (count-call "summary")
+                :judge-fn (count-call "{\"relation\":\"duplicate\",\"confidence\":0.9}")
+                :enrich-fn (count-call "[]")})]
+      (is (= 2 @calls) "judgments then summaries: most valuable first")
+      (is (= {:allowed 2 :spent 2} (:budget r)))
+      (is (nil? (get-in r [:conflicts :deferred])))
+      (is (= 1 (count (get-in r [:episodes :closed]))))
+      (is (= 1 (get-in r [:enrichment :deferred])))
+      (testing "the next pass, with a fresh budget, picks up exactly the remainder"
+        (reset! calls 0)
+        (let [again (consolidate/consolidate!
+                     s {:summarize-fn (count-call "summary")
+                        :judge-fn (count-call "{\"relation\":\"duplicate\",\"confidence\":0.9}")
+                        :enrich-fn (count-call "[]")})]
+          (is (= 1 @calls) "the recorded verdict replays free; only enrichment is left")
+          (is (= {:allowed consolidate/default-call-budget :spent 1} (:budget again)))
+          (is (= 1 (get-in again [:enrichment :considered])))
+          (is (nil? (get-in again [:enrichment :deferred]))))))))
