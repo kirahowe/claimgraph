@@ -330,6 +330,31 @@ revises:
    doesn't: a shipped OSS governed tier (Namespace RBAC + OpenTelemetry) and an
    attribution-integrity eval (MAI) wired into RAGAS. It is alpha and
    server/Postgres-based, so treat maturity claims with the §5 caution.
+10. **A database arrived with this doc's temporal semantics built in — and
+    was evaluated and declined as a backend** (2026-08-06). NornicDB
+    (github.com/orneryd/NornicDB, MIT, Go, ~838★) is a graph database
+    *server* — Bolt/Cypher + Qdrant-gRPC compatible, HNSW + BM25 hybrid
+    retrieval, MVCC — shipping **native tritemporal facts** (valid,
+    transaction, *and decision* time, with as-of reads) and policy-based
+    Ebbinghaus-style memory decay, pitched explicitly at AI-agent memory.
+    That makes it the first *database* observed with first-class axis-5
+    semantics, and strong corroboration of revision #8: the storage
+    primitives are commoditizing, so the judgment layer above them is where
+    the value concentrates. Evaluated as a Datalevin replacement and
+    **decided against**: it is a daemon (binary/Docker/Helm — memledger's
+    same objection) where claimgraph's premise is an embedded, per-project,
+    inspectable store; it would replace the bi-temporal indexing that
+    already works while the actual differentiators (epistemic classes →
+    conflict policy, confidence, provenance, audit) stay application logic
+    regardless of store; its in-database intelligence (auto-relationship
+    generation, LLM reranking, in-store decay) sits on the wrong side of
+    the no-LLM-on-write-path and forgetting-we-control constraints; bus
+    factor is one (maintainer publicly soliciting co-maintainers, benchmarks
+    self-reported); and the one real gap it would close — vector retrieval
+    for the roadmap's retrieval phase — Datalevin's built-in vector + FTS
+    indexes already cover in-process. Kept as a design reference: the
+    decision-time third axis and the decay-policy API are worth mining for
+    claimgraph's own history and forgetting verbs.
 
 -----
 
@@ -369,6 +394,9 @@ External (fetched 2026-07-09; abbreviated — key primary sources only):
   memledger (`v0.5.0a0`, Apache-2.0); `memledger-ai` GitHub org (memledger-core
   SDK/MCP/Helm, memledger-ui trust graph, memledger-docs); author
   github.com/ratnopamc
+- NornicDB (fetched 2026-08-06): github.com/orneryd/NornicDB (`v1.2.1`, MIT
+  + defensive patent grant); dbdb.io/db/nornicdb; maintainer call
+  dev.to/orneryd/im-looking-for-a-small-number-of-maintainers-for-nornicdb-2pn6
 - Memory-R1 (arXiv 2508.19828, ACL 2026); MemoryOS (arXiv 2506.06326);
   "Forgetful but Faithful"/FiFA (arXiv 2512.12856); LoCoMo; LongMemEval
   (+V2 arXiv 2605.12493); MemoryBench (github.com/supermemoryai/memorybench);
