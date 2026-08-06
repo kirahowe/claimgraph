@@ -142,7 +142,22 @@ config {
     admission_floor: Decimal = 0.3       -- extracted candidates below this drop
     max_subject_chars: Integer = 80      -- a subject longer than this is a
                                          -- sentence, not a name
-    max_literal_chars: Integer = 250
+    max_literal_chars: Integer = 250     -- for VALUE-shaped predicates only:
+                                         -- a value is a datum, and length
+                                         -- past a sentence means prose was
+                                         -- stuffed into a slot built for data
+    prose_literal_chars: Integer = 1000  -- for predicates whose registry row
+                                         -- declares object_shape prose
+                                         -- (claims.allium, decided
+                                         -- 2026-08-06): lessons and
+                                         -- rationales are sentences by
+                                         -- design, and the flat 250 rejected
+                                         -- exactly the richest extracted
+                                         -- knowledge (measured 252–606
+                                         -- chars, all lesson-bearing). Still
+                                         -- a ceiling — a lesson is not a
+                                         -- document, and the evidence tier
+                                         -- keeps the document
     roster_limit: Integer = 200          -- known-entity slice shown to extractors
 }
 
@@ -217,7 +232,14 @@ config {
 --   admission_signals(candidate)     the rule-based screen, no LLM:
 --                                    confidence >= admission_floor,
 --                                    subject within max_subject_chars,
---                                    literal within max_literal_chars are
+--                                    literal within the bound its
+--                                    predicate's declared object shape
+--                                    selects (claims.allium: value ->
+--                                    max_literal_chars, prose ->
+--                                    prose_literal_chars; a coined or
+--                                    unknown predicate reads as value —
+--                                    prose admission is earned by
+--                                    declaration, not by length) are
 --                                    HARD; unknown subject / coined
 --                                    predicate / class weight only inform
 --                                    the logged score, not the verdict —

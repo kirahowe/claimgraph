@@ -80,6 +80,21 @@ enum ObjectKind { entity | literal }
 -- entity when a matching entity already exists, else literal.
 enum ObjectKindRule { entity_only | literal_only | either }
 
+-- What a predicate's LITERAL objects are — the contract the admission
+-- screen reads (ingestion.allium, decided 2026-08-06). `value`: a
+-- comparable datum (a version, a status, a language) whose length past a
+-- sentence means the extractor stuffed prose into a slot built for data.
+-- `prose`: a lesson or rationale, sentences BY DESIGN — the failure tier's
+-- own rule is "the lesson, not the diff", and a lesson that fits a value's
+-- bound is a slogan. One flat length cap defined the prose class as junk:
+-- the first curated store's rejections measured 252–606 chars, all on
+-- lesson-bearing predicates, two of them over by 2 and 7 characters — not
+-- pathology being caught, the tail of a natural distribution being shaved.
+-- The registry is already the vocabulary's authority on what each
+-- predicate's objects may be (object_kinds, cardinality); which bound
+-- applies belongs to the same row, not to one number in the screen.
+enum ObjectShape { value | prose }
+
 -- The epistemic class drives conflict policy: observations and preferences
 -- supersede cleanly; a commitment on either side of a conflict flags — a
 -- human decision is never silently overwritten by new evidence.
@@ -166,6 +181,13 @@ entity Predicate {
     definition: String
     category: PredicateCategory
     object_kinds: ObjectKindRule
+    object_shape: ObjectShape        -- default value. A row written before
+                                     -- this field existed reads as the
+                                     -- shipped seed's declaration for its
+                                     -- name, else value — additive, no
+                                     -- format bump, no store migration:
+                                     -- the seed IS the authority core/*
+                                     -- rows materialize
     cardinality: Cardinality
     default_epistemic: EpistemicClass?
     value_exclusivity: ValueExclusivity?
@@ -403,6 +425,11 @@ rule AssertFact {
                 definition: "auto-registered on first use; promote to core/* once proven",
                 category: experimental,
                 object_kinds: either,
+                object_shape: value,     -- conservative until a human
+                                         -- registration says otherwise: a
+                                         -- coinage has no declared contract,
+                                         -- and prose admission is earned by
+                                         -- declaration, not by length
                 cardinality: many_values,
                 status: testing
             )
@@ -608,7 +635,7 @@ rule InvalidateFact {
 -- Explicit coinage (the CLI's predicates register): only x/* may be coined
 -- at runtime; core/* is curated in the seed vocabulary.
 rule RegisterPredicate {
-    when: RegisterPredicate(agent, name, definition?, object_kinds?, cardinality?, default_epistemic?)
+    when: RegisterPredicate(agent, name, definition?, object_kinds?, object_shape?, cardinality?, default_epistemic?)
     requires: is_experimental(name)
     ensures: Predicate.created(
         name: name,
@@ -616,6 +643,7 @@ rule RegisterPredicate {
         definition: definition ?? "auto-registered on first use; promote to core/* once proven",
         category: experimental,
         object_kinds: object_kinds ?? either,
+        object_shape: object_shape ?? value,
         cardinality: cardinality ?? many_values,
         default_epistemic: default_epistemic,
         status: testing
@@ -640,6 +668,7 @@ rule PromotePredicate {
             definition: staging.definition,
             category: staging.category,
             object_kinds: staging.object_kinds,
+            object_shape: staging.object_shape,
             cardinality: staging.cardinality,
             status: stable
         )
@@ -691,7 +720,7 @@ surface ClaimStore {
                    epistemic?, confidence?, scope?, source_type?, episode?,
                    on_conflict?, valid_from?, valid_until?)
         InvalidateFact(agent, fact, reason?, at?)
-        RegisterPredicate(agent, name, definition?, object_kinds?, cardinality?, default_epistemic?)
+        RegisterPredicate(agent, name, definition?, object_kinds?, object_shape?, cardinality?, default_epistemic?)
         PromotePredicate(agent, staging, core_name)
 
     @guarantee NothingHardDeleted
