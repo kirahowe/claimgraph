@@ -64,8 +64,11 @@
     :object-kind :either :cardinality :many
     :status :stable :default-epistemic :observation :maps-to "LOCAL"
     :definition "Subject is deployed using the object mechanism, pipeline, or command."}
+   ;; The lesson IS the object here — "what goes wrong, under what conditions,
+   ;; and what to do instead" does not fit in a datum, and a flat 250-char cap
+   ;; rejected every one this project's own ingester produced.
    {:id :core/failure-mode :label "failure mode" :category :procedural
-    :object-kind :literal :cardinality :many
+    :object-kind :literal :cardinality :many :object-shape :prose
     :status :stable :default-epistemic :observation :maps-to "LOCAL"
     :definition "Subject has a known failure mode or hazard: the object records the lesson — what goes wrong, under what conditions, and what to do instead."}
 
@@ -80,18 +83,24 @@
     :exclusion-group :revision
     :status :stable :default-epistemic :commitment :maps-to "dcterms:isReplacedBy"
     :definition "Inverse of supersedes."}
+   ;; The three decision predicates below take prose for the same reason: a
+   ;; rejection, a preference and a motivation are only worth keeping WITH
+   ;; their reasoning, and reasoning trimmed to fit a version string is a
+   ;; slogan. (Their entity-shaped objects are unaffected — the bound is on
+   ;; literals, and an entity name that runs past 250 characters is not a
+   ;; name.)
    {:id :core/decided-against :label "decided against" :category :decision
-    :object-kind :either :cardinality :many
+    :object-kind :either :cardinality :many :object-shape :prose
     :exclusion-group :stance
     :status :stable :default-epistemic :commitment :maps-to "LOCAL (ADR rejected-alternative)"
     :definition "A human decision explicitly rejected the object option. Outlives code state."}
    {:id :core/prefers :label "prefers" :category :decision
-    :object-kind :either :cardinality :many
+    :object-kind :either :cardinality :many :object-shape :prose
     :exclusion-group :stance :value-exclusivity :exclusive
     :status :stable :default-epistemic :preference :maps-to "LOCAL"
     :definition "Subject (person, project, module) prefers the object approach, idiom, or tool."}
    {:id :core/motivated-by :label "motivated by" :category :decision
-    :object-kind :either :cardinality :many
+    :object-kind :either :cardinality :many :object-shape :prose
     :status :stable :default-epistemic :observation :maps-to "prov:wasInfluencedBy"
     :definition "Subject decision was motivated by the object reason, constraint, or event."}
    {:id :core/has-status :label "has status" :category :decision
@@ -112,6 +121,30 @@
     :object-kind :either :cardinality :many
     :status :stable :default-epistemic :observation :maps-to "prov:hadPrimarySource, dcterms:provenance"
     :definition "Subject's authoritative origin is the object document or artifact."}])
+
+(def shipped-shapes
+  "The object shapes this build's seed declares, {predicate-id shape} — derived
+  from `seed` and never hand-maintained, because a second copy of the four rows
+  that matter is a copy that goes stale silently."
+  (into {} (keep (fn [{:keys [id object-shape]}] (when object-shape [id object-shape])))
+        seed))
+
+(defn object-shape
+  "A registry row's EFFECTIVE object shape: what its literal objects are, and
+  therefore which admission bound applies (:value, a comparable datum, or
+  :prose, a lesson that is sentences by design).
+
+  Three links, and the middle one is the whole point (spec/claims.allium,
+  Predicate.object_shape). The row's own declaration wins. Failing that, a
+  :core/* row written before this field existed materializes the shipped
+  seed's declaration for its name: those stores were seeded when the field did
+  not exist, and re-seeding is a thing a user does, not a thing that has
+  happened yet — so the seed IS the authority such rows read from, and no
+  migration and no format bump are needed. Everything else is :value: a
+  coinage has no declared contract, and prose admission is earned by
+  declaration, never by length."
+  [row]
+  (or (:object-shape row) (shipped-shapes (:id row)) :value))
 
 (defn levenshtein
   "Edit distance between two strings; used for :did-you-mean suggestions."
@@ -146,12 +179,18 @@
   (= "x" (namespace pred-id)))
 
 (defn auto-registration
-  "Registry row for a first-use :x/* predicate."
+  "Registry row for a first-use :x/* predicate. :object-shape is stated rather
+  than left to the fallback because every other default on this row is stated
+  too — and because the answer is not a default so much as a refusal: a
+  coinage has declared no contract at all, so its literals screen as data
+  until a human registration says otherwise. Prose admission is earned by
+  declaration, never by length."
   [pred-id]
   {:id pred-id
    :label (str/replace (name pred-id) "-" " ")
    :category :experimental
    :object-kind :either
+   :object-shape :value
    :cardinality :many
    :status :testing
    :definition "Auto-registered on first use; promote to :core/* once proven."})

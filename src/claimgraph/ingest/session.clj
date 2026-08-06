@@ -16,6 +16,7 @@
             [claimgraph.core :as core]
             [claimgraph.llm :as llm]
             [claimgraph.logic :as logic]
+            [claimgraph.predicates :as preds]
             [claimgraph.store :as store]))
 
 (def max-confidence 0.7)
@@ -79,6 +80,26 @@
                     (when (seq aliases) (str " (aka " (str/join ", " aliases) ")"))
                     (when etype (str " [" (name etype) "]")))))))
 
+(def prose-object-note
+  "What a prose-shaped predicate's line says beyond its definition.
+
+  The extractor cannot read the registry, so an unmarked vocabulary listing
+  teaches it that every object is a short datum — and it obliges, trimming
+  lessons into slogans before the admission screen ever sees them. That is
+  self-censorship no widened bound can undo: the screen can only admit what
+  was written. One clause per prose predicate, and nothing at all on the
+  others, so the marking reads as permission rather than as instruction."
+  " [object may be a full lesson, a sentence or three]")
+
+(defn vocabulary-lines
+  "The allowed-predicate listing both extractors show: one line per predicate,
+  its definition, and — on the prose-shaped ones — the note above."
+  [predicates]
+  (str/join "\n"
+            (for [p predicates]
+              (str "  " (subs (str (:id p)) 1) " — " (:definition p)
+                   (when (= :prose (preds/object-shape p)) prose-object-note)))))
+
 (defn extraction-prompt [transcript predicates roster]
   (str
    "Extract durable project memory from this coding-session transcript.\n\n"
@@ -92,8 +113,7 @@
    "Subjects and entity-kind objects must be stable names (services, namespaces, tools,\n"
    "ADR ids, people), never sentences; free text belongs in literal objects.\n\n"
    "Allowed predicates (coin x/<new-name> only if none fits):\n"
-   (str/join "\n" (for [p predicates]
-                    (str "  " (subs (str (:id p)) 1) " — " (:definition p))))
+   (vocabulary-lines predicates)
    (when (seq roster)
      (str "\n\nKnown entities — when you mean one of these, use its EXACT name\n"
           "(synonym drift fragments the graph); coin a new name only when none\n"

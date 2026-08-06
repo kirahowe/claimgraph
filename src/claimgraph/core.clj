@@ -72,7 +72,7 @@
   untouched), and deprecate the staging term with a :replaced-by pointer, so
   further writes to it fail with the forwarding address.
   opts: :from (x/*) :to (core/*) [:label :definition :category :object-kind
-        :cardinality :maps-to :default-epistemic]"
+        :object-shape :cardinality :maps-to :default-epistemic]"
   [s {:keys [from to] :as opts}]
   (let [from-k (logic/->kw from)
         to-k (logic/->kw to)]
@@ -94,7 +94,8 @@
                 {:id to-k :status :stable}
                 (into {} (filter (comp some? val))
                       (select-keys opts [:label :definition :category :object-kind
-                                         :cardinality :maps-to :default-epistemic]))))
+                                         :object-shape :cardinality :maps-to
+                                         :default-epistemic]))))
       (let [n (store/-repoint-predicate s from-k to-k)]
         (store/-register-predicate s (assoc staging :status :deprecated :replaced-by to-k))
         {:status :promoted :from from-k :to to-k :facts-rewritten n}))))

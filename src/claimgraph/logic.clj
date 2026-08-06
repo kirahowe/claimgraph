@@ -209,10 +209,10 @@
         m (dissoc rec dump-discriminator)]
     (case t
       :predicate [t (-> m
-                        (kw-fields [:id :category :object-kind :cardinality
-                                    :inverse-of :status :replaced-by
-                                    :default-epistemic :exclusion-group
-                                    :value-exclusivity])
+                        (kw-fields [:id :category :object-kind :object-shape
+                                    :cardinality :inverse-of :status
+                                    :replaced-by :default-epistemic
+                                    :exclusion-group :value-exclusivity])
                         strip-nils)]
       :entity [t (-> m (kw-fields [:type]) strip-nils)]
       :episode [t (-> m
@@ -507,6 +507,7 @@
            (->> (-> pred
                     (assoc :id id)
                     (update :object-kind ->kw)
+                    (update :object-shape ->kw)
                     (update :cardinality ->kw)
                     (update :default-epistemic ->kw))
                 (filter (comp some? val))
@@ -703,21 +704,55 @@
 
 (def admission-floor-confidence 0.3)
 (def max-subject-chars 80)
-(def max-literal-chars 250)
+
+(def max-literal-chars
+  "The bound on a VALUE-shaped predicate's literal: a version, a status, a
+  language. Length past a sentence there means the extractor stuffed prose
+  into a slot built for data."
+  250)
+
+(def prose-literal-chars
+  "The bound on a PROSE-shaped predicate's literal (spec/claims.allium,
+  decided 2026-08-06). Lessons and rationales are sentences by design — the
+  failure tier's own rule is \"the lesson, not the diff\" — and one flat cap
+  defined that whole class as junk: the first curated store's rejections
+  measured 252–606 characters, every one of them on :core/failure-mode,
+  :core/prefers or :core/decided-against, two of them over by 2 and 7. That is
+  the tail of a natural distribution being shaved, not pathology being caught.
+
+  Still a ceiling, and deliberately far from unbounded: a lesson is not a
+  document, and the evidence tier keeps the document."
+  1000)
 
 (defn admission-signals
   "Rule-based admission signals for one extracted candidate — structured and
   interpretable, no LLM (the optional utility signal stays unspent). ctx:
-  {:known-norms #{normalized entity names} :known-preds #{predicate ids}}."
+  {:known-norms #{normalized entity names} :known-preds #{predicate ids}
+   :prose-preds #{predicate ids declaring :prose}}.
+
+  Which literal bound applies is the candidate's PREDICATE's decision, read
+  off its registry row (see admission-ctx): the registry is already the
+  vocabulary's authority on what each predicate's objects may be, so which
+  bound applies belongs on the row and not to one number in here. A predicate
+  this ctx has never heard of — a coinage, a typo — reads as :value, because
+  prose admission is earned by declaration and never by length.
+
+  Both the bare and the :core/*-namespaced spelling of the predicate are
+  looked up, exactly as :predicate-known is: an extractor writes \"prefers\",
+  a caller writes \"core/prefers\", and a shape resolution that recognised
+  only one of them would silently apply the value bound to half the traffic on
+  the very predicates this exists for."
   [{:keys [subject predicate object confidence epistemic class]} ctx]
   (let [pred-kw (->kw (when predicate (str/replace (str predicate) "_" "-")))
-        pred-known? (or (contains? (:known-preds ctx)
-                                   (keyword "core" (name (or pred-kw :none))))
-                        (contains? (:known-preds ctx) pred-kw))]
+        core-kw (keyword "core" (name (or pred-kw :none)))
+        known? (fn [s] (or (contains? s core-kw) (contains? s pred-kw)))
+        literal-limit (if (known? (:prose-preds ctx))
+                        prose-literal-chars
+                        max-literal-chars)]
     {:above-floor (>= (double (or confidence 0.5)) admission-floor-confidence)
      :subject-shaped (<= (count (str subject)) max-subject-chars)
-     :object-sane (<= (count (str object)) max-literal-chars)
-     :predicate-known pred-known?
+     :object-sane (<= (count (str object)) literal-limit)
+     :predicate-known (known? (:known-preds ctx))
      :subject-known (contains? (:known-norms ctx)
                                (normalize-entity-name (str subject)))
      :class-weight (case (->kw (or epistemic class))
@@ -746,14 +781,26 @@
           (if subject-known 0.15 0.0)))))
 
 (defn admission-ctx
-  "Entities + predicate rows -> the ctx admission-signals reads."
+  "Entities + predicate rows -> the ctx admission-signals reads.
+
+  :prose-preds is resolved through preds/object-shape rather than off
+  (:object-shape row) directly, and that fallback is the whole no-migration
+  guarantee: every store seeded before the field existed carries :core/*
+  rows without it, and reading them literally would apply the value bound
+  to :core/failure-mode in exactly the stores that already have the
+  rejections. The shipped seed is the authority those rows materialize, so
+  the bound arrives with the upgrade rather than with a `claim init` the
+  user has no reason to run."
   [entities predicates]
   {:known-norms (into #{}
                       (comp (mapcat (fn [e] (cons (:name e) (:aliases e))))
                             (remove nil?)
                             (map normalize-entity-name))
                       entities)
-   :known-preds (into #{} (map :id) predicates)})
+   :known-preds (into #{} (map :id) predicates)
+   :prose-preds (into #{}
+                      (comp (filter #(= :prose (preds/object-shape %))) (map :id))
+                      predicates)})
 
 (defn screen-candidates
   "Pure: split prepared candidates into the admitted and the inadmissible,

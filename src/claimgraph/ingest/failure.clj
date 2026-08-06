@@ -48,8 +48,10 @@
    "  (class commitment only when a human decided; otherwise observation)\n"
    "Subjects and entity-kind objects must be stable names, never sentences.\n\n"
    "Allowed predicates (coin x/<new-name> only if none fits):\n"
-   (str/join "\n" (for [p predicates]
-                    (str "  " (subs (str (:id p)) 1) " — " (:definition p))))
+   ;; This tier above all: its whole job is lessons, and a listing that told
+   ;; the model every object is a short datum was asking it to throw away
+   ;; the one thing it was invoked to capture
+   (session/vocabulary-lines predicates)
    (when (seq roster)
      (str "\n\nKnown entities — when you mean one of these, use its EXACT name:\n"
           (str/join "\n" roster)))

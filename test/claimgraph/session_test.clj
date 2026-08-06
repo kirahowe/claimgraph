@@ -51,6 +51,20 @@
         "an empty graph shows no roster section")
     (is (str/includes? prompt "<transcript>\nuser: hi\n</transcript>"))))
 
+(deftest the-prompt-marks-which-predicates-take-prose
+  ;; The extractor cannot read the registry, so an unmarked listing teaches it
+  ;; that every object is a short datum — and a lesson trimmed to fit is a
+  ;; slogan the screen never gets a chance to admit.
+  (let [prompt (session/extraction-prompt
+                "user: hi"
+                [{:id :core/failure-mode :definition "the lesson"}
+                 {:id :core/depends-on :definition "requires"}]
+                [])
+        line-for (fn [id] (first (filter #(str/includes? % (subs (str id) 1))
+                                         (str/split-lines prompt))))]
+    (is (str/includes? (line-for :core/failure-mode) "full lesson"))
+    (is (not (str/includes? (line-for :core/depends-on) "full lesson")))))
+
 (deftest entity-roster-is-a-bounded-prior
   (let [entities [{:id "e1" :name "AuthService" :type :service :aliases ["auth-service"]}
                   {:id "e2" :name "Redis" :aliases []}

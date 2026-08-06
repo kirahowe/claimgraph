@@ -97,8 +97,9 @@
    "Subjects and entity-kind objects must be stable names (services, namespaces,\n"
    "tools, files, people), never sentences; free text belongs in literal objects.\n\n"
    "Allowed predicates (coin x/<new-name> only if none fits):\n"
-   (str/join "\n" (for [p predicates]
-                    (str "  " (subs (str (:id p)) 1) " — " (:definition p))))
+   ;; shared with the session extractor: which predicates take a lesson rather
+   ;; than a datum is a property of the vocabulary, not of the tier reading it
+   (session/vocabulary-lines predicates)
    (when (seq roster)
      (str "\n\nKnown entities — when you mean one of these, use its EXACT name\n"
           "(synonym drift fragments the graph); coin a new name only when none\n"

@@ -340,25 +340,52 @@
   (with-store opts
     (fn [s] (emit opts (core/list-predicates s (select-keys opts [:category :status :usage]))))))
 
+(defn- checked-object-shape
+  "--object-shape, normalized, or the opts untouched when it was not passed.
+
+  Refused with usage-exit rather than stored, because the shape is a closed
+  enum the admission screen reads: an unrecognised one is not a narrower
+  bound, it is no declaration at all (preds/object-shape falls back), so a
+  typo would register a row that silently keeps rejecting the very lessons the
+  flag was reached for — and report success."
+  [opts]
+  (if-some [raw (:object-shape opts)]
+    (let [k (logic/->kw raw)]
+      (when-not (#{:value :prose} k)
+        (logic/fail (str "Unknown object shape: " raw)
+                    {:type :invalid-object-shape
+                     :object-shape (str raw)
+                     :expected ["value" "prose"]
+                     :claimgraph/exit usage-exit
+                     :hint (str "value caps a literal object at "
+                                logic/max-literal-chars " characters; prose at "
+                                logic/prose-literal-chars ", for predicates whose "
+                                "objects are lessons or rationales")}))
+      (assoc opts :object-shape k))
+    opts))
+
 (defn cmd-predicate-register
   "Reports {status, predicate}. The registry row is nested rather than merged
   with the status: a predicate row HAS a :status of its own (staging, stable,
   deprecated) and flattening the report over it would answer a question about
   the vocabulary with a fact about the command."
   [{:keys [opts]}]
-  (with-write-store opts
-    (fn [s] (emit opts {:status :registered
-                        :predicate (core/register-predicate
-                                    s (select-keys opts [:id :label :category :object-kind
-                                                         :cardinality :definition
-                                                         :default-epistemic]))}))))
+  (let [opts (checked-object-shape opts)]
+    (with-write-store opts
+      (fn [s] (emit opts {:status :registered
+                          :predicate (core/register-predicate
+                                      s (select-keys opts [:id :label :category :object-kind
+                                                           :object-shape :cardinality
+                                                           :definition
+                                                           :default-epistemic]))})))))
 
 (defn cmd-predicate-promote [{:keys [opts]}]
-  (with-write-store opts
-    (fn [s] (emit opts (core/promote-predicate
-                        s (select-keys opts [:from :to :label :definition :category
-                                             :object-kind :cardinality :maps-to
-                                             :default-epistemic]))))))
+  (let [opts (checked-object-shape opts)]
+    (with-write-store opts
+      (fn [s] (emit opts (core/promote-predicate
+                          s (select-keys opts [:from :to :label :definition :category
+                                               :object-kind :object-shape :cardinality
+                                               :maps-to :default-epistemic])))))))
 
 (defn cmd-episode-open
   "Reports {status, episode} — the row nested under the name of the thing it
@@ -933,13 +960,20 @@ Commands:
   near-match resolutions self-heal by recording the queried name as an alias.
   predicates          List the vocabulary [--category C] [--status S] [--usage]
   predicate register  Coin an :x/* predicate: --id x/uses-pattern [--definition ...]
+                        [--object-shape value|prose]. object-shape says what
+                        this predicate's LITERAL objects are: value (default) a
+                        datum, capped at 250 characters; prose a lesson or
+                        rationale, capped at 1000 — the extracted-fact
+                        admission screen reads the declaration off the row.
   predicate promote   Graduate a staging term: --from x/uses-pattern
                         --to core/uses-pattern [--definition ...] [--label ...]
-                        [--category ...] [--object-kind ...] [--cardinality ...]
-                        [--maps-to ...]. Registers the stable twin, rewrites
-                        every fact onto it (term rename, history untouched),
-                        deprecates the x/* id with a replaced-by pointer —
-                        further writes to it fail with the forwarding address.
+                        [--category ...] [--object-kind ...] [--object-shape ...]
+                        [--cardinality ...] [--maps-to ...]. Registers the
+                        stable twin carrying the staging row's fields (each
+                        flag overrides one), rewrites every fact onto it (term
+                        rename, history untouched), deprecates the x/* id with
+                        a replaced-by pointer — further writes to it fail with
+                        the forwarding address.
   evidence            The raw bytes an episode was extracted from:
                         --episode ID | --hash SHA256 [--evidence-dir DIR]
                         Provenance past the summary: ingest-session and

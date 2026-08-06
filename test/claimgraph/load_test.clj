@@ -187,6 +187,24 @@
         "and an entity's :type is still the entity's own")
     (is (some? entity))))
 
+(deftest a-predicates-declared-object-shape-survives-the-round-trip
+  ;; The declaration is what the admission screen reads, so a dump that drops
+  ;; it restores a store whose lesson-bearing predicates quietly screen as
+  ;; values again — a machine-to-machine regression no fact count would show.
+  (let [src (doto (mem/create) core/seed!)
+        _ (core/register-predicate src {:id :x/lesson-learned :object-shape :prose
+                                        :definition "a lesson, in sentences"})
+        dst (mem/create)]
+    (core/load-dump dst (dumped src))
+    (testing "against the restored ROW, never a second dump"
+      (is (= :prose (:object-shape (store/-get-predicate dst :x/lesson-learned))))
+      (is (= :prose (:object-shape (store/-get-predicate dst :core/failure-mode)))
+          "including the seeded declarations")
+      (is (nil? (:object-shape (store/-get-predicate dst :core/depends-on)))
+          "and a row that declared nothing does not acquire a declaration"))
+    (testing "the keyword comes back a keyword, not the string JSON made of it"
+      (is (keyword? (:object-shape (store/-get-predicate dst :x/lesson-learned)))))))
+
 ;; ---------------------------------------------------------------------------
 ;; What load refuses, and why silence would be worse
 ;; ---------------------------------------------------------------------------

@@ -20,8 +20,9 @@
   redefinition may drop. Mirrors datalevin/predicate-attrs; the two lists
   disagreeing is the one way this store and that one could report different
   predicate rows for the same seed."
-  [:label :category :object-kind :cardinality :inverse-of :status :replaced-by
-   :definition :maps-to :default-epistemic :exclusion-group :value-exclusivity])
+  [:label :category :object-kind :object-shape :cardinality :inverse-of :status
+   :replaced-by :definition :maps-to :default-epistemic :exclusion-group
+   :value-exclusivity])
 
 (defn- curated?
   "Does registering this id redefine the row or amend it? Mirrors

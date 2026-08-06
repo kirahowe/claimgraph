@@ -412,3 +412,84 @@
         (is (= 1 (count inadmissible)))
         (is (false? (get-in (first inadmissible) [:admission-signals :above-floor]))
             "the inadmissible carry their signals — auditable, not silent")))))
+
+;; ---------------------------------------------------------------------------
+;; Object shape: which literal bound a predicate's registry row selects
+;; ---------------------------------------------------------------------------
+
+(defn- lit
+  "A literal of exactly n characters — the bound is measured in characters,
+  so the fixtures have to be too."
+  [n]
+  (apply str (repeat n "x")))
+
+(deftest the-seed-declares-prose-on-exactly-the-lesson-bearing-predicates
+  (let [declared (into {} (keep (fn [{:keys [id object-shape]}]
+                                  (when object-shape [id object-shape])))
+                       preds/seed)]
+    (is (= {:core/failure-mode :prose
+            :core/decided-against :prose
+            :core/prefers :prose
+            :core/motivated-by :prose}
+           declared)
+        "prose is earned by being lesson-bearing BY DESIGN; every other seed
+         row omits the key and reads as :value")
+    (is (= declared preds/shipped-shapes)
+        "shipped-shapes is derived from the seed, never hand-maintained — the
+         fallback chain's authority and the seed cannot be allowed to drift")))
+
+(deftest a-rows-effective-object-shape-falls-back-to-the-shipped-seed
+  ;; The no-migration guarantee (spec/claims.allium, Predicate.object_shape):
+  ;; every store seeded before the field existed carries core/* rows without
+  ;; it, and none of them may lose the bound their name has always implied.
+  (testing "a row that declares one is authoritative"
+    (is (= :prose (preds/object-shape {:id :x/long-story :object-shape :prose})))
+    (is (= :value (preds/object-shape {:id :core/failure-mode :object-shape :value}))))
+  (testing "a core/* row written before the field existed materializes the seed"
+    (is (= :prose (preds/object-shape {:id :core/failure-mode})))
+    (is (= :value (preds/object-shape {:id :core/depends-on}))))
+  (testing "anything the seed never shipped is a value"
+    (is (= :value (preds/object-shape {:id :x/long-story})))
+    (is (= :value (preds/object-shape {:id :core/invented-yesterday})))
+    (is (= :value (preds/object-shape {})))))
+
+(deftest a-prose-predicate-admits-the-lesson-a-value-predicate-cannot
+  ;; The measured failure: the first curated store rejected 252–606 char
+  ;; literals, every one of them a lesson on failure-mode / prefers /
+  ;; decided-against. A flat cap defined the prose class as junk.
+  (let [ctx (logic/admission-ctx
+             [{:name "AuthService"}]
+             ;; rows WITHOUT :object-shape, exactly as an existing store
+             ;; carries them — the fallback chain is what makes this work
+             [{:id :core/failure-mode} {:id :core/depends-on} {:id :x/long-story}])
+        candidate (fn [pred n] {:subject "AuthService" :predicate pred
+                                :object (lit n) :confidence 0.7})]
+    (testing "600 chars of lesson admits on a prose predicate"
+      (is (logic/admit? (logic/admission-signals (candidate "failure-mode" 600) ctx))
+          "the bare name resolves to :core/*, exactly as :predicate-known does")
+      (is (logic/admit? (logic/admission-signals (candidate "core/failure-mode" 600) ctx))
+          "and so does the namespaced form"))
+    (testing "the same 600 chars on a coinage rejects: prose is declared, not measured"
+      (is (not (logic/admit? (logic/admission-signals (candidate "x/long-story" 600) ctx))))
+      (is (not (logic/admit? (logic/admission-signals (candidate "x/long-story" 251) ctx)))))
+    (testing "prose is a ceiling, not an exemption — a lesson is not a document"
+      (is (logic/admit? (logic/admission-signals (candidate "failure-mode" 1000) ctx)))
+      (is (not (logic/admit? (logic/admission-signals (candidate "failure-mode" 1100) ctx)))))
+    (testing "the value bound is exactly where it always was"
+      (is (logic/admit? (logic/admission-signals (candidate "depends-on" 249) ctx)))
+      (is (logic/admit? (logic/admission-signals (candidate "depends-on" 250) ctx)))
+      (is (not (logic/admit? (logic/admission-signals (candidate "depends-on" 251) ctx)))))
+    (testing "an x/* row may declare prose for itself"
+      (let [ctx' (logic/admission-ctx [] [{:id :x/long-story :object-shape :prose}])]
+        (is (logic/admit? (logic/admission-signals (candidate "x/long-story" 600) ctx')))
+        (is (not (logic/admit? (logic/admission-signals
+                                (candidate "x/long-story" 1100) ctx'))))))
+    (testing "the screen carries the verdict, and the rejection says which signal"
+      (let [{:keys [admitted inadmissible]}
+            (logic/screen-candidates [(candidate "failure-mode" 600)
+                                      (candidate "depends-on" 600)]
+                                     ctx)]
+        (is (= 1 (count admitted)))
+        (is (= 1 (count inadmissible)))
+        (is (false? (get-in (first inadmissible)
+                            [:admission-signals :object-sane])))))))

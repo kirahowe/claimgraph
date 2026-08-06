@@ -119,7 +119,15 @@
     (is (= :commitment (:default-epistemic (store/-get-predicate s :core/decided-against))))
     (testing "seeding is idempotent"
       (core/seed! s)
-      (is (= 23 (count (store/-list-predicates s {})))))))
+      (is (= 23 (count (store/-list-predicates s {})))))
+    (testing "the declared object shape round-trips through the store"
+      ;; The admission screen reads this off the row, so a store that drops
+      ;; it silently reinstates the flat cap the declaration exists to lift.
+      (is (= :prose (:object-shape (store/-get-predicate s :core/failure-mode))))
+      (is (nil? (:object-shape (store/-get-predicate s :core/depends-on)))
+          "and a row that declares nothing stays silent — absent is :value,
+           and writing the default in would make the seed's four declarations
+           indistinguishable from twenty-three"))))
 
 (deftest assert-and-read-basic
   (with-stores [s]
@@ -857,6 +865,30 @@
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"already exists"
                             (core/promote-predicate
                              s {:from "x/other" :to "core/depends-on"}))))))
+
+(deftest object-shape-travels-the-predicate-lifecycle
+  ;; A coinage has no declared contract, so it screens as :value however long
+  ;; its objects are; declaring prose is what earns the wider bound, and
+  ;; promotion must carry the declaration or the graduated term silently
+  ;; loses it on the day it becomes the canonical one.
+  (with-stores [s]
+    (testing "register declares the shape"
+      (core/register-predicate s {:id :x/lesson-learned :object-shape :prose
+                                  :definition "a lesson, in sentences"})
+      (is (= :prose (:object-shape (store/-get-predicate s :x/lesson-learned)))))
+    (testing "register without it lands the conservative default"
+      (core/register-predicate s {:id :x/plain-datum :definition "a datum"})
+      (is (= :value (:object-shape (store/-get-predicate s :x/plain-datum)))))
+    (testing "a string from the CLI normalizes to the keyword"
+      (core/register-predicate s {:id :x/spelled-out :object-shape "prose"})
+      (is (= :prose (:object-shape (store/-get-predicate s :x/spelled-out)))))
+    (testing "promotion carries the staging row's shape onto the core twin"
+      (core/promote-predicate s {:from :x/lesson-learned :to :core/lesson-learned})
+      (is (= :prose (:object-shape (store/-get-predicate s :core/lesson-learned)))))
+    (testing "and an explicit --object-shape overrides it, like every other field"
+      (core/promote-predicate s {:from :x/spelled-out :to :core/spelled-out
+                                 :object-shape :value})
+      (is (= :value (:object-shape (store/-get-predicate s :core/spelled-out)))))))
 
 (deftest trust-defenses
   (with-stores [s]

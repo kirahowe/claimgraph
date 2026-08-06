@@ -197,6 +197,12 @@
     :predicate/label       {:db/valueType :db.type/string}
     :predicate/category    {:db/valueType :db.type/keyword}
     :predicate/object-kind {:db/valueType :db.type/keyword}
+    ;; Absent on every row an older build wrote, and deliberately left that
+    ;; way: a missing attribute is not a missing bound, it is a row that
+    ;; materializes the shipped seed's declaration (claimgraph.predicates/
+    ;; object-shape). Adding an attribute is additive on open, so an existing
+    ;; database reads under this schema without migration.
+    :predicate/object-shape {:db/valueType :db.type/keyword}
     :predicate/cardinality {:db/valueType :db.type/keyword}
     :predicate/inverse-of  {:db/valueType :db.type/keyword}
     :predicate/exclusion-group {:db/valueType :db.type/keyword}
@@ -235,6 +241,7 @@
    :label :predicate/label
    :category :predicate/category
    :object-kind :predicate/object-kind
+   :object-shape :predicate/object-shape
    :cardinality :predicate/cardinality
    :inverse-of :predicate/inverse-of
    :status :predicate/status

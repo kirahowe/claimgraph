@@ -19,10 +19,28 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 :curation`, refs `verdict:…` / `enrich:…`), not a new *shape*: an older reader
 treats them as ordinary episodes it has no opinion about, so nothing it
 already holds reads wrong. The consolidation stamp's removal deletes a sidecar
-file, which no reader ever parsed as an artifact.
+file, which no reader ever parsed as an artifact. A predicate's new
+`:object-shape` is likewise additive: an older reader meets a registry field it
+has no opinion about, and a row that omits it — which is every row in every
+store written so far — reads exactly as it always did.
 
 ### Changed
 
+- **Lesson-shaped facts stop being screened out as junk.** A predicate's
+  registry row now declares `object-shape`: `value` (the default) caps a
+  literal object at 250 characters, `prose` at 1000. The seed declares `prose`
+  on `core/failure-mode`, `core/prefers`, `core/decided-against` and
+  `core/motivated-by` — the lesson-bearing four. One flat cap had been
+  rejecting the richest thing extraction produced (measured: 252–606
+  characters, all on those predicates, two over by 2 and 7). **No migration:**
+  a `core/*` row written before the field existed reads as the shipped seed's
+  declaration for its name, so the wider bound arrives with the upgrade, not
+  with a `claim init`. Coined and unknown predicates read as `value` — prose
+  admission is earned by declaration, never by length. `predicate register`
+  and `predicate promote` take `--object-shape value|prose`; promotion carries
+  the staging row's declaration onto the core twin unless the flag overrides
+  it. The extractor prompts mark prose predicates, so the model stops trimming
+  lessons to fit a slot they were never meant to fit.
 - **Session end no longer waits on a model — at all.** `hooks run` is now
   deterministic capture (delta-gated code pass, recompile) that spawns a
   detached `claim curate` and exits; its installed timeout drops 600s → 60s.
@@ -50,7 +68,6 @@ file, which no reader ever parsed as an artifact.
   clash-refusal) take it, briefly, per outcome. A second lease
   (`<db>.curate.lock`, try-acquire) makes the curator a singleton — a
   concurrent `curate` reports `already-running` and exits 0.
-
 ## [0.1.0-alpha] — 2026-07-26
 
 **format-version: 1.** The first stamped format, not a bump. Everything written

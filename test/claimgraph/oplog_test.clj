@@ -93,6 +93,26 @@
         (is (some #(str/includes? % "insert-fact") lines))
         (is (some #(str/includes? % "ensure-entity") lines))))))
 
+(deftest a-registry-field-crosses-beside-the-others-not-instead-of-them
+  ;; The effect payload is the whole row, so a new registry field rides along
+  ;; for free — which is exactly why nothing would notice it stopping. A shape
+  ;; that crosses as a string, or not at all, leaves the other machine
+  ;; screening lessons as data with no error anywhere to say so.
+  (let [a (machine "w-a")
+        b (machine "w-b")]
+    (core/register-predicate (:store a) {:id :x/lesson-learned :object-shape :prose
+                                         :definition "a lesson, in sentences"})
+    (let [effect (first (filter #(= "register-predicate" (:t %))
+                                (log-lines (:db a) "w-a")))]
+      (is (= "prose" (get-in effect [:predicate :object-shape]))
+          "the field is a sibling of the ones that were always there")
+      (is (= "either" (get-in effect [:predicate :object-kind]))
+          "which it did not displace"))
+    (sync-log! a b)
+    (oplog/reconcile! (oplog/inner-store (:store b)) (:db b))
+    (is (= :prose (:object-shape (store/-get-predicate (:store b) :x/lesson-learned)))
+        "and lands a keyword on the far side, not the string JSON made of it")))
+
 (deftest two-writers-reconcile
   (let [a (machine "w-a")
         b (machine "w-b")]

@@ -218,6 +218,58 @@
         (is (= :no-notes-dir (:status r)))))))
 
 ;; ---------------------------------------------------------------------------
+;; The rejection this ingester was actually losing knowledge to
+;; ---------------------------------------------------------------------------
+
+(defn- lesson
+  "A lesson of roughly n characters — sentences, because that is the shape the
+  failure tier's own rule (\"the lesson, not the diff\") asks for."
+  [n]
+  (subs (apply str (repeat 100 "the pod dies silently when the socket closes mid-write; "))
+        0 n))
+
+(deftest a-prose-shaped-lesson-survives-the-admission-screen-end-to-end
+  ;; The live failure this exists to stop: every 252–606 char lesson the
+  ;; extractor produced landed in :inadmissible, so the ingester dropped
+  ;; exactly the facts it was best at finding.
+  (let [dir (temp-notes-dir)
+        s (doto (mem/create) (core/seed!))
+        response (str "{\"subject\":\"claimgraph\",\"predicate\":\"failure_mode\","
+                      "\"object\":\"" (lesson 400) "\",\"object_kind\":\"literal\"}\n"
+                      "{\"subject\":\"claimgraph\",\"predicate\":\"has_version\","
+                      "\"object\":\"" (lesson 400) "\",\"object_kind\":\"literal\"}")]
+    (spit (str dir "/MEMORY.md") "# Notes\nWhat we learned about the pod.\n")
+    (let [r (notes/ingest! s {:dir dir :extractor-fn (constantly response)})
+          file (first (:files r))]
+      (is (= 1 (get-in r [:counts :created]))
+          "the 400-char lesson is admitted — its predicate declares prose")
+      (is (= [(lesson 400)]
+             (mapv :object-lit (:facts (core/get-facts
+                                        s {:entity "claimgraph"
+                                           :predicate :core/failure-mode}))))
+          "and lands in the store whole, not truncated")
+      (testing "the same length on a value-shaped predicate is still junk"
+        (is (= 1 (count (:inadmissible file))))
+        (is (= "has_version" (str (:predicate (first (:inadmissible file))))))
+        (is (false? (get-in (first (:inadmissible file))
+                            [:admission-signals :object-sane])))))))
+
+(deftest the-prompt-marks-which-predicates-take-prose
+  ;; A vocabulary listing that says nothing about shape teaches the extractor
+  ;; to keep every object short, which is self-censorship the screen never
+  ;; gets to see.
+  (let [predicates [{:id :core/failure-mode :definition "the lesson"}
+                    {:id :core/depends-on :definition "requires"}]
+        marked-line (fn [prompt id]
+                      (first (filter #(str/includes? % (subs (str id) 1))
+                                     (str/split-lines prompt))))
+        prompt (notes/extraction-prompt "MEMORY.md" "content" predicates [])]
+    (is (str/includes? (marked-line prompt :core/failure-mode) "full lesson")
+        "the prose predicate's line says its object may be sentences")
+    (is (not (str/includes? (marked-line prompt :core/depends-on) "full lesson"))
+        "and a value predicate's line is unchanged")))
+
+;; ---------------------------------------------------------------------------
 ;; Shell: the budget gate and the write wrapper the curator drives this with
 ;; ---------------------------------------------------------------------------
 
