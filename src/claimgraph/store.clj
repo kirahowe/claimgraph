@@ -75,8 +75,8 @@
   (mapv :key fact-fields))
 
 (defn fact-keys-of
-  "The fact wire keys whose JSON round trip is of one class — the input to
-  every field list that used to be written out by hand."
+  "The fact wire keys whose JSON round trip is of one class — the single
+  source for every field list a JSON round trip needs."
   [json-class]
   (into [] (comp (filter #(= json-class (:json %))) (map :key)) fact-fields))
 

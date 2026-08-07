@@ -6,8 +6,8 @@
 ;; Codex maintain about a project) becomes an ingestion tier, and the graph
 ;; compiles its current view back into the file the harness injects at
 ;; session start. Capture is delegated in, injection is delegated out, and
-;; the graph consolidates in the middle. A SessionEnd hook runs the loop, so
-;; the floor requires zero behavior change.
+;; the graph consolidates in the middle. A SessionEnd hook runs the loop
+;; automatically, at the end of every session.
 ;;
 ;; This chapter executes the deterministic halves: the compile side in full,
 ;; and the pure machinery of the ingest side (delta detection, the echo

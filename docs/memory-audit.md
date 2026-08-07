@@ -30,6 +30,49 @@ from this spec, all in the settle-in-implementation spirit:*
 - *`--pretty` prints the §1 human scorecard (plus per-finding receipts)
   instead of pretty JSON; the JSON schema is the default stdout output and
   the `--out` payload.*
+- *2026-08-06: sources are typed by origin — the default-scan-set files and
+  `.cursor/rules/*` are `:instruction` (human-maintained; mint at
+  `:user-assertion` trust/ceiling), the auto-memory notes dir and
+  `--file`/`--dir` extras are `:note` (unknown or agent authorship; stay at
+  `:agent-note`). Instructions ingest before notes, so a note colliding with
+  a standing instruction is reported as `instruction-conflict`, alongside
+  (never inside) `contradiction`. Every claim side carries a `:source` label
+  (`code`/`instruction`/`note`), and a restatement spanning an instruction
+  file and a note file is flagged `restates-instructions`, the same idea as
+  `restates-code`. `:user-assertion` shares `logic/source-trust`'s rank 3
+  with `:code`, so without a guard an instruction claim would cleanly
+  supersede a colliding code fact (a disagreement) rather than being
+  outranked (stale) and would remove it from the store for every later
+  claim besides — `audit-file!` closes this by checking, before each
+  assert, whether a code fact already answers that claim's (subject,
+  predicate) and forcing `:on-conflict :flag` when it does, pinning code as
+  un-supersedable ground truth. The staleness signal is reliable for both
+  kinds.*
+- *2026-08-06: injection arithmetic counts what each harness actually
+  injects at session start. Instruction files count raw, on-disk, in full —
+  that's what the harness reads and injects — and so does the harness's own
+  notes inject-file (e.g. `MEMORY.md`), managed section included, with the
+  managed share broken out separately as `managed-bytes`. Every other
+  auto-memory note is on-demand — recalled, never injected at session
+  start — and is excluded from the injection window math (`on-demand-bytes`
+  instead), even though it is still scanned for every other consistency
+  finding. A source that strips to nothing (a `MEMORY.md` that is entirely
+  claimgraph's compiled view) stays in the file list, marked `:skipped`, so
+  the biggest injected file on a post-adoption repo never disappears from
+  its own accounting — it is only kept out of extraction, which is what the
+  echo guard protects.*
+- *2026-08-07: the scan covers every instruction file Claude Code actually
+  discovers at session start, not just the project root — `.claude/CLAUDE.md`
+  and `.claude/rules/*.md` alongside the existing `.cursor/rules/*`; a
+  `CLAUDE.md`/`CLAUDE.local.md`/`AGENTS.md`/`AGENT.md` ancestor walk from the
+  project root up to the filesystem root (bounded only in tests, via an
+  internal `collect-sources` opt — real runs walk to the real root); each
+  configured harness's own
+  `:global-instructions` (Claude Code: `$CLAUDE_CONFIG_DIR/CLAUDE.md` and its
+  `rules/*.md`; Codex declares none); and the OS-specific managed-policy
+  `CLAUDE.md` path, filtered to whichever exists. All mint `:instruction`,
+  `:injected? true`. `@`-imports inside a `CLAUDE.md` are not followed — a
+  live v1 limitation, not a planned one.*
 
 -----
 

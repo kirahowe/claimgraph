@@ -765,12 +765,12 @@
   the release version.
 
   A :format that is not an integer is refused here rather than coerced,
-  because coercion is what a header exists to make unnecessary: `null` and
-  `\"2\"` used to reach `long` and come out of the CLI as a bare
-  NullPointerException (ex-message literally nil) or ClassCastException — a
-  stack trace where the caller was promised claimgraph's JSON error contract.
-  Absent is not defaulted either: the header arrived WITH format 1, so a
-  header that declares no format is damaged, not old."
+  because coercion is what a header exists to make unnecessary: without this
+  guard, `null` and `\"2\"` would reach `long` and come out of the CLI as a
+  bare NullPointerException (ex-message literally nil) or ClassCastException
+  — a stack trace where the caller was promised claimgraph's JSON error
+  contract. Absent is not defaulted either: the header arrived WITH format 1,
+  so a header that declares no format is damaged, not old."
   [header]
   (when header
     (let [raw (:format header)]
@@ -805,9 +805,10 @@
   handed over in process (core/dump's return value, straight into load-dump)
   carry the second and not the first, which is why a missing header is not
   refused on its own. Input carrying neither — an empty file, a file
-  truncated to nothing, a redirect that never wrote — carried nothing to
-  refuse, and used to come back {:status :loaded} with every count zero: the
-  silent success that makes a lost graph look like a restored one."
+  truncated to nothing, a redirect that never wrote — carries nothing to
+  refuse; without this check it would come back {:status :loaded} with every
+  count zero — the silent success that makes a lost graph look like a
+  restored one."
   [header records]
   (when-not (or header (seq records))
     (logic/fail "Refusing to load: this input holds no dump header and no records"

@@ -96,9 +96,9 @@
   "Preflight for every verb that shells out to an LLM. Two resolutions no
   command should reinvent: the call timeout (above), and --command falling
   back to the chain --extractor resolves through (flag > $CLAIMGRAPH_LLM_CMD >
-  config > claude -p). That fallback used to resolve against an EMPTY opts
-  map, which meant `judge --extractor mycmd` and `consolidate --extractor
-  mycmd` accepted the flag, ignored it, and shelled out to claude -p."
+  config > claude -p), resolved against the caller's own opts so `judge
+  --extractor mycmd` and `consolidate --extractor mycmd` honor the flag
+  they were given."
   [opts]
   (install-llm-timeout! opts)
   (update opts :command #(or % (config/value :extractor opts))))
@@ -220,16 +220,15 @@
 
 (defn- walk-neighborhood
   "The guided walk in the neighborhood's shape, so `neighbor` answers with one
-  object rather than two. With --query it used to drop :entities and :depth
-  and report :walk-score where the BFS reported :effective-confidence — the
-  same verb, two incompatible payloads, and no way to write one reader for
-  it. The walk keeps everything that makes it a walk (:query, :walk-score,
-  its own ordering) and gains everything the neighborhood promised.
+  object rather than two: it keeps everything that makes it a walk (:query,
+  :walk-score, its own ordering) and gains everything the neighborhood
+  promised (:entities, :depth, :effective-confidence).
 
-  The hop distances come from the walk itself. This wrapper used to measure
-  them over the facts it was handed, which reports null for every node whose
-  linking fact the budget truncated away (core/walk-nodes) — and since the MCP
-  surface shares this wrapper, it reported null there too."
+  The hop distance comes from the walk itself (each entity's own :depth),
+  not from measuring the facts it was handed: the budget can truncate away
+  the fact that links a node (core/walk-nodes), which would report null for
+  that node's distance — and since the MCP surface shares this wrapper, the
+  gap would show there too."
   [{:keys [entities facts] :as walk} now]
   (assoc walk
          :facts (mapv #(assoc % :effective-confidence (logic/effective-confidence % now))
@@ -300,10 +299,9 @@
                              :evidence-dir (evidence-dir opts)}))))))
 
 (defn cmd-entity-ensure
-  "Reports {status, entity} like `entity rename` and `entity alias` do. It
-  used to answer with the bare entity — a mutation whose output a caller had
-  to recognise by its shape rather than read a status off, alone among the
-  entity verbs."
+  "Reports {status, entity} like `entity rename` and `entity alias` do, so a
+  caller reads a status off every entity verb's output rather than
+  recognising a mutation by its shape."
   [{:keys [opts]}]
   (with-write-store opts
     (fn [s] (emit opts {:status :ensured
@@ -390,13 +388,10 @@
 (defn cmd-episode-open
   "Reports {status, episode} — the row nested under the name of the thing it
   is, exactly as `entity ensure` and `predicate register` report {status,
-  entity} and {status, predicate}.
-
-  It used to flatten the row into the report and rename its :id to :episode,
-  which made three sibling mutations answer in three different shapes and left
-  the episode row with no id of its own — the one field that identifies it.
-  `jq -r .episode.id` is two characters more than `jq -r .episode` and one
-  fewer shape for a caller to learn."
+  entity} and {status, predicate}, so the episode row keeps its own :id (the
+  field that identifies it) rather than losing it to the report's :episode
+  key. `jq -r .episode.id` is two characters more than `jq -r .episode` and
+  one fewer shape for a caller to learn across the three sibling mutations."
   [{:keys [opts]}]
   (with-write-store opts
     (fn [s]
@@ -669,10 +664,11 @@
                                          :evidence-dir (evidence-dir opts))))))))
 
 (defn- audit-scan-dirs
-  "audit's extra scan directories under both spellings. --scan-dir is what
-  they are; --dir is what they were called when it also meant the notes dir
-  everywhere else. They are a repeatable list of extra sources, so passing
-  both adds both rather than one shadowing the other."
+  "audit's extra scan directories under both spellings. --scan-dir is the
+  canonical name; --dir is also accepted here, even though on every other
+  verb --dir names the notes dir instead. They are a repeatable list of
+  extra sources, so passing both adds both rather than one shadowing the
+  other."
   [opts]
   (into (vec (:scan-dir opts)) (:dir opts)))
 
@@ -680,18 +676,15 @@
   "Pure: does this invocation want the human scorecard rather than JSON?
 
   --pretty means pretty-printed JSON here exactly as it does on every other
-  verb. It used to switch the format outright, so `audit --pretty | jq` got a
-  human scorecard and no JSON at all — one flag with two meanings on the one
-  verb whose output people pipe. The scorecard is --scorecard now, and stays
+  verb; --scorecard is the only flag that asks for the scorecard, and is
   what a human at a terminal gets without asking.
 
   Nothing stops a caller passing two of these, so the precedence is decided
-  here and stated in help — help used to say --pretty and --scorecard both
-  \"force\" their format, and --pretty silently won. --json wins outright: a
-  caller that asked for machine output must never be handed prose. Then
-  --scorecard, the only flag that asks for the scorecard at all, over --pretty,
-  which is a global flag a wrapper may put on every command line and which says
-  how JSON is printed rather than whether JSON is what comes out."
+  here and stated in help: --json wins outright, since a caller that asked
+  for machine output must never be handed prose. Then --scorecard, over
+  --pretty, which is a global flag a wrapper may put on every command line
+  and which says how JSON is printed rather than whether JSON is what comes
+  out."
   [{:keys [json pretty scorecard]} tty]
   (boolean (and (not json) (or scorecard (and (not pretty) tty)))))
 
@@ -706,6 +699,7 @@
                    :files (:file opts)
                    :dirs (audit-scan-dirs opts)
                    :notes-dir (config/value :notes-dir opts)
+                   :inject-file (config/value :inject-file opts)
                    :no-code (:no-code opts)
                    :no-judge (:no-judge opts)
                    :extractor (:extractor opts)})]
@@ -852,16 +846,24 @@ Commands:
                         uncommitted or untracked changes, which means the sha
                         alone does not describe the code that ran. Quote this
                         in a bug report.
-  audit               Consistency scorecard over the project's agent-memory
-                        pile (CLAUDE.md, AGENTS.md, .cursorrules, .cursor/rules,
-                        copilot instructions, auto-memory notes) — runs BEFORE
-                        claimgraph is installed: throwaway in-memory store,
-                        nothing written, no dtlv needed (prerequisites: bb +
-                        an extractor). Code facts ingest first (every language
-                        the analyzer registry detects), so pile claims
-                        colliding with the code read as staleness; then every
-                        pile claim goes through the full conflict machinery.
-                        Findings: contradictions, silent disagreements, stale
+  audit               Consistency scorecard over your agent's memory pile —
+                        the auto-memory notes it accumulates on its own —
+                        audited together with your instruction files
+                        (CLAUDE.md, AGENTS.md, .cursorrules, .cursor/rules,
+                        .claude/rules, copilot instructions), scanned
+                        wherever a harness actually injects them: the
+                        project root, every ancestor directory up to the
+                        filesystem root, and each harness's own global
+                        config — runs BEFORE claimgraph is
+                        installed: throwaway in-memory store, nothing
+                        written, no dtlv needed (prerequisites: bb + an
+                        extractor). Code facts ingest first (every language
+                        the analyzer registry detects), so claims colliding
+                        with the code read as staleness; instructions ingest
+                        before notes, so a note that contradicts a standing
+                        instruction is its own finding class rather than an
+                        ordinary contradiction. Findings: contradictions,
+                        instruction conflicts, silent disagreements, stale
                         claims, restatements, name clusters, injection bloat —
                         each with verbatim quote receipts. The judge pass
                         filters false positives (judged-compatible pairs are
@@ -871,6 +873,9 @@ Commands:
                         (extra sources beyond the default scan: every *.md
                         inside; --dir is the older spelling and still adds
                         one) [--notes-dir D] (the auto-memory dir to read)
+                        [--inject-file F] (which note in it counts as
+                        injected for the bloat number — default per harness,
+                        e.g. MEMORY.md)
                         [--no-code] (skip the staleness-vs-code prong)
                         [--no-judge] (skip the LLM verdict pass; report raw)
                         [--extractor CMD] [--out FILE] (also write the JSON

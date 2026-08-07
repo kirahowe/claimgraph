@@ -125,7 +125,12 @@
   without touching the real environment); :inject-file is the file the
   harness auto-injects at session start (compile-context's write target);
   :note-glob is what counts as a note there (unknown layouts degrade
-  gracefully — anything matching is a plain note)."
+  gracefully — anything matching is a plain note); :global-instructions is
+  (fn [{:keys [home env]}]) -> a seq of path strings, the instruction files
+  the harness injects from its own config area rather than any project —
+  same pure-ctx contract as :notes-dir, no project directory passed because
+  a global file by definition doesn't have one. `claim audit`'s
+  collect-sources is the only caller."
   {:claude-code
    {:id :claude-code
     :label "Claude Code auto memory"
@@ -133,7 +138,17 @@
     :note-glob "**.md"
     :notes-dir (fn [{:keys [home env]} abs-project-dir]
                  (str (or (get env "CLAUDE_CONFIG_DIR") (str home "/.claude"))
-                      "/projects/" (munge-project-path abs-project-dir) "/memory"))}
+                      "/projects/" (munge-project-path abs-project-dir) "/memory"))
+    ;; $CLAUDE_CONFIG_DIR/CLAUDE.md (default ~/.claude/CLAUDE.md) is injected
+    ;; at every session start regardless of project; every *.md under its
+    ;; rules/ sits alongside it, injected the same way.
+    :global-instructions (fn [{:keys [home env]}]
+                            (let [config-dir (or (get env "CLAUDE_CONFIG_DIR")
+                                                  (str home "/.claude"))
+                                  rules-dir (fs/path config-dir "rules")]
+                              (cond-> [(str (fs/path config-dir "CLAUDE.md"))]
+                                (fs/directory? rules-dir)
+                                (into (map str (fs/glob rules-dir "*.md"))))))}
 
    ;; Codex memories are per-machine, not per-project (docs/consuming-auto-
    ;; memory.md §5): thread summaries + durable entries + evidence files,
@@ -147,7 +162,11 @@
     :note-glob "**.{md,txt}"
     :notes-dir (fn [{:keys [home env]} _abs-project-dir]
                  (str (or (get env "CODEX_HOME") (str home "/.codex"))
-                      "/memories"))}})
+                      "/memories"))
+    ;; Codex's own docs don't establish a user-global instructions file the
+    ;; way Claude Code's $CLAUDE_CONFIG_DIR/CLAUDE.md does, so there is
+    ;; nothing to report here.
+    :global-instructions (constantly [])}})
 
 (defn resolve-harness
   "Harness keyword/string -> registry entry, or a deterministic failure

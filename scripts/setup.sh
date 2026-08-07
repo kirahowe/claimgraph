@@ -301,6 +301,7 @@ echo
 echo "In the project you want it to remember:"
 echo
 echo "  claim audit   # start here: a read-only consistency scorecard of the"
-echo "                # memory pile you already have (CLAUDE.md, rules files,"
-echo "                # auto-memory notes) — no store, nothing written"
+echo "                # memory pile you already have (auto-memory notes),"
+echo "                # audited together with CLAUDE.md/rules files —"
+echo "                # no store, nothing written"
 echo "  claim setup   # then: wire the graph — store, agent skill, ambient loop"

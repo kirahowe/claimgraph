@@ -24,9 +24,53 @@ file, which no reader ever parsed as an artifact. A predicate's new
 has no opinion about, and a row that omits it — which is every row in every
 store written so far — reads exactly as it always did.
 
+### Added
+
+- **`claim audit` gains a marquee finding: `instruction-conflict`.** Sources
+  are typed by origin. `CLAUDE.md`/`AGENTS.md`/rules files/copilot
+  instructions are `:instruction` — human-maintained, so they mint at
+  `:user-assertion` trust and ceiling, the same as a direct `claim assert`.
+  Auto-memory notes and `--file`/`--dir` extras stay `:note` (unknown or
+  agent authorship) at `:agent-note`. Instructions ingest before notes, so a
+  note colliding with a standing instruction is the canonical collision
+  direction, reported as `instruction-conflict` alongside (never inside)
+  `contradiction`. Every claim in a finding now carries a `:source` label
+  (`code`/`instruction`/`note`), and a restatement spanning an instruction
+  file and a note file is flagged `restates-instructions`.
+- **`audit` accepts `--inject-file`**, honoring the same override the rest
+  of the ambient loop uses, to name which auto-memory note counts as
+  injected for the byte accounting below.
+- **`audit`'s scan now matches what Claude Code actually discovers at
+  session start, not just the project root.** `.claude/CLAUDE.md` and
+  `.claude/rules/*.md` join `.cursor/rules/*`; a `CLAUDE.md` /
+  `CLAUDE.local.md` / `AGENTS.md` / `AGENT.md` ancestor walk runs from the
+  project root up to the filesystem root; each harness's own global
+  instructions (Claude Code: `$CLAUDE_CONFIG_DIR/CLAUDE.md` and its
+  `rules/*.md`; Codex declares none) and the OS managed-policy `CLAUDE.md`
+  path are scanned too. All of it mints `:instruction`, `:injected? true`,
+  the same trust and injection accounting as a project-root file.
+
 ### Changed
 
-- **Lesson-shaped facts stop being screened out as junk.** A predicate's
+- **Code is un-supersedable ground truth inside the audit's throwaway
+  store.** `:instruction` claims mint at the same trust rank as `:code`
+  (both rank 3 in `logic/source-trust`), so without a guard an instruction
+  claim on a single-valued predicate would cleanly supersede a colliding
+  code fact instead of being outranked — misclassifying a staleness finding
+  as a disagreement, and erasing the code baseline every later claim on
+  that (subject, predicate) needed to collide against. `audit-file!` now
+  checks, before every assert, whether a code fact already answers the
+  claim and forces `:on-conflict :flag` when it does, pinning code as
+  un-supersedable ground truth for the whole pass.
+- **Injection arithmetic counts what a harness actually injects.**
+  Instruction files count raw, on-disk, in full — a harness reads and
+  injects them wholesale — and so does the harness's own notes inject-file
+  (e.g. `MEMORY.md`), with its managed section broken out separately as
+  `managed-bytes`. Every other auto-memory note is on-demand — recalled,
+  never injected — and is excluded from the injection-window math
+  (`on-demand-bytes` instead), though it is still scanned for every other
+  consistency finding.
+- **Lesson-shaped facts get admitted at prose length.** A predicate's
   registry row now declares `object-shape`: `value` (the default) caps a
   literal object at 250 characters, `prose` at 1000. The seed declares `prose`
   on `core/failure-mode`, `core/prefers`, `core/decided-against` and

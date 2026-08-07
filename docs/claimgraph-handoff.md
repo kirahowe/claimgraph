@@ -11,11 +11,13 @@ Working name: **claimgraph** (placeholder).
 
 ## 1. Purpose & scope
 
-The problem: coding-agent memory today is piles of markdown (`CLAUDE.md`,
-`AGENTS.md`, ad-hoc notes) that collapse working/episodic/semantic/procedural
-memory into one undifferentiated bucket. They have no structured retrieval, no
-invalidation, no epistemic typing, no provenance, and no way to answer “what do
-we currently believe about X” vs “what did we believe last month.”
+The problem: coding-agent memory today is a pile of auto-generated markdown
+(the notes a harness accumulates on its own between sessions) that collapses
+working/episodic/semantic/procedural memory into one undifferentiated
+bucket, with no structured retrieval, no invalidation, no epistemic typing,
+no provenance, and no way to answer “what do we currently believe about X”
+vs “what did we believe last month.” `CLAUDE.md`/`AGENTS.md`/ad-hoc notes
+are a separate, human-maintained artifact.
 
 The target: a **structured, self-invalidating, queryable graph** that remembers
 a codebase’s preferences, standards, idioms, design decisions, architecture
@@ -356,10 +358,6 @@ CONTAINED_BY, observation), `contains` (↔ `part-of`, SPDX CONTAINS /
 dcterms:hasPart), `part-of` (dcterms:isPartOf), `implements` (DOAP/SEON, observation),
 `written-in` (DOAP programming-language; either), `has-version` (dcterms:hasVersion;
 literal).
-
-*(v0 correction: `defined-in` claimed `contains` as its inverse while
-`contains` claimed `part-of`, giving `contains` two claimants. `contains` ↔
-`part-of` is the one containment pair; `defined-in` has no true inverse here.)*
 
 **Procedural:** `tested-by` (SPDX hasTest, observation), `built-with` (SPDX
 BUILD_DEPENDENCY_OF), `generated-from` (SPDX GENERATED_FROM / prov:wasGeneratedBy),

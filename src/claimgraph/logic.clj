@@ -85,11 +85,10 @@
 
 (def invalidation-kinds
   "Every kind of invalidation claimgraph performs, and the producer of each.
-  These used to be distinguishable only by reading the reason sentence, which
-  meant one producer could — and did — phrase itself out of every reader:
-  the judge wrote \"judged superseded by <id>\", the compiled context matched
-  ^superseded by (\\S+)$, and an LLM-resolved supersession therefore never
-  appeared in the briefing built to show what changed.
+  Each kind is structured data, not something a reader has to recover by
+  parsing the reason sentence: a producer's own phrasing of that sentence
+  can never keep a kind out of a reader that matches on :invalidation-kind
+  instead of prose.
 
     :superseded          assert-fact closed it for a newer assertion
     :judged-superseded   the LLM judge ruled the newer fact its successor

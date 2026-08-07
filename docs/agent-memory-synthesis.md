@@ -10,8 +10,13 @@ frameworks, analogies, and mental models worth carrying into prototype design.
 Modern coding agents and conversational LLMs are stateless at the API level:
 each completion is an independent function call. To simulate continuity across
 sessions, every framework reinvents some kind of “memory” — and the dominant
-solution today is **piles of markdown files** scattered across `CLAUDE.md`,
-`AGENTS.md`, ADR folders, and per-project scratch notes.
+solution today is **a pile of auto-generated markdown**: notes a harness
+accumulates on its own, session after session, with nothing curating what
+goes in (Claude Code's per-project memory dir, Codex's memories, ad hoc
+scratch notes) — that pile is the subject of this document. `CLAUDE.md`,
+`AGENTS.md`, and ADR folders are a different artifact: deliberate,
+human-maintained configuration and decision records. The failure modes
+below are the pile's.
 
 This works at the smallest scale and falls apart everywhere else:
 

@@ -164,11 +164,10 @@
     {:action :unlink}
     {:action :none :reason :needs-human|:low-confidence|:unparseable}
 
-  The invalidation carries its kind and its successor as data. It used to
-  carry only the sentence \"judged superseded by <id>\", and the compiled
-  context recovered supersessions by matching ^superseded by (\\S+)$ against
-  that field — which this phrasing never matched, so no supersession the
-  judge ever resolved reached the briefing that exists to report them."
+  The invalidation carries its kind and its successor as data, not only as
+  prose in the reason sentence: the compiled context recovers a supersession
+  from the structured :successor field, so a verdict's own phrasing of the
+  reason can never keep it out of the briefing that reports what changed."
   [{:keys [fact candidate]} {:keys [relation confidence]} min-confidence]
   (cond
     (= :contradicts relation) {:action :none :reason :needs-human}

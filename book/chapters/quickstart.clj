@@ -17,24 +17,28 @@
 ;; Every command accepts `--db PATH` (default `$CLAIMGRAPH_DB` or
 ;; `./.claimgraph/db`) and emits JSON on stdout; add `--pretty` for humans.
 ;;
-;; ## Before installing anything: audit the pile you already have
+;; ## Before installing anything: audit what you already have
 ;;
 ;; One verb runs without the store, the pod, or any commitment: `claim
 ;; audit` points the conflict machinery at your existing agent-memory pile
-;; (`CLAUDE.md`, `AGENTS.md`, rules files, auto-memory notes) and scores its
-;; internal consistency. It needs only `bb` and an extractor command,
-;; everything happens in a throwaway in-memory store, and nothing is
-;; written:
+;; — the auto-memory notes a coding agent writes to on its own — together
+;; with your `CLAUDE.md`/`AGENTS.md`/rules files, and scores both for
+;; internal consistency, including where the pile contradicts a standing
+;; instruction. It needs only `bb` and an extractor command, everything
+;; happens in a throwaway in-memory store, and nothing is written:
 ;;
 ;; ```bash
 ;; bin/claim audit --pretty
 ;;   87 claims extracted from 4 files
-;;    7 contradictions   (opposed claims coexisting in the pile)
-;;   12 disagreements    (same subject, different values — the last one read silently wins)
-;;    9 stale            (contradicted by what the code says today)
-;;   23 restatements     (the same fact maintained in more than one place)
-;;    3 name clusters    (AuthSvc / auth-service / AuthService)
+;;    7 contradictions  (opposed claims coexisting in the pile)
+;;    2 instruction conflicts (agent memory at odds with your instruction files)
+;;   12 disagreements   (same subject, different values — the last one read silently wins)
+;;    9 stale           (contradicted by what the code says today)
+;;   23 restatements    (the same fact maintained in more than one place)
+;;    3 name clusters   (AuthSvc / auth-service / AuthService)
 ;;   41 KB injected per session against a ~25 KB window  ** over budget **
+;;      (of which 8 KB is claimgraph's compiled view)
+;;      15 KB of on-demand notes scanned, not injected
 ;; ```
 ;;
 ;; Every number carries verbatim quote receipts, and the findings are

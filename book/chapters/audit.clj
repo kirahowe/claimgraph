@@ -1,13 +1,16 @@
 ;; # The audit: score the pile you already have
 ;;
 ;; Every chapter so far assumed you adopted claimgraph. This one runs before
-;; that decision. Every agent-assisted repo accumulates a memory pile
-;; (`CLAUDE.md`, `AGENTS.md`, rules files, auto-memory notes), nothing ever
-;; checks that pile for internal consistency, and the harness documentation
-;; itself concedes that contradictory memory produces arbitrary behavior.
-;; `claim audit` points the conflict machinery of the previous chapters at
-;; the pile and produces a scorecard: contradictions, silent disagreements,
-;; staleness against the code, restatements, name drift, injection bloat.
+;; that decision. Every agent-assisted repo accumulates a memory pile — the
+;; auto-memory notes a coding agent writes to on its own — and nothing ever
+;; checks it for internal consistency, or against the `CLAUDE.md`/`AGENTS.md`/
+;; rules files you actually wrote; the harness documentation itself concedes
+;; that contradictory memory produces arbitrary behavior. `claim audit`
+;; points the conflict machinery of the previous chapters at both: it scores
+;; the pile for self-contradiction and staleness, and flags where the pile
+;; contradicts your standing instructions — the marquee `instruction-conflict`
+;; finding — alongside silent disagreements, restatements, name drift, and
+;; injection bloat.
 ;;
 ;; The constraints are absolute, because this is the top of the funnel:
 ;; everything runs inside a throwaway in-memory store, the real store is
@@ -112,11 +115,12 @@
 ;; a restatement.
 ;;
 ;; Two deliberate inversions of the ambient tier make the collisions
-;; surface. First, the audit ingests the *code* before the pile — the
-;; mechanical facts land at 0.95 under source-type `:code`, so CLAUDE.md's
-;; claim that `fixture.app` lives in `src/legacy/app.clj` flags against
-;; ground truth (the trust model refuses to let an agent-note-grade claim
-;; supersede a code fact) and reads as staleness:
+;; surface. First, the audit ingests the *code* before the pile and the
+;; instruction files — the mechanical facts land at 0.95 under source-type
+;; `:code`, so CLAUDE.md's claim that `fixture.app` lives in
+;; `src/legacy/app.clj` collides with it. Instruction files mint at code's
+;; trust rank; the audit pins code as un-supersedable ground truth, so the
+;; collision flags and reads as staleness:
 
 (first (get-in report [:findings :stale]))
 

@@ -85,16 +85,20 @@ reporting flip rate next to accuracy, because a pair that flips is a pair
 
 **`audit`** points the judge-and-sweep machinery just described (plus the
 write path's flag/supersede/reinforce vocabulary) at a repo's existing
-memory pile, before claimgraph is installed: throwaway in-memory store,
-nothing written, no `dtlv` — `bb` and an extractor are the whole
-prerequisite list. Code facts ingest first so pile claims colliding with
-the code read as staleness, epistemic classes keep their predicate defaults
-so reported decisions flag instead of silently superseding, every finding
-carries verbatim quote receipts, and judged-compatible pairs are removed
-from the contradiction count. It never resolves anything, and exit code is
-0 even with findings: it is a diagnostic, not a gate. The audit chapter
-runs the whole pipeline executably; `--no-judge` and `--no-code` degrade it
-honestly when the LLM or the code analyzers are unavailable.
+memory pile — auto-memory notes — together with its instruction files
+(`CLAUDE.md`/`AGENTS.md`/rules files), before claimgraph is installed:
+throwaway in-memory store, nothing written, no `dtlv` — `bb` and an
+extractor are the whole prerequisite list. Code facts ingest first so
+claims colliding with the code read as staleness; instructions ingest
+before notes, so a note contradicting a standing instruction reads as
+`instruction-conflict` rather than an ordinary contradiction. Epistemic
+classes keep their predicate defaults so reported decisions flag instead of
+silently superseding, every finding carries verbatim quote receipts, and
+judged-compatible pairs are removed from the contradiction count. It never
+resolves anything, and exit code is 0 even with findings: it is a
+diagnostic, not a gate. The audit chapter runs the whole pipeline
+executably; `--no-judge` and `--no-code` degrade it honestly when the LLM
+or the code analyzers are unavailable.
 
 ## The outcome signal
 

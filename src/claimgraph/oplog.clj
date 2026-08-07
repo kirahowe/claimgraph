@@ -713,8 +713,7 @@
                         by-writer)
          ;; A line whose envelope will not read as numbers is separated out
          ;; before anything sorts or gates on it: it cannot be ordered, applied
-         ;; or marked, so the only honest thing to do with it is name it. It
-         ;; used to fall through the marks unmentioned, or take the pass down.
+         ;; or marked, so the only honest thing to do with it is name it.
          {bad true placeable false} (group-by #(some? (envelope-problem %)) unseen)
          canonical (juxt hlc-of :writer seq-of)
          keyed (group-by (juxt :writer seq-of) placeable)

@@ -1,8 +1,10 @@
 # claimgraph
 
 A bi-temporal, epistemically-typed knowledge graph for AI coding-agent memory.
-Owned, portable, inspectable — a structured replacement for the
-`CLAUDE.md`/`AGENTS.md` markdown pile.
+Owned, portable, inspectable — a structured replacement for the auto-memory
+pile your agent accumulates on its own. It reads your `CLAUDE.md`/`AGENTS.md`
+as high-trust instruction files and audits them against the code and the
+graph.
 
 Every fact is a reified edge carrying a metadata bundle: valid time +
 transaction time, confidence, epistemic class (observation / commitment /
@@ -76,20 +78,27 @@ pass (`--db`, `--notes-dir`, `--settings-file`, ...) is persisted to
 
 ### Start with an audit — before you install anything
 
-Every agent-assisted repo accumulates a memory pile — `CLAUDE.md`,
-`AGENTS.md`, rules files, auto-memory notes — and nothing ever checks that
-pile for internal consistency. `claim audit` points claimgraph's conflict
-machinery at it and prints a scorecard:
+Every agent-assisted repo accumulates a memory pile — the auto-memory notes
+Claude Code, Codex, and friends write to on their own — and nothing ever
+checks it for internal consistency, or against the `CLAUDE.md`/`AGENTS.md`/
+rules files you actually wrote. `claim audit` points claimgraph's conflict
+machinery at both: it scores the pile for self-contradiction and staleness,
+and — the marquee check — flags where your agent's memory contradicts your
+standing instructions, an `instruction-conflict`, before you install
+anything:
 
 ```
 $ bin/claim audit --scorecard
   87 claims extracted from 4 files
-   7 contradictions   (opposed claims coexisting in the pile)
-  12 disagreements    (same subject, different values — the last one read silently wins)
-   9 stale            (contradicted by what the code says today)
-  23 restatements     (the same fact maintained in more than one place)
-   3 name clusters    (AuthSvc / auth-service / AuthService)
-  41 KB injected per session against a ~25 KB window
+   7 contradictions  (opposed claims coexisting in the pile)
+   2 instruction conflicts (agent memory at odds with your instruction files)
+  12 disagreements   (same subject, different values — the last one read silently wins)
+   9 stale           (contradicted by what the code says today)
+  23 restatements    (the same fact maintained in more than one place)
+   3 name clusters   (AuthSvc / auth-service / AuthService)
+  41 KB injected per session against a ~25 KB window  ** over budget **
+     (of which 8 KB is claimgraph's compiled view)
+     15 KB of on-demand notes scanned, not injected
 ```
 
 It runs entirely in a throwaway in-memory store: nothing is written, the
@@ -99,7 +108,13 @@ Every finding carries verbatim quote receipts, an LLM judge pass filters
 the false positives (skip it with `--no-judge`), and `--out report.json`
 keeps the full JSON. The scorecard is what a terminal gets and what
 `--scorecard` forces anywhere; piped or `--json` output is the findings as
-JSON, so `audit | jq` and `audit` read by a human are the same run. The staleness-vs-code prong covers every language the
+JSON, so `audit | jq` and `audit` read by a human are the same run. Instruction
+scanning matches what a harness actually injects — up-tree CLAUDE.md/AGENTS.md
+files and the user-global one, not just the project root. The
+injected-KB line only counts what a harness actually loads at session start
+— instruction files plus whichever note is the harness's live inject
+target — so the pile's other notes show up as on-demand KB, scanned for
+consistency but never charged against the window. The staleness-vs-code prong covers every language the
 analyzer registry detects (Clojure, Kotlin, TypeScript/JavaScript, plus
 anything added via `code-analyzers`) and skips honestly when nothing is
 detected; every other finding class works on any repo. The findings are precisely the
@@ -482,7 +497,7 @@ scans never reinforce — only intent writes do.
   loop. `code-ingest: manual` opts a project with an expensive analyzer out;
   non-git projects always run (matching manual semantics). Stages report
   independently — an analyzer failure never blocks the deterministic
-  recompile. Capture in, injection out, zero behavior change required.
+  recompile. Capture in, injection out.
 - `curate` — the detached run the hook hands off to, and where every model
   call in the ambient loop lives: `ingest-notes` (the just-ended session's
   knowledge is the freshest), then `consolidate` (enrich-only), then
@@ -652,11 +667,13 @@ Quarto book. Build it with `bb book` (needs a JVM and the
 - `docs/consuming-auto-memory.md` — design note: consume the harnesses'
   auto-memory as an ingestion tier and compile the graph back into their
   injection surface (the ambient loop).
-- `docs/memory-audit.md` — spec + handoff for `claim audit`: the
-  pile-consistency scorecard (contradictions, staleness, restatement, name
-  drift, injection bloat) that runs before claimgraph is even installed.
-  First of the three measurement tiers; shipped (`src/claimgraph/audit.clj`
-  — the header notes the few implementation deviations).
+- `docs/memory-audit.md` — spec + handoff for `claim audit`: the scorecard
+  that audits your agent's memory pile together with your instruction files
+  (contradictions, instruction conflicts, staleness, restatement, name
+  drift, injected-vs-on-demand bytes) that runs before claimgraph is even
+  installed. First of the three measurement tiers; shipped
+  (`src/claimgraph/audit.clj` — the header notes the few implementation
+  deviations).
 - `docs/language-adapters.md` — spec + handoff for the language-adapter
   registry (Kotlin + TypeScript via command-shaped analyzers, a
   bring-your-own-analyzer config seam) and the ambient code-freshness stage

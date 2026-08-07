@@ -6,9 +6,14 @@ A large language model completes one request at a time. Each API call is an
 independent function invocation; whatever continuity a coding agent appears
 to have across sessions is reconstructed from whatever it persisted between
 calls. Most systems persist to files on disk, and the dominant format in 2026
-is markdown: `CLAUDE.md`, `AGENTS.md`, auto-memory directories, ADR folders,
-scratch notes. The harness loads some subset of these into the context window
-at session start and hopes the relevant parts are in there.
+is a pile of auto-generated markdown: notes a harness writes to on its own,
+session after session, with nothing curating what goes in (auto-memory
+directories, scratch notes). `CLAUDE.md`, `AGENTS.md`, and ADR folders are a
+different artifact — deliberate, human-maintained files — but the two blur in
+practice, since a note that should have stayed disposable routinely gets
+promoted into the instruction file instead. The harness loads some subset of
+all of this into the context window at session start and hopes the relevant
+parts are in there.
 
 This works for a week and then degrades with no recovery mechanism. The
 failure modes are structural, not incidental:
@@ -165,8 +170,9 @@ structured store sits in the middle as the consolidator. More detail is in the
 original research and design note,
 [`docs/consuming-auto-memory.md`](https://github.com/kirahowe/claimgraph/blob/main/docs/consuming-auto-memory.md).
 The failure modes this chapter opened with are also mechanically measurable:
-`claim audit` runs those same checks over an existing markdown pile and scores
-it — contradictions, silent disagreements, staleness against the code,
+`claim audit` runs those same checks over an existing auto-memory pile
+together with its instruction files and scores the pair — contradictions,
+instruction conflicts, silent disagreements, staleness against the code,
 restatement, name drift, injection bloat — before anything is installed.
 
 Second, the claim has to be demonstrated as improvement on the actual end

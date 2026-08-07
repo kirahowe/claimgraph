@@ -34,10 +34,9 @@
 (def default-min-usage 3)
 (def max-summary-chars 600)
 
-;; The ONE bound on a pass, replacing the per-stage caps and the cadence that
-;; used to ration a pass which redid all its work every time. Every call now
-;; lands a durable outcome, so runs converge toward the free no-op and the
-;; only question left is how much a single run may spend.
+;; The ONE bound on a pass. Every call lands a durable outcome, so runs
+;; converge toward the free no-op and the only question is how much a
+;; single run may spend.
 (def default-call-budget 20)
 
 ;; ---------------------------------------------------------------------------
@@ -330,12 +329,10 @@
   "The internally-caught failures a consolidate! report carries, keyed by
   stage — a report aggregator, and nothing more.
 
-  It used to feed the stamp gate, which withheld the stamp when any of these
-  appeared so the whole pass stayed due. There is no stamp to withhold now
-  (spec/maintenance.allium, decided 2026-08-05): a failed call minted no
-  outcome record, so its work is still pending BY DERIVATION and the next run
-  retries exactly it rather than the pass around it. (Episode summaries never
-  appear here: the mechanical digest means that stage always makes progress.)"
+  A failed call mints no outcome record, so its work is still pending BY
+  DERIVATION and the next run retries exactly it rather than the pass around
+  it. (Episode summaries never appear here: the mechanical digest means that
+  stage always makes progress.)"
   [{:keys [conflicts sweep enrichment]}]
   (into {}
         (keep (fn [[stage r]] (when (:error r) [stage (:error r)])))

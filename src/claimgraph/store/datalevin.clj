@@ -260,10 +260,10 @@
 
   :core/* is curated: the seed map IS the row, because nothing else may write
   one — logic/prepare-registration refuses a runtime coinage outside :x/*. So
-  a field the seed drops has to be retracted. :core/defined-in lost
-  :inverse-of when the containment pair stopped being bijective, and an
-  add-only upsert would leave every store that ever seeded the old row
-  reporting the retired value forever.
+  a field the seed drops has to be retracted: :core/defined-in carries no
+  :inverse-of (`contains` ↔ `part-of` is the one containment pair), and an
+  add-only upsert would leave any store that ever seeded an older row with
+  :inverse-of reporting that retired value forever.
 
   :x/* accumulates instead, across writers that each know only part of the
   row: coined on first use from preds/auto-registration, amended by `claim

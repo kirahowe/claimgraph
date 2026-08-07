@@ -29,14 +29,12 @@
   come from. A nil :default means the consumer computes one (documented in
   :desc).
 
-  A setting's name IS its flag, always. The registry used to allow a setting
-  to be spelled differently on the command line (:notes-dir was --dir), and
-  that indirection is how `setup --notes-dir` persisted a key no runtime
-  consumer read while `setup --dir` persisted nothing at all: two names for
-  one setting means two places to keep in sync, and they did not stay in
-  sync. Old spellings are the CLI's business now — cli.clj folds a verb's
-  legacy flag onto the canonical one before the env and config layers are
-  consulted, so the alias keeps working without the registry knowing."
+  A setting's name IS its flag, always: the registry carries only the
+  canonical spelling for each setting, never an alternate one — two names
+  for one setting in the registry would mean two places to keep in sync.
+  Old spellings are the CLI's business — cli.clj folds a verb's legacy flag
+  onto the canonical one before the env and config layers are consulted, so
+  the alias keeps working without the registry knowing."
   (array-map
    :db {:flag "--db" :env "CLAIMGRAPH_DB" :default ".claimgraph/db"
         :desc "Store path (an LMDB directory; the format stamp, oplog, evidence, leases, and the curation log derive from it as siblings)."}
