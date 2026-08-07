@@ -73,6 +73,21 @@ from this spec, all in the settle-in-implementation spirit:*
   `CLAUDE.md` path, filtered to whichever exists. All mint `:instruction`,
   `:injected? true`. `@`-imports inside a `CLAUDE.md` are not followed — a
   live v1 limitation, not a planned one.*
+- *2026-08-07: model calls are budgeted and isolated rather than run
+  open-loop. A one-call extractor preflight runs before the pipeline;
+  failure there is a `status: "blocked"` scorecard and exit 1, the same
+  shape a missing `dtlv` gives `setup` — a run that can't reach its
+  extractor fails up front, not partway through a pile. Past preflight,
+  `--budget` (default 20, the same knob `curate` uses) caps total calls
+  across extraction and judging; work past the cap is deferred and named in
+  the scorecard rather than silently dropped. Each remaining call is
+  isolated — one file's or one pair's failure doesn't abort the run — and
+  surfaces as a `status: "partial"` scorecard carrying an `:llm` receipts
+  section; three consecutive failures trip a breaker rather than spending
+  the rest of the budget against a dead extractor. Progress narrates on
+  stderr as each call lands (`--quiet` silences it), and `--no-llm` skips
+  the extractor entirely for the deterministic subset — file scan,
+  injection arithmetic, the code baseline.*
 
 -----
 
@@ -117,15 +132,20 @@ claim audit [--project DIR]           # default cwd
             [--dir D]...              # extra directories (every *.md inside)
             [--no-code]               # skip the staleness-vs-code prong
             [--no-judge]              # skip the LLM verdict pass (report raw)
+            [--no-llm]                # deterministic subset only — no extractor
+            [--budget N]              # model-call cap, extraction + judging (default 20)
             [--extractor CMD]         # the usual chain ($CLAIMGRAPH_LLM_CMD…)
+            [--quiet]                 # silence the stderr progress lines
             [--out FILE]              # also write the scorecard JSON to FILE
             [--pretty]
 ```
 
 JSON scorecard on stdout like every other verb; `--pretty` for the human
 rendering above plus per-finding detail (each finding carries its source
-files and the claims involved, so every number is auditable). Exit 0 even
-with findings — it's a report. (`--fail-on N` for CI is a later idea, §9.)
+files and the claims involved, so every number is auditable). Exit 0 with
+findings — it's a report, not a gate — but an extractor preflight failure
+blocks before scanning anything and exits 1, the same shape a missing
+`dtlv` gives `setup`. (`--fail-on N` for CI is a later idea, §9.)
 
 The scorecard ends with a `next` hint: `claim setup` — the funnel step.
 

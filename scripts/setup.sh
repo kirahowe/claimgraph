@@ -303,5 +303,8 @@ echo
 echo "  claim audit   # start here: a read-only consistency scorecard of the"
 echo "                # memory pile you already have (auto-memory notes),"
 echo "                # audited together with CLAUDE.md/rules files —"
-echo "                # no store, nothing written"
+echo "                # no store, nothing written; ~20 model calls via your"
+echo "                # extractor, --no-llm for the free deterministic subset"
 echo "  claim setup   # then: wire the graph — store, agent skill, ambient loop"
+echo
+echo "scripts/uninstall.sh reverses claim setup in a project (--purge, --global)"

@@ -330,6 +330,19 @@
       (is (= 1 @calls))
       (is (= 1 (count (curation-refs s "verdict:")))))))
 
+(deftest progress-fn-fires-once-per-model-call
+  (let [s (store-with-conflict)
+        calls (atom 0)]
+    (let [r (judge/judge-conflicts! s {:judge-fn (verdict-fn :supersedes 0.95)
+                                       :progress-fn (fn [_] (swap! calls inc))})]
+      (is (some? r))
+      (is (= 1 @calls) "one model call, one narration line"))
+    (testing "a re-run against a now-recorded verdict costs no call and no narration"
+      (let [again (judge/judge-conflicts! s {:judge-fn refuse-to-judge
+                                             :progress-fn (fn [_] (swap! calls inc))})]
+        (is (true? (get-in again [:results 0 :from-record])))
+        (is (= 1 @calls) "the record answers for free — progress-fn never fires again")))))
+
 (defn- seeded []
   (doto (mem/create) (core/seed!)))
 

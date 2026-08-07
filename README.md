@@ -74,6 +74,13 @@ pass (`--db`, `--notes-dir`, `--settings-file`, ...) is persisted to
 `.claimgraph/config.json` so later commands need no flags — see
 [Configuration](#configuration).
 
+`scripts/uninstall.sh [PROJECT_DIR] [--purge] [--global]` undoes `claim
+setup` in a project, by the same markers setup wrote: the hook entries, the
+`.mcp.json` registration, the agent skill, and the gitignore and
+compiled-view marker blocks. It keeps `.claimgraph/` (the store and its
+config) unless run with `--purge`, and `--global` removes the `claim`
+launcher — `bb` and `dtlv` are shared tools and stay.
+
 ## Quickstart
 
 ### Start with an audit — before you install anything
@@ -121,6 +128,18 @@ detected; every other finding class works on any repo. The findings are precisel
 diseases the graph cures: post-adoption, staleness goes to ~zero by
 construction, contradictions become tracked open conflicts, restatement
 becomes reinforcement, and name drift becomes aliases.
+
+Audit's model-call bill is stated up front: one preflight round-trip to
+confirm the extractor answers, then one call per scanned file plus one per
+judged conflict pair, hard-capped at `--budget` (default 20, the same knob
+`curate` uses) — anything past the cap is deferred and named in the
+scorecard rather than silently dropped. Calls run a few seconds to ~2
+minutes each, so a typical pile scores in single-digit minutes, narrated as
+progress lines on stderr (`--quiet` to silence them). `claim audit --no-llm`
+runs the deterministic subset — file scan, injection arithmetic, the code
+baseline — in seconds, no extractor needed. A run that can't reach its
+extractor blocks before scanning anything and exits 1, instead of failing
+partway through a pile with an unpredictable slice already spent.
 
 ### Feed and query the graph
 
@@ -196,7 +215,7 @@ layer set it, and the fully resolved paths.
 | LLM command | `--extractor` / `--command` | `CLAIMGRAPH_LLM_CMD` | `claude -p` |
 | LLM call timeout (ms) | `--llm-timeout-ms` | `CLAIMGRAPH_LLM_TIMEOUT_MS` | `120000` |
 | raw-evidence dir | `--evidence-dir` | `CLAIMGRAPH_EVIDENCE_DIR` | `<db>.evidence` |
-| curation call budget | `--budget` | `CLAIMGRAPH_BUDGET` | `20` |
+| model-call budget (`curate`, `audit`) | `--budget` | `CLAIMGRAPH_BUDGET` | `20` |
 | ambient code refresh | `--code-ingest` | `CLAIMGRAPH_CODE_INGEST` | `session-end` (or `manual`) |
 
 A setting's name is its flag, always: `--notes-dir` sets `notes-dir`. Where a

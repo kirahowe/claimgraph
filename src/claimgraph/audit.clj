@@ -48,6 +48,24 @@
 
 (def default-confidence notes/default-confidence)
 
+(def default-call-budget
+  "audit's own hard cap on model calls for the whole run — the same
+  budget discipline claimgraph.curate/curate! runs under: one shared
+  counter spanning every call the pipeline makes (extraction AND judge),
+  never a per-stage carve-out. Work the cap doesn't reach is deferred and
+  named in the scorecard's :llm section, never dropped silently — the next
+  run, or a wider --budget, picks it up exactly where this one stopped."
+  20)
+
+(def trip-threshold
+  "Consecutive failed model calls after which the gate stops spending
+  altogether, independent of how much budget remains. Every call already
+  waits up to the 120s per-call timeout (claimgraph.llm/default-timeout-ms);
+  a dead extractor or an expired auth token fails every call the same way,
+  and without a breaker a run would burn its whole remaining budget one
+  timeout at a time instead of surfacing the failure once and moving on."
+  3)
+
 (def kind->source-type
   "Where a claim's trust comes from, keyed by its file's :kind (§1): an
   :instruction file is human-maintained, so its claims mint at the same
@@ -394,8 +412,16 @@
 (defn scorecard
   "Fold everything into the §7 schema: summary is the marketing line,
   findings is the receipts. With the judge on, judged-compatible pairs are
-  removed — the false-positive filter that keeps the headline honest."
-  [{:keys [project files fold judged no-judge clusters entities code noise]}]
+  removed — the false-positive filter that keeps the headline honest.
+
+  :llm and :preflight ride straight through from audit! (a direct pure
+  call may omit both — :status stays \"ok\" and neither key appears in the
+  output). :llm's own :status decides the top-level
+  one: \"partial\" whenever the model-call gate degraded (a per-call error,
+  a deferral, a tripped breaker), \"ok\" otherwise. A :no-llm :llm section
+  overrides :judge's usual --no-judge note, so a --no-llm run reads as
+  needing an extractor rather than the generic raw-report phrasing."
+  [{:keys [project files fold judged no-judge clusters entities code noise llm preflight]}]
   (let [pairs (dedupe-pairs
                (if no-judge
                  (:pairs fold)
@@ -415,28 +441,35 @@
                  :restatements (count restated)
                  :name-clusters (count nclusters)}
         claims (reduce + 0 (map :claims files))]
-    {:status "ok"
-     :project project
-     :files (mapv #(select-keys % [:path :bytes :claims :warning :skipped]) files)
-     :claims claims
-     :code code
-     :judge (if no-judge
-              {:status :skipped :note "raw report — mechanical flags only (--no-judge)"}
-              {:status :ok :judged (count judged)
-               :compatible-removed (count (filter #(= :compatible (get-in % [:verdict :relation]))
-                                                  judged))})
-     :findings {:contradictions (vec contradictions)
-                :instruction-conflicts (vec instruction-conflicts)
-                :stale (vec stale)
-                :disagreements disagreements
-                :restatements restated
-                :name-clusters nclusters
-                :extraction-noise noise}
-     :injection (injection-report files)
-     :summary summary
-     :next [(if (zero? claims)
-              "claim setup  # nothing to migrate — start the graph fresh"
-              "claim setup  # the graph tracks these instead of accumulating them")]}))
+    (cond->
+      {:status (if (= :partial (:status llm)) "partial" "ok")
+       :project project
+       :files (mapv #(select-keys % [:path :bytes :claims :warning :skipped :llm]) files)
+       :claims claims
+       :code code
+       :judge (cond
+                (= :no-llm (:reason llm))
+                {:status :skipped :note "skipped by --no-llm (deterministic checks only)"}
+                no-judge
+                {:status :skipped :note "raw report — mechanical flags only (--no-judge)"}
+                :else
+                {:status :ok :judged (count judged)
+                 :compatible-removed (count (filter #(= :compatible (get-in % [:verdict :relation]))
+                                                    judged))})
+       :findings {:contradictions (vec contradictions)
+                  :instruction-conflicts (vec instruction-conflicts)
+                  :stale (vec stale)
+                  :disagreements disagreements
+                  :restatements restated
+                  :name-clusters nclusters
+                  :extraction-noise noise}
+       :injection (injection-report files)
+       :summary summary
+       :next [(if (zero? claims)
+                "claim setup  # nothing to migrate — start the graph fresh"
+                "claim setup  # the graph tracks these instead of accumulating them")]}
+      llm (assoc :llm llm)
+      preflight (assoc :preflight preflight))))
 
 ;; ---------------------------------------------------------------------------
 ;; Pure: human rendering
@@ -465,24 +498,43 @@
 
 (defn render-pretty
   "The §1 scorecard block plus per-finding detail — every number auditable.
-  An empty pile short-circuits to a plain answer instead of a wall of zeros.
+  An empty pile short-circuits to a plain answer instead of a wall of
+  zeros; so does a --no-llm run, whose deterministic-only head skips every
+  finding count a model call would have been needed to produce (zeros
+  there would read as \"unchecked\", not \"clean\"). \"partial\" renders
+  exactly like \"ok\" — only a genuinely blocked run takes the error path
+  — with whatever the model-call gate degraded on appended below the
+  ordinary findings as warnings and notes.
   The injection line reports injected KB against the window, with the
   managed-view and on-demand shares called out underneath whenever either is
   nonzero — so the headline number is legible as 'this much actually lands
   in the harness's context window', not a re-statement of the whole scan."
-  [{:keys [status claims files findings injection summary code next] :as sc}]
-  (if (not= "ok" status)
+  [{:keys [status claims files findings injection summary code next llm] :as sc}]
+  (if (not (contains? #{"ok" "partial"} status))
     (str/join "\n" (remove nil? [(str "audit " (name status)
                                       (some->> (:error sc) (str ": ")))
                                  (some->> (:hint sc) (str "hint: "))]))
     (let [n (fn [k] (get summary k 0))
           plural (fn [c s] (if (= 1 c) s (str s "s")))
           kb (fn [b] (Math/round (/ b 1000.0)))
+          no-extractor? (= :no-llm (:reason llm))
           code-line (when (= :ok (:status code))
                       (format "%4d code facts from %d files (%s) — the baseline stale claims are checked against"
                               (:facts code) (:files code)
                               (str/join ", " (map pred-str (:languages code)))))
-          head (if (empty? files)
+          injection-lines (remove nil?
+                                  [(format "%4d KB injected per session against a ~%d KB window%s"
+                                          (kb (:injected-bytes injection))
+                                          (kb (:window-bytes injection))
+                                          (if (:over-budget injection) "  ** over budget **" ""))
+                                   (when (pos? (:managed-bytes injection))
+                                     (format "     (of which %d KB is claimgraph's compiled view)"
+                                             (kb (:managed-bytes injection))))
+                                   (when (pos? (:on-demand-bytes injection))
+                                     (format "     %d KB of on-demand notes scanned, not injected"
+                                             (kb (:on-demand-bytes injection))))])
+          head (cond
+                 (empty? files)
                  (remove nil?
                          ["nothing to audit — no instruction files or auto-memory notes found"
                           (str "     (scanned " (str/join ", " default-scan-set) ",")
@@ -490,48 +542,77 @@
                           "      every ancestor directory, each harness's global instructions,"
                           "      and the harness auto-memory notes)"
                           code-line])
+
+                 no-extractor?
                  (remove nil?
-                         [(format "%4d claims extracted from %d %s"
-                                  claims (count files) (plural (count files) "file"))
-                          (format "%4d %-15s (opposed claims coexisting in the pile)"
-                                  (n :contradictions) (plural (n :contradictions) "contradiction"))
-                          (format "%4d %-15s (agent memory at odds with your instruction files)"
-                                  (n :instruction-conflicts)
-                                  (plural (n :instruction-conflicts) "instruction conflict"))
-                          (format "%4d %-15s (same subject, different values — the last one read silently wins)"
-                                  (n :disagreements) (plural (n :disagreements) "disagreement"))
-                          (format "%4d %-15s (contradicted by what the code says today)"
-                                  (n :stale) "stale")
-                          (format "%4d %-15s (the same fact maintained in more than one place)"
-                                  (n :restatements) (plural (n :restatements) "restatement"))
-                          (format "%4d %-15s %s"
-                                  (n :name-clusters) (plural (n :name-clusters) "name cluster")
-                                  (if-let [c (first (:name-clusters findings))]
-                                    (str "(" (str/join " / " c) ")")
-                                    "(no drift detected)"))
-                          (format "%4d KB injected per session against a ~%d KB window%s"
-                                  (kb (:injected-bytes injection))
-                                  (kb (:window-bytes injection))
-                                  (if (:over-budget injection) "  ** over budget **" ""))
-                          (when (pos? (:managed-bytes injection))
-                            (format "     (of which %d KB is claimgraph's compiled view)"
-                                    (kb (:managed-bytes injection))))
-                          (when (pos? (:on-demand-bytes injection))
-                            (format "     %d KB of on-demand notes scanned, not injected"
-                                    (kb (:on-demand-bytes injection))))
-                          code-line]))
-          details (concat (map finding-line (:contradictions findings))
-                          (map finding-line (:instruction-conflicts findings))
-                          (map finding-line (:stale findings))
-                          (map finding-line (:disagreements findings))
-                          (map finding-line (:restatements findings))
-                          (map #(str "  name cluster: " (str/join " / " %))
-                               (:name-clusters findings)))
+                         (concat [(format "%4d files scanned — deterministic checks only (--no-llm)"
+                                          (count files))]
+                                 injection-lines
+                                 [code-line]))
+
+                 :else
+                 (remove nil?
+                         (concat
+                          [(format "%4d claims extracted from %d %s"
+                                   claims (count files) (plural (count files) "file"))
+                           (format "%4d %-15s (opposed claims coexisting in the pile)"
+                                   (n :contradictions) (plural (n :contradictions) "contradiction"))
+                           (format "%4d %-15s (agent memory at odds with your instruction files)"
+                                   (n :instruction-conflicts)
+                                   (plural (n :instruction-conflicts) "instruction conflict"))
+                           (format "%4d %-15s (same subject, different values — the last one read silently wins)"
+                                   (n :disagreements) (plural (n :disagreements) "disagreement"))
+                           (format "%4d %-15s (contradicted by what the code says today)"
+                                   (n :stale) "stale")
+                           (format "%4d %-15s (the same fact maintained in more than one place)"
+                                   (n :restatements) (plural (n :restatements) "restatement"))
+                           (format "%4d %-15s %s"
+                                   (n :name-clusters) (plural (n :name-clusters) "name cluster")
+                                   (if-let [c (first (:name-clusters findings))]
+                                     (str "(" (str/join " / " c) ")")
+                                     "(no drift detected)"))]
+                          injection-lines
+                          [code-line])))
+          details (if no-extractor?
+                    []
+                    (concat (map finding-line (:contradictions findings))
+                            (map finding-line (:instruction-conflicts findings))
+                            (map finding-line (:stale findings))
+                            (map finding-line (:disagreements findings))
+                            (map finding-line (:restatements findings))
+                            (map #(str "  name cluster: " (str/join " / " %))
+                                 (:name-clusters findings))))
+          per-file-errors (keep (fn [f] (when (= :error (get-in f [:llm :status]))
+                                          (str "  warning: " (:path f) ": extraction failed ("
+                                               (name (get-in f [:llm :error-type])) ")")))
+                                files)
+          gate-errors (:errors llm)
+          error-freq-line (when (seq gate-errors)
+                            (str "  warning: " (count gate-errors) " model call"
+                                 (when (not= 1 (count gate-errors)) "s")
+                                 " failed ("
+                                 (str/join ", " (map (fn [[k v]] (str (name k) ": " v))
+                                                     (frequencies (map :error-type gate-errors))))
+                                 ")"))
+          tripped-line (when (:tripped? llm)
+                        (str "  warning: model calls stopped after " trip-threshold
+                             " consecutive failures — the scorecard is partial"))
+          deferred-line (when (pos? (or (:deferred llm) 0))
+                         (str "  note: " (:deferred llm) " model calls were deferred by the --budget "
+                              (:allowed llm) " cap — raise --budget for full coverage"))
           notes (cond-> []
+                  no-extractor?
+                  (conj (str "  LLM checks skipped: contradictions, instruction conflicts, "
+                             "disagreements, stale claims, restatements and name drift need an "
+                             "extractor — run again without --no-llm"))
                   (= :skipped (:status code))
                   (conj (str "  staleness prong skipped: " (:note code)))
                   (seq (keep :warning files))
-                  (into (map #(str "  warning: " (:warning %)) (filter :warning files))))]
+                  (into (map #(str "  warning: " (:warning %)) (filter :warning files)))
+                  (seq per-file-errors) (into per-file-errors)
+                  error-freq-line (conj error-freq-line)
+                  tripped-line (conj tripped-line)
+                  deferred-line (conj deferred-line))]
       (str/join "\n" (concat head
                              (when (seq details) (cons "" details))
                              (when (seq notes) (cons "" notes))
@@ -557,7 +638,9 @@
       :extractor {:command cmd :found found}}
      (when-not found
        {:error (str "extractor '" bin "' is not on PATH — audit extracts claims with it")
-        :hint "install and authenticate the claude CLI, or point --extractor / $CLAIMGRAPH_LLM_CMD at any prompt-on-stdin command"}))))
+        :hint (str "install and authenticate the claude CLI, or point --extractor / "
+                   "$CLAIMGRAPH_LLM_CMD at any prompt-on-stdin command; or run "
+                   "`claim audit --no-llm` for the deterministic checks alone")}))))
 
 (defn- source-label [root p]
   (let [abs (fs/canonicalize p)]
@@ -765,6 +848,154 @@
        (some #(= :code (:source-type %))
              (:facts (core/get-facts s {:entity (:name entity) :predicate predicate})))))))
 
+(def preflight-prompt
+  "The one round-trip preflight! spends to prove the extractor actually
+  answers, before audit! commits any of its budget to real extraction."
+  "Reply with the single word: ok")
+
+(defn preflight!
+  "One real extractor round-trip, run before the pipeline spends anything —
+  so an unauthenticated CLI or a rate-limited account blocks the run up
+  front, in the seconds a single call takes, instead of minutes into a
+  budget that was never going to land anything.
+
+  NOT metered against --budget: the budget bounds the pipeline's own
+  extraction and judge calls, and this is the fixed +1 call the README
+  already documents as the cost of running audit at all.
+
+  run is called exactly like every other model call (prompt -> reply
+  string). A blank or nil reply is as much a failure here as a thrown
+  exception — an extractor that answers nothing is exactly as useless as
+  one that errors."
+  [run]
+  (try
+    (let [started (System/nanoTime)
+          reply (run preflight-prompt)
+          ms (/ (- (System/nanoTime) started) 1e6)]
+      (if (str/blank? reply)
+        {:status :error :error "the extractor answered the preflight prompt with empty output"}
+        {:status :ok :ms ms}))
+    (catch clojure.lang.ExceptionInfo e
+      {:status :error :error (ex-message e) :error-type (:type (ex-data e))})
+    (catch Exception e
+      {:status :error :error (str e)})))
+
+(defn- gate-error-type
+  [e]
+  (if (instance? clojure.lang.ExceptionInfo e)
+    (or (:type (ex-data e)) :unexpected)
+    :unexpected))
+
+(defn llm-gate
+  "One gate in front of every model call audit! makes, extraction and judge
+  alike, so both draw from the SAME shared budget (curate!'s pattern: one
+  call counter for a whole run, never a per-stage carve-out) and fail the
+  same way: a thrown call is isolated to its own report entry instead of
+  killing the run, and a breaker (trip-threshold consecutive failures)
+  stops spending once the extractor is clearly dead rather than burning
+  the rest of the budget one 120s timeout at a time.
+
+  opts: :extract-run (prompt -> reply, the extraction shell-out)
+        :judge-run (prompt -> reply, the judge shell-out — kept separate
+                    from :extract-run because an injected :extractor-fn
+                    must never silently stand in for the judge and vice
+                    versa: audit! wires each independently)
+        :budget (calls this gate may spend before every further call is
+                 deferred rather than attempted)
+
+  Returns:
+    :spend! — 0-arg; true + :spent++ when a call is affordable, false +
+              :deferred++ when the budget is exhausted or the breaker has
+              tripped. The exact contract judge-conflicts!/sweep-conflicts!
+              already accept, so the judge stage spends from this same
+              gate.
+    :call!  — (fn [label prompt]) for the extraction path: spends, then
+              runs :extract-run guarded. {:status :ok :text s} on success;
+              {:status :skipped :reason :budget-exhausted|:tripped} without
+              calling; {:status :error :error-type kw :message s} on a
+              thrown exception (:type from ex-data for an ExceptionInfo —
+              llm/complete! throws :llm-command-failed /
+              :llm-command-timeout — else :unexpected).
+    :judge-fn — (fn [prompt]), ready to hand straight to
+              judge-conflicts!/sweep-conflicts!'s own :judge-fn: runs
+              :judge-run guarded with NO spend check of its own (those fns
+              already consult :spend! before calling it) and returns the
+              reply text, or nil on a thrown exception. A nil reply parses
+              as an unparseable verdict inside judge.clj, which records
+              nothing and kills nothing.
+    :report — 0-arg; {:allowed :spent :deferred :errors :tripped?}."
+  [{:keys [extract-run judge-run budget]}]
+  (let [state (atom {:spent 0 :deferred 0 :errors [] :consecutive 0})
+        tripped? (fn [] (>= (:consecutive @state) trip-threshold))
+        spend! (fn []
+                 (if (or (>= (:spent @state) budget) (tripped?))
+                   (do (swap! state update :deferred inc) false)
+                   (do (swap! state update :spent inc) true)))
+        guarded-run (fn [run label prompt]
+                      (try
+                        (let [text (run prompt)]
+                          (swap! state assoc :consecutive 0)
+                          {:status :ok :text text})
+                        (catch Exception e
+                          (let [error-type (gate-error-type e)]
+                            (swap! state (fn [st]
+                                           (-> st
+                                               (update :errors conj
+                                                       {:at label :error-type error-type
+                                                        :message (ex-message e)})
+                                               (update :consecutive inc))))
+                            {:status :error :error-type error-type :message (ex-message e)}))))]
+    {:spend! spend!
+     :call! (fn [label prompt]
+              (if (spend!)
+                (guarded-run extract-run label prompt)
+                {:status :skipped :reason (if (tripped?) :tripped :budget-exhausted)}))
+     :judge-fn (fn [prompt] (:text (guarded-run judge-run "judge" prompt)))
+     :report (fn []
+               (let [st @state]
+                 {:allowed budget :spent (:spent st) :deferred (:deferred st)
+                  :errors (:errors st) :tripped? (tripped?)}))}))
+
+(defn- kb-round [b] (Math/round (/ (double (or b 0)) 1000.0)))
+
+(defn- code-progress-line
+  [{:keys [status files facts note languages]}]
+  (case status
+    :ok (format "code: %d facts from %d files (%s)"
+                facts files (str/join ", " (map pred-str languages)))
+    :skipped (str "code: skipped (" note ")")
+    (str "code: " (name (or status :unknown)))))
+
+(defn- extract-outcome-line
+  [i total path {:keys [claims llm]}]
+  (let [prefix (format "extract [%d/%d] %s" i total path)]
+    (cond
+      (= :error (:status llm)) (str prefix ": failed (" (name (:error-type llm)) ")")
+      (contains? #{:budget-exhausted :tripped} (:reason llm))
+      (str prefix ": deferred (" (name (:reason llm)) ")")
+      :else (str prefix ": " claims " claims"))))
+
+(defn- skipped-report
+  "The report for a source read-source marked :skipped — stripped content
+  blank, usually a note that is entirely claimgraph's own compiled view.
+  It never reaches audit-file! (nothing to extract, and re-extracting our
+  own compiled view is exactly the echo loop the guard exists to prevent),
+  but it must not vanish from the file list: its raw bytes are still what
+  the harness reads and injects, so injection-report still needs to see
+  them."
+  [{:keys [path kind bytes managed-bytes injected?]}]
+  {:path path :kind kind :bytes bytes :managed-bytes managed-bytes
+   :injected? injected? :claims 0 :results [] :rejected 0 :inadmissible 0
+   :skipped true})
+
+(defn- unextracted-report
+  "skipped-report's shape for a source --no-llm left alone on purpose:
+  scanned (its bytes still count toward injection), but no extractor call
+  was ever made and no episode was ever opened — the :llm reason is what
+  tells this apart from an ordinary echo-guard skip."
+  [src]
+  (assoc (skipped-report src) :llm {:status :skipped :reason :no-llm}))
+
 (defn- audit-file!
   "Extract one pile file and push every admitted claim through the full
   conflict machinery, one episode per file (ref audit:<path>@<hash>). The
@@ -780,69 +1011,67 @@
   if so the assert is forced to :on-conflict :flag, pinning code as
   ground truth the pile can collide with but never quietly overwrite.
 
+  The extraction call itself runs through gate's :call! — budgeted and
+  isolated to its own report entry. A non-:ok result (:skipped or :error)
+  never opens an episode or touches the store at all: it folds straight
+  into skipped-report's shape with the gate's own result attached as :llm,
+  same as a source read-source marked :skipped, so a caller reading
+  :files never has to special-case why a file carries zero claims.
+
   Only ever called on a source whose stripped content is non-blank (audit!
   filters skipped sources to skipped-report instead) — content is always
   something to extract here."
-  [s run {:keys [path content hash bytes managed-bytes injected? kind]}]
+  [s gate {:keys [path content hash bytes managed-bytes injected? kind] :as src}]
   (let [entities (store/-list-entities s {})
         predicates (store/-list-predicates s {:status :stable})
         roster (session/entity-roster entities (store/-entity-usage s)
                                       session/roster-limit)
         prompt (extraction-prompt path content predicates roster kind)
-        {:keys [facts rejected]} (prepare-audit-facts
-                                  (session/parse-extraction (run prompt)) kind)
-        {:keys [admitted inadmissible]} (logic/screen-candidates
-                                         facts (logic/admission-ctx entities predicates))
-        ep (core/open-episode s {:source-type (mapped-source-type kind)
-                                 :ref (str "audit:" path "@" hash)})
-        results (mapv (fn [f]
-                        (let [quote (:quote f)
-                              fact (dissoc f :quote :admission-score)
-                              on-conflict (when (code-baseline? s (:subject fact) (:predicate fact))
-                                            :flag)]
-                          (try
-                            (-> (core/assert-fact s (assoc fact :episode (:id ep)
-                                                          :on-conflict on-conflict))
-                                (select-keys [:status :fact :candidates :superseded])
-                                (assoc :quote quote))
-                            (catch clojure.lang.ExceptionInfo e
-                              {:status :error :message (ex-message e)
-                               :error-type (:type (ex-data e)) :input fact}))))
-                      admitted)
-        content-bytes (utf8-bytes content)]
-    (core/close-episode s {:episode (:id ep)
-                           :summary (str "audit " path "@" hash ": "
-                                         (count admitted) " claims ("
-                                         (pr-str (frequencies (map :status results))) "), "
-                                         (count rejected) " rejected, "
-                                         (count inadmissible) " inadmissible")})
-    (cond-> {:path path :kind kind :bytes bytes :managed-bytes managed-bytes
-             :injected? injected? :claims (count admitted)
-             :results results
-             :rejected (count rejected)
-             :inadmissible (count inadmissible)}
-      (> content-bytes file-warn-bytes)
-      (assoc :warning (str path " is " content-bytes
-                           " bytes — extraction degrades above ~50 KB/file")))))
-
-(defn- skipped-report
-  "The report for a source read-source marked :skipped — stripped content
-  blank, usually a note that is entirely claimgraph's own compiled view.
-  It never reaches audit-file! (nothing to extract, and re-extracting our
-  own compiled view is exactly the echo loop the guard exists to prevent),
-  but it must not vanish from the file list: its raw bytes are still what
-  the harness reads and injects, so injection-report still needs to see
-  them."
-  [{:keys [path kind bytes managed-bytes injected?]}]
-  {:path path :kind kind :bytes bytes :managed-bytes managed-bytes
-   :injected? injected? :claims 0 :results [] :rejected 0 :inadmissible 0
-   :skipped true})
+        call-result ((:call! gate) path prompt)]
+    (if (not= :ok (:status call-result))
+      (assoc (skipped-report src) :llm (dissoc call-result :text))
+      (let [{:keys [facts rejected]} (prepare-audit-facts
+                                       (session/parse-extraction (:text call-result)) kind)
+            {:keys [admitted inadmissible]} (logic/screen-candidates
+                                              facts (logic/admission-ctx entities predicates))
+            ep (core/open-episode s {:source-type (mapped-source-type kind)
+                                     :ref (str "audit:" path "@" hash)})
+            results (mapv (fn [f]
+                            (let [quote (:quote f)
+                                  fact (dissoc f :quote :admission-score)
+                                  on-conflict (when (code-baseline? s (:subject fact) (:predicate fact))
+                                                :flag)]
+                              (try
+                                (-> (core/assert-fact s (assoc fact :episode (:id ep)
+                                                              :on-conflict on-conflict))
+                                    (select-keys [:status :fact :candidates :superseded])
+                                    (assoc :quote quote))
+                                (catch clojure.lang.ExceptionInfo e
+                                  {:status :error :message (ex-message e)
+                                   :error-type (:type (ex-data e)) :input fact}))))
+                          admitted)
+            content-bytes (utf8-bytes content)]
+        (core/close-episode s {:episode (:id ep)
+                               :summary (str "audit " path "@" hash ": "
+                                             (count admitted) " claims ("
+                                             (pr-str (frequencies (map :status results))) "), "
+                                             (count rejected) " rejected, "
+                                             (count inadmissible) " inadmissible")})
+        (cond-> {:path path :kind kind :bytes bytes :managed-bytes managed-bytes
+                 :injected? injected? :claims (count admitted)
+                 :results results
+                 :rejected (count rejected)
+                 :inadmissible (count inadmissible)}
+          (> content-bytes file-warn-bytes)
+          (assoc :warning (str path " is " content-bytes
+                               " bytes — extraction degrades above ~50 KB/file")))))))
 
 (defn audit!
-  "The whole §4 pipeline, inside one throwaway in-memory store: collect the
-  pile, seed, ingest code ground truth, extract + assert every pile claim,
-  sweep + judge (report-only — NEVER :resolve; audit fixes nothing), fold
-  into the scorecard. Writes nothing anywhere.
+  "The whole §4 pipeline, inside one throwaway in-memory store: preflight
+  the extractor, collect the pile, seed, ingest code ground truth, extract
+  + assert every pile claim under one shared model-call budget (llm-gate),
+  sweep + judge from that same budget (report-only — NEVER :resolve; audit
+  fixes nothing), fold into the scorecard. Writes nothing anywhere.
 
   opts: :project (default cwd) :files/:dirs (extra sources)
         :harness (default claude-code) :notes-dir / :inject-file (override
@@ -852,46 +1081,129 @@
         :ancestor-limit / :managed-paths (collect-sources' test-isolation
         seams — pass through untouched; nil/absent gives the real scan)
         :no-code :no-judge
+        :no-llm (skip every model call outright — extraction AND judge,
+                 with it the extractor prerequisite and the preflight; the
+                 deterministic checks (file scan, injection arithmetic,
+                 code baseline) still run in full)
+        :budget (model calls for the WHOLE run — extraction and judge draw
+                 from one shared pool, curate!'s pattern; default
+                 default-call-budget)
         :extractor (command string) :extractor-fn / :judge-fn (injectable,
-        tests) :which (prerequisite lookup, injectable)"
+        tests — an injected :extractor-fn is never used for judging, and
+        vice versa)
+        :which (prerequisite lookup, injectable)
+        :preflight-fn (injectable, tests; default preflight!)
+        :progress-fn (fn [line]) called with human-readable narration as
+        the pipeline runs — the preflight, the code baseline, each file's
+        extraction, sweep/judge, the final budget summary; default a
+        no-op. cli.clj wires this to stderr so `claim audit | jq` still
+        narrates at a terminal."
   [{:keys [project harness files dirs notes-dir inject-file ctx no-code no-judge
-           extractor extractor-fn judge-fn which ancestor-limit managed-paths]}]
+           extractor extractor-fn judge-fn which ancestor-limit managed-paths
+           budget no-llm progress-fn preflight-fn]}]
   (let [project (str (fs/canonicalize (or project ".")))
-        prereqs (when-not extractor-fn
+        no-judge (or no-judge no-llm)
+        progress (or progress-fn (fn [_]))
+        prereqs (when-not (or extractor-fn no-llm)
                   (check-prerequisites {:extractor extractor :which which}))]
     (if (= :error (:status prereqs))
       {:status "blocked" :project project :prerequisites prereqs
        :error (:error prereqs) :hint (:hint prereqs)}
-      (let [sources (collect-sources {:project project :files files :dirs dirs
-                                      :harness harness :notes-dir notes-dir
-                                      :inject-file inject-file :ctx ctx
-                                      :ancestor-limit ancestor-limit
-                                      :managed-paths managed-paths})
-            s (mem/create)
-            _ (core/seed! s)
-            code (ingest-code! s project no-code)
-            run (or extractor-fn (partial llm/complete! (llm/command extractor)))
-            ;; A source read-source marked :skipped strips to nothing — no
-            ;; extractor call, no episode — but it still counts toward
-            ;; injection (skipped-report), the whole point of keeping it in
-            ;; collect-sources.
-            reports (mapv (fn [src]
-                            (if (:skipped src)
-                              (skipped-report src)
-                              (audit-file! s run src)))
-                          sources)
-            fold (fold-results reports)
-            _ (when-not no-judge
-                (judge/sweep-conflicts! s {:judge-fn judge-fn :command extractor}))
-            judged (when-not no-judge
-                     (:results (judge/judge-conflicts! s {:judge-fn judge-fn
-                                                          :command extractor})))]
-        (scorecard {:project project
-                    :files reports
-                    :fold fold
-                    :judged (vec judged)
-                    :no-judge (boolean no-judge)
-                    :clusters (:candidates (core/entity-duplicates s))
-                    :entities (store/-list-entities s {})
-                    :code code
-                    :noise (extraction-noise reports (:errors fold))})))))
+      (let [run (or extractor-fn (partial llm/complete! (llm/command extractor)))
+            ;; An injected :extractor-fn skips the preflight unless a test
+            ;; injects :preflight-fn explicitly — an injected fn is already
+            ;; known-good, and a real extractor is verified before spending
+            ;; anything on it.
+            run-preflight? (and (not no-llm) (or preflight-fn (not extractor-fn)))
+            pf (when run-preflight?
+                 (progress (str "preflight: extractor round-trip ("
+                               (llm/command extractor) ")…"))
+                 (let [r ((or preflight-fn preflight!) run)]
+                   (when (= :ok (:status r))
+                     (progress (format "preflight: ok (%.1fs)" (/ (double (:ms r)) 1000.0))))
+                   r))]
+        (if (= :error (:status pf))
+          {:status "blocked" :project project :prerequisites prereqs :preflight pf
+           :error (str "the extractor failed its preflight call: " (:error pf))
+           :hint (str "see the failure yourself: echo ok | " (llm/command extractor)
+                      "  — or run `claim audit --no-llm` for the deterministic checks alone")}
+          (let [sources (collect-sources {:project project :files files :dirs dirs
+                                          :harness harness :notes-dir notes-dir
+                                          :inject-file inject-file :ctx ctx
+                                          :ancestor-limit ancestor-limit
+                                          :managed-paths managed-paths})
+                s (mem/create)
+                _ (core/seed! s)
+                code (ingest-code! s project no-code)
+                _ (progress (code-progress-line code))
+                resolved-budget (max 0 (if (number? budget) (long budget) default-call-budget))
+                ;; Both extraction and judge spend from ONE gate — the
+                ;; curate! pattern — so :judge-run is wired independently
+                ;; of :extract-run: an injected :extractor-fn must never
+                ;; silently stand in for the judge, only an injected
+                ;; :judge-fn does that.
+                gate (when-not no-llm
+                       (llm-gate {:extract-run run
+                                  :judge-run (or judge-fn (partial llm/complete! (llm/command extractor)))
+                                  :budget resolved-budget}))
+                total (count (remove :skipped sources))
+                idx (atom 0)
+                ;; A source read-source marked :skipped strips to nothing —
+                ;; no extractor call, no episode — but it still counts
+                ;; toward injection (skipped-report), the whole point of
+                ;; keeping it in collect-sources.
+                reports (mapv
+                         (fn [src]
+                           (cond
+                             (:skipped src) (skipped-report src)
+                             ;; a --no-llm scan is instant, so per-file
+                             ;; narration would be all noise: 2n lines that
+                             ;; each say only "no call was made"
+                             no-llm (unextracted-report src)
+                             :else
+                             (let [i (swap! idx inc)]
+                               (progress (format "extract [%d/%d] %s (%d KB)…"
+                                                 i total (:path src) (kb-round (:bytes src))))
+                               (let [report (audit-file! s gate src)]
+                                 (progress (extract-outcome-line i total (:path src) report))
+                                 report))))
+                         sources)
+                fold (fold-results reports)
+                judge-progress (fn [line] (progress (str "judge: " line)))
+                sweep-r (when-not no-judge
+                         (judge/sweep-conflicts! s {:judge-fn (:judge-fn gate)
+                                                    :spend! (:spend! gate)
+                                                    :progress-fn judge-progress}))
+                _ (when sweep-r
+                   (progress (format "sweep: %d candidates, %d linked"
+                                     (:candidates sweep-r) (:linked sweep-r))))
+                judge-r (when-not no-judge
+                         (judge/judge-conflicts! s {:judge-fn (:judge-fn gate)
+                                                    :spend! (:spend! gate)
+                                                    :progress-fn judge-progress}))
+                judged (vec (:results judge-r))
+                _ (when judge-r
+                   (progress (format "judge: %d verdicts, %d compatible removed"
+                                     (count judged)
+                                     (count (filter #(= :compatible (get-in % [:verdict :relation]))
+                                                    judged)))))
+                llm-r (when gate ((:report gate)))
+                _ (when llm-r
+                   (progress (format "llm: %d calls, %d failed, %d deferred (budget %d)"
+                                     (:spent llm-r) (count (:errors llm-r))
+                                     (:deferred llm-r) (:allowed llm-r))))]
+            (scorecard {:project project
+                        :files reports
+                        :fold fold
+                        :judged judged
+                        :no-judge (boolean no-judge)
+                        :clusters (:candidates (core/entity-duplicates s))
+                        :entities (store/-list-entities s {})
+                        :code code
+                        :noise (extraction-noise reports (:errors fold))
+                        :llm (if no-llm
+                              {:status :skipped :reason :no-llm}
+                              (let [degraded (or (:tripped? llm-r) (seq (:errors llm-r))
+                                                 (pos? (:deferred llm-r)))]
+                                (assoc llm-r :status (if degraded :partial :ok))))
+                        :preflight pf})))))))

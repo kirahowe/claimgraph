@@ -8,6 +8,7 @@
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [claimgraph.audit :as audit]
+            [claimgraph.cli :as cli]
             [claimgraph.harness :as harness]))
 
 (def ^:private isolated-ctx
@@ -973,3 +974,148 @@
       (is (= {:contradictions 0 :instruction-conflicts 0 :stale 0 :disagreements 0
               :restatements 0 :name-clusters 0}
              (:summary r))))))
+
+;; ---------------------------------------------------------------------------
+;; Shell: the model-call gate — budget, per-call isolation, the breaker,
+;; the preflight, --no-llm, and progress narration
+;; ---------------------------------------------------------------------------
+
+(deftest budget-defers-past-the-cap
+  (let [{:keys [project note-dir]} (write-fixture!)
+        calls (atom 0)
+        counting-extractor (fn [_] (swap! calls inc) "")
+        r (audit/audit! {:project project
+                         :dirs [note-dir]
+                         :ctx isolated-ctx
+                         :ancestor-limit project :managed-paths []
+                         :budget 1
+                         :extractor-fn counting-extractor
+                         :judge-fn fixture-judge})]
+    (is (= 1 @calls) "the budget allows exactly one extraction call")
+    (is (= 3 (count (:files r))))
+    (testing "the two files the budget didn't reach carry the skip reason"
+      (let [[first-file & rest-files] (:files r)]
+        (is (nil? (:llm first-file)) "the one call spent lands a normal report")
+        (is (every? #(= {:status :skipped :reason :budget-exhausted} (:llm %)) rest-files))))
+    (testing "the :llm section names what the run couldn't reach"
+      (is (= 1 (get-in r [:llm :allowed])))
+      (is (= 1 (get-in r [:llm :spent])))
+      (is (<= 2 (get-in r [:llm :deferred]))))
+    (is (= "partial" (:status r)) "a run that deferred work is not a clean ok")))
+
+(deftest per-call-errors-degrade-not-kill
+  (let [{:keys [project note-dir]} (write-fixture!)
+        extractor (fn [prompt]
+                    (cond
+                      (str/includes? prompt "file=\"CLAUDE.md\"")
+                      (throw (ex-info "boom" {:type :llm-command-failed}))
+                      (str/includes? prompt "file=\"AGENTS.md\"") agents-extraction
+                      (str/includes? prompt "note.md") note-extraction
+                      :else ""))
+        r (audit/audit! {:project project
+                         :dirs [note-dir]
+                         :ctx isolated-ctx
+                         :ancestor-limit project :managed-paths []
+                         :extractor-fn extractor
+                         :judge-fn fixture-judge})
+        [agents claude note] (:files r)]
+    (testing "the run completes, and the OTHER files' claims still land"
+      (is (= 4 (:claims agents)) "AGENTS.md was never touched by the failure")
+      (is (= 1 (:claims note)) "the note was never touched by the failure")
+      (is (str/ends-with? (:path note) "note.md")))
+    (testing "the failed file carries its own error, and asserts nothing"
+      (is (zero? (:claims claude)))
+      (is (= :error (get-in claude [:llm :status])))
+      (is (= :llm-command-failed (get-in claude [:llm :error-type]))))
+    (is (= 1 (count (get-in r [:llm :errors]))) "one call failed, isolated to its own entry")
+    (is (= "partial" (:status r)))))
+
+(deftest trip-after-consecutive-failures
+  (let [{:keys [project note-dir]} (write-fixture!)
+        _ (spit (str note-dir "/extra1.md") "another note")
+        _ (spit (str note-dir "/extra2.md") "yet another note")
+        calls (atom 0)
+        extractor (fn [_] (swap! calls inc) (throw (ex-info "boom" {:type :llm-command-failed})))
+        r (audit/audit! {:project project
+                         :dirs [note-dir]
+                         :ctx isolated-ctx
+                         :ancestor-limit project :managed-paths []
+                         :budget 100
+                         :extractor-fn extractor})]
+    (is (= 5 (count (:files r))) "two instruction files plus three notes")
+    (is (= audit/trip-threshold @calls)
+        "the breaker stops spending after exactly trip-threshold consecutive failures")
+    (is (true? (get-in r [:llm :tripped?])))
+    (is (pos? (count (filter #(= :tripped (get-in % [:llm :reason])) (:files r))))
+        "whatever the breaker left unattempted is named :tripped, not :budget-exhausted")
+    (is (= "partial" (:status r)))))
+
+(deftest preflight-failure-blocks-with-exit-worthy-status
+  (let [proj (temp-dir)
+        r (audit/audit! {:project proj
+                         :ctx isolated-ctx
+                         :ancestor-limit proj :managed-paths []
+                         :extractor-fn (fn [_] "unused")
+                         :preflight-fn (fn [_] {:status :error :error "auth expired"})})]
+    (is (= "blocked" (:status r)))
+    (is (some? (:preflight r)))
+    (is (str/includes? (:error r) "preflight"))
+    (is (str/includes? (:hint r) "--no-llm"))))
+
+(deftest preflight-unit-behaviour
+  (testing "a non-blank reply is ok, with elapsed time"
+    (let [r (audit/preflight! (fn [_] "ok"))]
+      (is (= :ok (:status r)))
+      (is (number? (:ms r)))))
+  (testing "a blank reply is a failure — an extractor that answers nothing is useless"
+    (let [r (audit/preflight! (fn [_] ""))]
+      (is (= :error (:status r)))
+      (is (some? (:error r)))))
+  (testing "a thrown ExceptionInfo carries its :type through as :error-type"
+    (let [r (audit/preflight! (fn [_] (throw (ex-info "boom" {:type :llm-command-failed}))))]
+      (is (= :error (:status r)))
+      (is (= :llm-command-failed (:error-type r))))))
+
+(deftest no-llm-needs-no-extractor
+  (let [{:keys [project note-dir]} (write-fixture!)
+        r (audit/audit! {:project project
+                         :dirs [note-dir]
+                         :ctx isolated-ctx
+                         :ancestor-limit project :managed-paths []
+                         :no-llm true
+                         :which (fn [_] nil)})]
+    (is (= "ok" (:status r)) "a missing extractor never blocks a --no-llm run")
+    (is (zero? (:claims r)))
+    (testing "the deterministic checks still ran in full"
+      (is (= 3 (count (:files r))))
+      (is (every? #(pos? (:bytes %)) (:files r)))
+      (is (map? (:injection r)))
+      (is (pos? (:injected-bytes (:injection r))))
+      (is (= :ok (get-in r [:code :status]))))
+    (is (= {:status :skipped :reason :no-llm} (:llm r)))
+    (is (= :skipped (get-in r [:judge :status])))))
+
+(deftest blocked-exits-nonzero
+  (let [tmp (temp-dir)
+        out (java.io.StringWriter.)
+        err (java.io.StringWriter.)
+        code (binding [*out* out *err* err]
+               (cli/run ["audit" "--project" tmp "--extractor" "no-such-binary-xyz"
+                        "--json" "--quiet"]))]
+    (is (= 1 code) "a blocked audit is not a clean exit, unlike an ordinary report")))
+
+(deftest progress-narrates
+  (let [{:keys [project note-dir]} (write-fixture!)
+        lines (atom [])
+        r (audit/audit! {:project project
+                         :dirs [note-dir]
+                         :ctx isolated-ctx
+                         :ancestor-limit project :managed-paths []
+                         :extractor-fn (fixture-extractor (atom []))
+                         :judge-fn fixture-judge
+                         :progress-fn (fn [line] (swap! lines conj line))})]
+    (is (= "ok" (:status r)))
+    (is (>= (count (filter #(str/starts-with? % "extract [") @lines)) 3)
+        "at least one narration line per file")
+    (is (some #(str/starts-with? % "llm: ") @lines)
+        "the final budget summary line is present")))

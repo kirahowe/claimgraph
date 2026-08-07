@@ -17,7 +17,7 @@ authoritative, always-current version of this list.
 
 | Command | Does |
 |---|---|
-| `audit` | Consistency scorecard over the agent-memory pile (auto-memory notes) audited together with the instruction files a harness actually injects (CLAUDE.md/AGENTS.md/rules files at the project root, up every ancestor directory, and each harness's own global config), pre-install: contradictions, instruction conflicts, disagreements, staleness-vs-code, restatements, name clusters, injected-vs-on-demand bytes — verbatim quote receipts, throwaway in-memory store, nothing written, no dtlv; `--no-code`, `--no-judge`, `--out`, `--inject-file` |
+| `audit` | Consistency scorecard over the agent-memory pile (auto-memory notes) audited together with the instruction files a harness actually injects (CLAUDE.md/AGENTS.md/rules files at the project root, up every ancestor directory, and each harness's own global config), pre-install: contradictions, instruction conflicts, disagreements, staleness-vs-code, restatements, name clusters, injected-vs-on-demand bytes — verbatim quote receipts, throwaway in-memory store, nothing written, no dtlv; model calls hard-capped at `--budget` (default 20), an extractor preflight blocks and exits 1 before scanning anything; `--no-code`, `--no-judge`, `--no-llm`, `--budget`, `--quiet`, `--out`, `--inject-file` |
 | `setup` | One-shot project onboarding, idempotent: store + seed, config persisted, live store gitignored, agent skill installed, ambient loop wired; `--dry-run`, `--mcp` |
 | `config` | Every setting: resolved value, the layer that set it, and the fully resolved paths |
 

@@ -691,7 +691,7 @@
 (defn cmd-audit [{:keys [opts]}]
   ;; The one verb that must NEVER open the real store: everything runs in a
   ;; throwaway in-memory store, so no with-store here.
-  (let [opts (-> (config/with-defaults opts [:harness :extractor])
+  (let [opts (-> (config/with-defaults opts [:harness :extractor :budget])
                  install-llm-timeout!)
         audit! (requiring-resolve 'claimgraph.audit/audit!)
         r (audit! {:project (:project opts)
@@ -702,12 +702,17 @@
                    :inject-file (config/value :inject-file opts)
                    :no-code (:no-code opts)
                    :no-judge (:no-judge opts)
-                   :extractor (:extractor opts)})]
+                   :no-llm (:no-llm opts)
+                   :budget (:budget opts)
+                   :extractor (:extractor opts)
+                   :progress-fn (when-not (:quiet opts)
+                                  (fn [line] (binding [*out* *err*] (println line))))})]
     (when-let [f (:out opts)]
       (spit f (str (wire/generate-string r {:pretty true}) "\n")))
     (if (audit-scorecard? opts (tty?))
       (println ((requiring-resolve 'claimgraph.audit/render-pretty) r))
-      (emit opts r))))
+      (emit opts r))
+    (when (= "blocked" (:status r)) error-exit)))
 
 (def ^:private setup-persist-keys
   "Settings a `claim setup` invocation may persist to .claimgraph/config.json —
@@ -857,18 +862,24 @@ Commands:
                         config — runs BEFORE claimgraph is
                         installed: throwaway in-memory store, nothing
                         written, no dtlv needed (prerequisites: bb + an
-                        extractor). Code facts ingest first (every language
-                        the analyzer registry detects), so claims colliding
-                        with the code read as staleness; instructions ingest
-                        before notes, so a note that contradicts a standing
-                        instruction is its own finding class rather than an
-                        ordinary contradiction. Findings: contradictions,
+                        extractor, verified with a live preflight call
+                        before any budget is spent). Code facts ingest
+                        first (every language the analyzer registry
+                        detects), so claims colliding with the code read
+                        as staleness; instructions ingest before notes, so
+                        a note that contradicts a standing instruction is
+                        its own finding class rather than an ordinary
+                        contradiction. Findings: contradictions,
                         instruction conflicts, silent disagreements, stale
-                        claims, restatements, name clusters, injection bloat —
-                        each with verbatim quote receipts. The judge pass
-                        filters false positives (judged-compatible pairs are
-                        removed); it only reports — audit never resolves.
-                        Exit 0 even with findings: it's a report.
+                        claims, restatements, name clusters, injection
+                        bloat — each with verbatim quote receipts. The
+                        judge pass filters false positives (judged-
+                        compatible pairs are removed); it only reports —
+                        audit never resolves. Progress narrates to stderr
+                        as it runs (--quiet silences it).
+                        Exit 0 even with findings (it's a report); exit 1
+                        when blocked — extractor missing or failing its
+                        preflight round-trip.
                         [--project DIR] [--file F]... [--scan-dir D]...
                         (extra sources beyond the default scan: every *.md
                         inside; --dir is the older spelling and still adds
@@ -878,6 +889,13 @@ Commands:
                         e.g. MEMORY.md)
                         [--no-code] (skip the staleness-vs-code prong)
                         [--no-judge] (skip the LLM verdict pass; report raw)
+                        [--no-llm] (deterministic checks only: file scan,
+                        injection arithmetic, code baseline; needs no
+                        extractor)
+                        [--budget N] (hard cap on model calls for the whole
+                        run, default 20; deferred work is named in the
+                        scorecard)
+                        [--quiet] (no progress on stderr)
                         [--extractor CMD] [--out FILE] (also write the JSON
                         scorecard to FILE) [--scorecard|--json|--pretty]
                         (the human scorecard is the default at a terminal and
@@ -1227,7 +1245,9 @@ Commands:
     {:cmds ["audit"] :fn cmd-audit
      :spec {:file {:coerce []} :dir {:coerce []} :scan-dir {:coerce []}
             :scorecard {:coerce :boolean}
-            :no-code {:coerce :boolean} :no-judge {:coerce :boolean}}}
+            :no-code {:coerce :boolean} :no-judge {:coerce :boolean}
+            :budget {:coerce :long} :no-llm {:coerce :boolean}
+            :quiet {:coerce :boolean}}}
     {:cmds ["config"] :fn cmd-config}
     {:cmds ["version"] :fn cmd-version}
     {:cmds ["init"] :fn cmd-init}

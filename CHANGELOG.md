@@ -49,6 +49,29 @@ store written so far — reads exactly as it always did.
   `rules/*.md`; Codex declares none) and the OS managed-policy `CLAUDE.md`
   path are scanned too. All of it mints `:instruction`, `:injected? true`,
   the same trust and injection accounting as a project-root file.
+- **`claim audit` gets a model-call budget and fails fast instead of
+  mid-run.** A one-call extractor preflight runs before the pipeline; a
+  preflight that can't reach the extractor is a `status: "blocked"`
+  scorecard and exit 1, instead of dying part-way through a pile with an
+  unpredictable slice of it already spent. Past preflight, `--budget`
+  (default 20, the same knob `curate` uses) caps total calls across
+  extraction and judging; work past the cap is deferred and named in the
+  scorecard rather than silently dropped. Each call is isolated — one
+  file's or one pair's failure surfaces as a `status: "partial"` scorecard
+  carrying an `:llm` receipts section, instead of aborting the run — and
+  three consecutive failures trip a breaker rather than spending the rest
+  of the budget against a dead extractor. Progress narrates on stderr as
+  each call lands (`--quiet` to silence it), and `--no-llm` runs the
+  deterministic subset — file scan, injection arithmetic, the code
+  baseline — needing no extractor at all.
+- **`scripts/uninstall.sh`** — the inverse of `claim setup`, removing
+  exactly what it wrote and by the same markers: hook entries out of the
+  settings file(s), the `.mcp.json` registration, the agent skill, the
+  gitignore block, and the compiled-view section in the inject file.
+  `.claimgraph/` (the store and its config) is kept unless run with
+  `--purge`; `--global` removes the `claim` launcher, and only when it
+  resolves into this checkout — a foreign binary on PATH is never this
+  script's to delete.
 
 ### Changed
 

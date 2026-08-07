@@ -309,6 +309,10 @@
         :spend! (0-arg budget gate; truthy = one model call is affordable.
                  Default unlimited)
         :evidence-dir (keep judge replies as content-addressed artifacts)
+        :progress-fn (fn [line]; called ONCE PER MODEL CALL, immediately
+                      before running the judge — never for a pair answered
+                      from a recorded verdict, never for one :spend! defers.
+                      Default a no-op)
 
   A pair whose verdict is already recorded never costs a second model call:
   an enrich-only run reports the record (:from-record true, the conflict
@@ -319,10 +323,11 @@
   Pairs the budget did not reach are counted in :deferred rather than
   dropped quietly: nothing was recorded for them, so they are still pending
   by derivation and the next run picks them up where this one stopped."
-  [s {:keys [command judge-fn resolve min-confidence spend! evidence-dir]}]
+  [s {:keys [command judge-fn resolve min-confidence spend! evidence-dir progress-fn]}]
   (let [at (java.util.Date.)
         run (or judge-fn (partial llm/complete! (llm/command command)))
         spend! (or spend! (constantly true))
+        progress-fn (or progress-fn (fn [_]))
         min-confidence (double (or min-confidence default-min-confidence))
         recorded (recorded-verdicts (store/-list-episodes s))
         deferred (atom 0)
@@ -335,10 +340,12 @@
                             ;; deferral
                             reply (when-not seen
                                     (if (spend!)
-                                      {:text (run (judgment-prompt
-                                                   pair
-                                                   (store/-get-predicate s (:predicate fact))
-                                                   (store/-get-predicate s (:predicate candidate))))}
+                                      (do (progress-fn (str "judging: " (fact-phrase fact)
+                                                            " vs " (fact-phrase candidate)))
+                                          {:text (run (judgment-prompt
+                                                       pair
+                                                       (store/-get-predicate s (:predicate fact))
+                                                       (store/-get-predicate s (:predicate candidate))))})
                                       (do (swap! deferred inc) nil)))]
                         (when (or seen reply)
                           (let [verdict (or seen (parse-judgment (:text reply)))
@@ -378,11 +385,14 @@
   benign pairs from the judge every pass. Only an unparseable reply leaves no
   record and retries under a later budget.
 
-  opts: as judge-conflicts!, including :spend! and :evidence-dir."
-  [s {:keys [command judge-fn resolve min-confidence spend! evidence-dir]}]
+  opts: as judge-conflicts!, including :spend!, :evidence-dir and
+        :progress-fn (called once per model call, same contract as
+        judge-conflicts!)."
+  [s {:keys [command judge-fn resolve min-confidence spend! evidence-dir progress-fn]}]
   (let [at (java.util.Date.)
         run (or judge-fn (partial llm/complete! (llm/command command)))
         spend! (or spend! (constantly true))
+        progress-fn (or progress-fn (fn [_]))
         min-confidence (double (or min-confidence default-min-confidence))
         recorded (recorded-verdicts (store/-list-episodes s))
         deferred (atom 0)
@@ -409,7 +419,9 @@
               (keep (fn [{:keys [fact candidate reason] :as pair}]
                       (if-not (spend!)
                         (do (swap! deferred inc) nil)
-                        (let [reply (run (judgment-prompt pair
+                        (let [_ (progress-fn (str "judging: " (fact-phrase fact)
+                                                  " vs " (fact-phrase candidate)))
+                              reply (run (judgment-prompt pair
                                                           (preds-by-id (:predicate fact))
                                                           (preds-by-id (:predicate candidate))))
                               verdict (parse-judgment reply)
