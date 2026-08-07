@@ -5,11 +5,13 @@
       CLI flag  >  environment variable  >  project config file  >  default
 
   The project config file is JSON at $CLAIMGRAPH_CONFIG or
-  ./.claimgraph/config.json, keyed by the kebab-case names below. It is
-  committable (unlike the live store next to it) and is what `claim setup`
-  writes when non-default locations are chosen, so one person's choices hold
-  for every writer of the repo. `claim config` prints every setting with its
-  resolved value and the layer it came from.
+  <project>/.claimgraph/config.json — project defaulting to cwd, so a verb
+  with no --project flag (or one run from inside the project it manages)
+  resolves exactly where it always did — keyed by the kebab-case names below.
+  It is committable (unlike the live store next to it) and is what
+  `claim setup` writes when non-default locations are chosen, so one person's
+  choices hold for every writer of the repo. `claim config` prints every
+  setting with its resolved value and the layer it came from.
 
   Resolution is pure (resolve-setting over passed opts/env/config maps); the
   only impure seams are reading the real environment and the config file.
@@ -214,10 +216,22 @@
 ;; ---------------------------------------------------------------------------
 
 (defn config-file-path
-  "Where the project config file lives: $CLAIMGRAPH_CONFIG or
-  ./.claimgraph/config.json (relative to cwd, like the default db path)."
-  ([] (config-file-path (into {} (System/getenv))))
-  ([env] (or (get env "CLAIMGRAPH_CONFIG") ".claimgraph/config.json")))
+  "Where the project config file lives: $CLAIMGRAPH_CONFIG, used exactly as
+  given — the caller's own env var is the caller's own anchoring, so a
+  project root never overrides it — or .claimgraph/config.json resolved
+  against `project` when one is supplied. `project` defaults to cwd (via
+  babashka.fs's own relative resolution, same as the default db path), so the
+  common case of running claimgraph inside the project it manages is unchanged;
+  the 2-arity exists for `claim ... --project X` run from somewhere else. With
+  no project argument at all, the default keeps its exact bare spelling —
+  nothing about the 0/1-arity shape churns for callers that never pass one."
+  ([] (config-file-path (into {} (System/getenv)) nil))
+  ([env] (config-file-path env nil))
+  ([env project]
+   (or (get env "CLAIMGRAPH_CONFIG")
+       (if project
+         (str (fs/path project ".claimgraph" "config.json"))
+         ".claimgraph/config.json"))))
 
 (defonce ^:private warned
   ;; Warned-about (path, keys) pairs. Every config/value call re-reads the
@@ -247,21 +261,32 @@
       config)))
 
 (defn context
-  "The two ambient layers, read once: {:env ... :config ... :config-file path}."
-  []
-  (let [env (into {} (System/getenv))
-        path (config-file-path env)]
-    {:env env :config (read-config-file path) :config-file (str path)}))
+  "The two ambient layers, read once: {:env ... :config ... :config-file path}.
+
+  Optionally anchored to a project root: a config-system path (the config
+  file itself, and — through db-path/evidence-dir in cli.clj — the store and
+  its evidence dir) resolves against `project` rather than the process cwd.
+  `project` defaults to cwd (the 0-arity), so a bare `claim <verb>` run
+  inside the project it manages is unaffected; verbs that take --project
+  anchor there instead of wherever the caller happened to invoke claim from."
+  ([] (context nil))
+  ([project]
+   (let [env (into {} (System/getenv))
+         path (config-file-path env project)]
+     {:env env :config (read-config-file path) :config-file (str path)})))
 
 (defn with-defaults
-  "Shell version of merge-defaults against the real env + config file."
+  "Shell version of merge-defaults against the real env + config file,
+  anchored to (:project opts) — nil, and so cwd, for a verb whose opts carry
+  no --project flag."
   [opts ks]
-  (merge-defaults opts (context) ks))
+  (merge-defaults opts (context (:project opts)) ks))
 
 (defn value
-  "Resolve one setting against the real environment. -> the value or nil."
+  "Resolve one setting against the real environment, anchored to
+  (:project opts) as with-defaults is. -> the value or nil."
   [k opts]
-  (:value (resolve-setting k (assoc (context) :opts opts))))
+  (:value (resolve-setting k (assoc (context (:project opts)) :opts opts))))
 
 (defn describe
   "The `claim config` payload: every setting with its resolved value, the
@@ -275,8 +300,9 @@
 
   The two-arity takes the ambient layers as data, the way resolve-setting and
   merge-defaults do, so what `claim config` reports about a given config file
-  is checkable without one on disk."
-  ([opts] (describe opts (context)))
+  is checkable without one on disk. The one-arity anchors to (:project opts)
+  exactly as with-defaults and value do."
+  ([opts] (describe opts (context (:project opts))))
   ([opts base-ctx]
    (let [ctx (assoc base-ctx :opts opts)]
      {:config-file {:path (:config-file ctx)

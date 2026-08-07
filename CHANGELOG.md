@@ -135,6 +135,35 @@ store written so far — reads exactly as it always did.
   clash-refusal) take it, briefly, per outcome. A second lease
   (`<db>.curate.lock`, try-acquire) makes the curator a singleton — a
   concurrent `curate` reports `already-running` and exits 0.
+
+### Fixed
+
+- **A text-valued flag could be silently mangled by babashka.cli's own type
+  guessing.** Without an explicit `:coerce`, `"true"`/`"false"` parses as a
+  boolean, a numeral as a long or double, and a leading `:` as a keyword —
+  and most of this CLI's flags are arbitrary user text (fact subjects and
+  objects, queries, ids, free-text scopes, paths). `claim assert --object
+  false` asserted the boolean `false`, not the four-character string; `claim
+  audit --extractor false` resolved to the boolean `false`, which
+  `llm/command` reads as unset and silently ran `claude -p` instead. Every
+  text flag across the dispatch table (and the three that previously
+  collected repeated values into a vector without typing its elements —
+  `audit`'s `--file`/`--dir`/`--scan-dir`) now declares `:coerce :string` (or
+  `[:string]`), so a value is carried verbatim whatever it looks like.
+- **A `--project`-taking verb resolved the config system against the
+  caller's cwd, not the project.** `.claimgraph/config.json` and a relative
+  db both resolved relative to the process's cwd, which matches the project
+  only when claim is run from inside it. `claim setup --project X` run from Y opened
+  the store under Y while writing X's `.gitignore`, skill and hooks; `claim
+  audit --project X` read Y's config file to resolve X's audit; `claim
+  config --project X` reported `notes-dir`/`inject-file`/`settings-file`
+  against X but `db`/`evidence-dir` against Y. A relative config-system path
+  now anchors to the project a verb was given (default: cwd, so a verb run
+  from inside its own project, or one that takes no `--project` at all, is
+  unaffected) — `config-file-path` and `context` take a project argument,
+  and `db-path`/`evidence-dir` in the CLI anchor the same way. An explicit
+  absolute `--db`/`$CLAIMGRAPH_DB`/`--evidence-dir` is untouched either way.
+
 ## [0.1.0-alpha] — 2026-07-26
 
 **format-version: 1.** The first stamped format, not a bump. Everything written

@@ -15,7 +15,31 @@
             [claimgraph.wire :as wire]))
 
 (def ^:private global-spec
-  {:db {:desc "Database path (default: $CLAIMGRAPH_DB, .claimgraph/config.json, or ./.claimgraph/db)"}
+  "Flags whose shape is the same on every verb that takes them, so they are
+  declared once here instead of repeated on each verb's own :spec table entry
+  (cli/dispatch merges this into every command's spec; a command's own entry
+  for the same key wins on conflict — none currently redeclare one of these).
+  Most are the settings claimgraph.config resolves through one precedence
+  chain everywhere they appear, so this is the one place their CLI shape is
+  decided too. Every entry needs an explicit :coerce: left unstated,
+  babashka.cli auto-coerces a flag's value — \"true\"/\"false\" to boolean,
+  digits to a number, a leading ':' to a keyword — and every flag below
+  carries a path or other arbitrary user text, never a literal for
+  babashka.cli to guess the shape of."
+  {:db {:coerce :string
+        :desc "Database path (default: $CLAIMGRAPH_DB, .claimgraph/config.json, or <project>/.claimgraph/db)"}
+   :project {:coerce :string
+             :desc "Project root for a --project-taking verb (default: cwd); also what a relative db and config file anchor to on that verb"}
+   :harness {:coerce :string :desc "Which harness's auto-memory the ambient loop consumes (claude-code | codex)"}
+   :notes-dir {:coerce :string :desc "The harness's auto-memory notes directory"}
+   :inject-file {:coerce :string :desc "The file the harness injects at session start"}
+   :settings-file {:coerce :string :desc "The hook-settings file `hooks install` writes"}
+   :skills-dir {:coerce :string :desc "Where `setup` installs the agent skill"}
+   :extractor {:coerce :string :desc "LLM command for extraction and judging: prompt on stdin, completion on stdout"}
+   :command {:coerce :string :desc "The judge/consolidate/curate LLM command — resolves the same chain as --extractor"}
+   :evidence-dir {:coerce :string :desc "Content-addressed raw-evidence store (default: <db>.evidence)"}
+   :code-ingest {:coerce :string :desc "Whether `hooks run` refreshes code facts as its first stage (session-end | manual)"}
+   :lease-wait {:coerce :long :desc "Ms a write command waits on a held lease before erroring with the holder's name (default 5000)"}
    :pretty {:coerce :boolean :desc "Pretty-print JSON output"}
    :json {:coerce :boolean :desc "Force JSON output (audit defaults to the human scorecard at a terminal)"}
    :llm-timeout-ms {:coerce :long :desc "Per-call LLM timeout in ms (default 120000)"}})
@@ -40,8 +64,18 @@
   never is. 2 is the shell's own convention for a usage error."
   2)
 
-(defn- db-path [opts]
-  (config/value :db opts))
+(defn- db-path
+  "The store's location, anchored to (:project opts). A verb that carries no
+  --project resolves the value exactly as configured — cwd-relative, spelled
+  verbatim. fs/path's own resolve rule is what makes the anchoring correct
+  with no special-casing: joining an ABSOLUTE db (an explicit --db, or
+  $CLAIMGRAPH_DB) onto a project root returns the db unchanged, so only a
+  relative db actually moves."
+  [opts]
+  (let [db (config/value :db opts)]
+    (if-let [project (:project opts)]
+      (str (fs/path project db))
+      db)))
 
 (defn- accept-alias
   "Fold a verb's older flag spelling onto the one that setting is now called,
@@ -129,9 +163,18 @@
     (try (.isTerminal c) (catch Throwable _ true))
     false))
 
-(defn- evidence-dir [opts]
-  (or (config/value :evidence-dir opts)
-      ((requiring-resolve 'claimgraph.evidence/default-dir) (db-path opts))))
+(defn- evidence-dir
+  "The raw-evidence store's location. An explicit :evidence-dir is anchored to
+  (:project opts) the same way db-path anchors the db, since it is the same
+  kind of config-system path; the default (unset) branch needs no anchoring
+  of its own — claimgraph.evidence/default-dir derives it from db-path, which
+  is already anchored."
+  [opts]
+  (if-let [explicit (config/value :evidence-dir opts)]
+    (if-let [project (:project opts)]
+      (str (fs/path project explicit))
+      explicit)
+    ((requiring-resolve 'claimgraph.evidence/default-dir) (db-path opts))))
 
 (defn- parse-time [s] (logic/parse-instant s))
 
@@ -1237,70 +1280,112 @@ Commands:
                     (cons e (map #(assoc e :cmds % :alias-of cmds) aliases)))))
         entries))
 
+(defn- string-flags
+  "{:coerce :string} for each key in ks, merged into a command's :spec.
+
+  Every flag below whose value is arbitrary user text — a fact's subject or
+  object, a query, a path, an id, a free-text scope — needs this declared:
+  left to babashka.cli's own guess, \"true\"/\"false\" auto-coerces to a
+  boolean, a numeral to a long or double, and a leading ':' to a keyword,
+  which is exactly what would turn `claim assert --object false` into
+  asserting the boolean false instead of the four-character string it was
+  given."
+  [ks]
+  (into {} (map (fn [k] [k {:coerce :string}])) ks))
+
 (def table
   (expand-aliases
    [{:cmds ["setup"] :fn cmd-setup
-     :spec {:coach {:coerce :boolean} :mcp {:coerce :boolean}
-            :dry-run {:coerce :boolean} :budget {:coerce :long}}}
+     :spec (merge (string-flags [:dir :bin])
+                  {:coach {:coerce :boolean} :mcp {:coerce :boolean}
+                   :dry-run {:coerce :boolean} :budget {:coerce :long}})}
     {:cmds ["audit"] :fn cmd-audit
-     :spec {:file {:coerce []} :dir {:coerce []} :scan-dir {:coerce []}
-            :scorecard {:coerce :boolean}
-            :no-code {:coerce :boolean} :no-judge {:coerce :boolean}
-            :budget {:coerce :long} :no-llm {:coerce :boolean}
-            :quiet {:coerce :boolean}}}
-    {:cmds ["config"] :fn cmd-config}
+     ;; --file/--dir/--scan-dir are repeatable, so :coerce needs an ELEMENT
+     ;; type of its own — {:coerce []} collects into a vector but still
+     ;; auto-coerces each element, so a --file whose name happens to be
+     ;; "false" or "42" would land in the vector as a boolean or a number.
+     :spec (merge (string-flags [:out])
+                  {:file {:coerce [:string]} :dir {:coerce [:string]}
+                   :scan-dir {:coerce [:string]}
+                   :scorecard {:coerce :boolean}
+                   :no-code {:coerce :boolean} :no-judge {:coerce :boolean}
+                   :budget {:coerce :long} :no-llm {:coerce :boolean}
+                   :quiet {:coerce :boolean}})}
+    {:cmds ["config"] :fn cmd-config :spec (string-flags [:dir])}
     {:cmds ["version"] :fn cmd-version}
     {:cmds ["init"] :fn cmd-init}
-    {:cmds ["assert"] :fn cmd-assert :spec {:confidence {:coerce :double}}}
-    {:cmds ["facts"] :fn cmd-facts :spec {:min-confidence {:coerce :double}
-                                          :include-invalidated {:coerce :boolean}}}
-    {:cmds ["neighbor"] :fn cmd-neighbor :spec {:depth {:coerce :long}
-                                                :budget {:coerce :long}
-                                                :beam {:coerce :long}
-                                                :min-confidence {:coerce :double}}}
-    {:cmds ["recall"] :fn cmd-recall :spec {:min-hits {:coerce :long}}}
-    {:cmds ["coach"] :fn cmd-coach :spec {:hook {:coerce :boolean}}}
-    {:cmds ["outcome"] :fn cmd-outcome}
+    {:cmds ["assert"] :fn cmd-assert
+     :spec (merge (string-flags [:subject :subject-type :subject-scope :predicate
+                                 :object :object-type :object-scope :object-kind
+                                 :epistemic :scope :source-type :episode
+                                 :on-conflict :class :valid-from :valid-until])
+                  {:confidence {:coerce :double}})}
+    {:cmds ["facts"] :fn cmd-facts
+     :spec (merge (string-flags [:entity :entity-scope :direction :predicate
+                                 :scope :as-of])
+                  {:min-confidence {:coerce :double}
+                   :include-invalidated {:coerce :boolean}})}
+    {:cmds ["neighbor"] :fn cmd-neighbor
+     :spec (merge (string-flags [:entity :entity-scope :query :scope :predicate :as-of])
+                  {:depth {:coerce :long}
+                   :budget {:coerce :long}
+                   :beam {:coerce :long}
+                   :min-confidence {:coerce :double}})}
+    {:cmds ["recall"] :fn cmd-recall
+     :spec (merge (string-flags [:query]) {:min-hits {:coerce :long}})}
+    {:cmds ["coach"] :fn cmd-coach
+     :spec (merge (string-flags [:query]) {:hook {:coerce :boolean}})}
+    {:cmds ["outcome"] :fn cmd-outcome :spec (string-flags [:valence])}
     {:cmds ["mcp"] :fn cmd-mcp}
-    {:cmds ["history"] :fn cmd-history}
-    {:cmds ["search"] :fn cmd-search}
-    {:cmds ["invalidate"] :fn cmd-invalidate}
+    {:cmds ["history"] :fn cmd-history :spec (string-flags [:subject :subject-scope :predicate])}
+    {:cmds ["search"] :fn cmd-search :spec (string-flags [:query])}
+    {:cmds ["invalidate"] :fn cmd-invalidate :spec (string-flags [:fact-id :reason :at])}
     {:cmds ["conflicts"] :fn cmd-conflicts}
     {:cmds ["judge"] :fn cmd-judge :spec {:resolve {:coerce :boolean}
                                           :sweep {:coerce :boolean}
                                           :min-confidence {:coerce :double}
                                           :min-verdict-confidence {:coerce :double}}}
-    {:cmds ["entity" "ensure"] :fn cmd-entity-ensure}
-    {:cmds ["entity" "list"] :fn cmd-entity-list}
-    {:cmds ["entity" "rename"] :fn cmd-entity-rename}
-    {:cmds ["entity" "alias"] :fn cmd-entity-alias}
-    {:cmds ["entity" "merge"] :fn cmd-entity-merge}
-    {:cmds ["entity" "split"] :fn cmd-entity-split}
+    {:cmds ["entity" "ensure"] :fn cmd-entity-ensure :spec (string-flags [:name :type :scope])}
+    {:cmds ["entity" "list"] :fn cmd-entity-list :spec (string-flags [:type :scope])}
+    {:cmds ["entity" "rename"] :fn cmd-entity-rename :spec (string-flags [:from :to :scope])}
+    {:cmds ["entity" "alias"] :fn cmd-entity-alias :spec (string-flags [:name :alias :scope])}
+    {:cmds ["entity" "merge"] :fn cmd-entity-merge :spec (string-flags [:from :into :scope])}
+    {:cmds ["entity" "split"] :fn cmd-entity-split :spec (string-flags [:from :into :scope])}
     {:cmds ["entity" "duplicates"] :fn cmd-entity-duplicates}
-    {:cmds ["predicates"] :fn cmd-predicates :spec {:usage {:coerce :boolean}}}
-    {:cmds ["predicate" "register"] :fn cmd-predicate-register}
-    {:cmds ["predicate" "promote"] :fn cmd-predicate-promote}
-    {:cmds ["evidence"] :fn cmd-evidence}
-    {:cmds ["episode" "open"] :fn cmd-episode-open}
-    {:cmds ["episode" "close"] :fn cmd-episode-close}
+    {:cmds ["predicates"] :fn cmd-predicates
+     :spec (merge (string-flags [:category :status]) {:usage {:coerce :boolean}})}
+    {:cmds ["predicate" "register"] :fn cmd-predicate-register
+     :spec (string-flags [:id :label :category :object-kind :object-shape
+                          :cardinality :definition :default-epistemic])}
+    {:cmds ["predicate" "promote"] :fn cmd-predicate-promote
+     :spec (string-flags [:from :to :label :definition :category :object-kind
+                          :object-shape :cardinality :maps-to :default-epistemic])}
+    {:cmds ["evidence"] :fn cmd-evidence :spec (string-flags [:episode :hash])}
+    {:cmds ["episode" "open"] :fn cmd-episode-open :spec (string-flags [:source-type :ref])}
+    {:cmds ["episode" "close"] :fn cmd-episode-close :spec (string-flags [:episode :summary])}
     {:cmds ["episode" "list"] :fn cmd-episode-list}
-    {:cmds ["ingest-code"] :fn cmd-ingest-code}
-    {:cmds ["ingest"] :fn cmd-ingest}
+    {:cmds ["ingest-code"] :fn cmd-ingest-code :spec (string-flags [:dir :scope :language])}
+    {:cmds ["ingest"] :fn cmd-ingest :spec (string-flags [:file :episode :source-type :ref])}
     {:cmds ["ingest-session"] :fn cmd-ingest-session
      :aliases [["session-extract"]]
-     :spec {:dry-run {:coerce :boolean}}}
-    {:cmds ["ingest-notes"] :fn cmd-ingest-notes :spec {:dry-run {:coerce :boolean}}}
-    {:cmds ["ingest-failure"] :fn cmd-ingest-failure :spec {:dry-run {:coerce :boolean}}}
-    {:cmds ["ingest-adr"] :fn cmd-ingest-adr :spec {:dry-run {:coerce :boolean}}}
+     :spec (merge (string-flags [:file :ref]) {:dry-run {:coerce :boolean}})}
+    {:cmds ["ingest-notes"] :fn cmd-ingest-notes
+     :spec (merge (string-flags [:dir]) {:dry-run {:coerce :boolean}})}
+    {:cmds ["ingest-failure"] :fn cmd-ingest-failure
+     :spec (merge (string-flags [:file :ref :context]) {:dry-run {:coerce :boolean}})}
+    {:cmds ["ingest-adr"] :fn cmd-ingest-adr
+     :spec (merge (string-flags [:adr-dir :dir :file]) {:dry-run {:coerce :boolean}})}
     {:cmds ["compile-context"] :fn cmd-compile-context
-     :spec {:budget {:coerce :long} :dry-run {:coerce :boolean}}}
+     :spec (merge (string-flags [:dir]) {:budget {:coerce :long} :dry-run {:coerce :boolean}})}
     {:cmds ["hooks" "run"] :fn cmd-hooks-run
-     :spec {:fail-on-partial {:coerce :boolean} :no-curate {:coerce :boolean}}}
+     :spec (merge (string-flags [:dir])
+                  {:fail-on-partial {:coerce :boolean} :no-curate {:coerce :boolean}})}
     {:cmds ["hooks" "install"] :fn cmd-hooks-install
-     :spec {:coach {:coerce :boolean}}}
-    {:cmds ["curate"] :fn cmd-curate :spec {:budget {:coerce :long}}}
-    {:cmds ["dump"] :fn cmd-dump}
-    {:cmds ["load"] :fn cmd-load}
+     :spec (merge (string-flags [:bin]) {:coach {:coerce :boolean}})}
+    {:cmds ["curate"] :fn cmd-curate
+     :spec (merge (string-flags [:dir]) {:budget {:coerce :long}})}
+    {:cmds ["dump"] :fn cmd-dump :spec (string-flags [:out])}
+    {:cmds ["load"] :fn cmd-load :spec (string-flags [:file])}
     {:cmds ["reconcile"] :fn cmd-reconcile}
     {:cmds ["stats"] :fn cmd-stats}
     {:cmds ["consolidate"] :fn cmd-consolidate

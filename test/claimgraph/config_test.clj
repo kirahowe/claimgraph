@@ -16,6 +16,7 @@
   amended. Registry semantics live in two implementations, so every one of
   those runs against both."
   (:require [babashka.classpath :as cp]
+            [babashka.cli :as bcli]
             [babashka.fs :as fs]
             [babashka.process :as p]
             [cheshire.core :as json]
@@ -87,6 +88,20 @@
   (is (= "/elsewhere/cfg.json"
          (config/config-file-path {"CLAIMGRAPH_CONFIG" "/elsewhere/cfg.json"})))
   (is (= ".claimgraph/config.json" (config/config-file-path {}))))
+
+(deftest config-file-path-anchors-to-a-project-root
+  (testing "no project: the exact bare default, unchanged — nothing churns
+            for a caller that never passes one"
+    (is (= ".claimgraph/config.json" (config/config-file-path {} nil))))
+  (testing "a project resolves the default under it"
+    (is (= (str (fs/path "/somewhere" ".claimgraph" "config.json"))
+           (config/config-file-path {} "/somewhere"))))
+  (testing "$CLAIMGRAPH_CONFIG wins outright, project or not — the caller's
+            own env var is the caller's own anchoring, passed as data (the
+            1-arity already takes env this way)"
+    (is (= "/elsewhere/cfg.json"
+           (config/config-file-path {"CLAIMGRAPH_CONFIG" "/elsewhere/cfg.json"}
+                                    "/somewhere")))))
 
 (deftest read-config-file-roundtrip
   (let [dir (fs/create-temp-dir {:prefix "claimgraph-config-test"})
@@ -413,6 +428,51 @@
     (is (= 0 (:exit (argv []))))
     (is (str/includes? (:out (argv [])) "Usage: claim"))))
 
+;; ---------------------------------------------------------------------------
+;; A text-valued flag survives, whatever it looks like
+;;
+;; Without an explicit :coerce, babashka.cli guesses a flag's type from its
+;; value: "true"/"false" -> boolean, a numeral -> long/double, a leading ':'
+;; -> keyword. Every flag in this CLI whose value is arbitrary user text —
+;; the ones below, and the many more like them across the table — needs its
+;; own {:coerce :string} (or {:coerce [:string]} where it repeats) or that
+;; guess corrupts it: `claim assert --object false` asserted a boolean, and
+;; `claim audit --extractor false` silently fell back to `claude -p`.
+;; ---------------------------------------------------------------------------
+
+(deftest a-text-flag-is-never-auto-coerced
+  (testing "the assert command's spec forces every text flag to a string"
+    (let [spec (:spec (table-entry ["assert"]))
+          parse (fn [args] (bcli/parse-opts args {:spec spec}))]
+      (is (= "false" (:object (parse ["--object" "false"])))
+          "\"false\" is a fact object, not a boolean")
+      (is (= "1.5" (:object (parse ["--object" "1.5"])))
+          "a numeral-looking object stays a string")
+      (is (= ":kw" (:object (parse ["--object" ":kw"])))
+          "and so does one that looks like a keyword")
+      (is (= 0.9 (:confidence (parse ["--confidence" "0.9"])))
+          "a genuinely numeric flag is untouched by this")))
+  (testing "repeatable text flags collect as strings too — audit's --file,
+            --dir and --scan-dir used {:coerce []}, which collects into a
+            vector but still auto-coerces each element"
+    (let [spec (:spec (table-entry ["audit"]))]
+      (is (= ["false" "1.5"]
+             (:file (bcli/parse-opts ["--file" "false" "--file" "1.5"] {:spec spec})))))))
+
+(deftest audit-extractor-false-blocks-instead-of-silently-falling-back
+  (let [tmp (str (fs/create-temp-dir {:prefix "claimgraph-extractor-false-test"}))
+        {:keys [exit out]} (argv ["audit" "--project" tmp "--extractor" "false"
+                                  "--json" "--quiet"])]
+    (is (= 1 exit)
+        "\"false\" used to parse as the boolean false, which llm/command reads
+         as unset and falls back to `claude -p` — silently running the wrong
+         extractor. A string \"false\" resolves to /usr/bin/false: it passes
+         the on-PATH prerequisite check (it exists) and then fails the
+         preflight round-trip, so the run reports blocked instead of quietly
+         substituting a different command")
+    (is (= "blocked" (:status (json/parse-string out true))))
+    (is (= "false" (get-in (json/parse-string out true) [:prerequisites :extractor :command])))))
+
 (deftest a-blocked-setup-exits-non-zero
   (let [out (java.io.StringWriter.)
         code (with-redefs-fn {(requiring-resolve 'claimgraph.setup/run!)
@@ -493,6 +553,63 @@
          persisted notes-dir while every consumer, this one included, read --dir")
     (is (= "/tmp/claimgraph-notes" (:notes-dir (resolved {:dir "/tmp/claimgraph-notes"})))
         "and the older spelling still answers")))
+
+;; ---------------------------------------------------------------------------
+;; --project anchors the config system, not just the thing a verb scans
+;;
+;; config-file-path (and everything built on it: with-defaults, value,
+;; describe) used to resolve .claimgraph/config.json relative to the process
+;; cwd always, and db-path resolved a relative db the same cwd-relative way —
+;; two anchors that agreed only by coincidence, when cwd happened to be the
+;; project. `claim config --project X` run from Y reported notes-dir/
+;; inject-file/settings-file resolved against X's config file but db/
+;; evidence-dir against Y's cwd-relative default: one report, two projects.
+;; ---------------------------------------------------------------------------
+
+(deftest config-resolves-db-and-evidence-dir-under-the-project-not-cwd
+  ;; Canonicalized up front: cmd-config resolves settings-file/skills-dir
+  ;; through fs/canonicalize (which follows a symlink, e.g. macOS's
+  ;; /tmp -> /private/tmp) but db/evidence-dir through fs/absolutize (which
+  ;; does not) — a pre-existing asymmetry between the two, not something this
+  ;; fix changes. Starting from the canonical form makes every :resolved path
+  ;; comparable the same way regardless of which fs fn produced it.
+  (let [tmp (str (fs/canonicalize (fs/create-temp-dir {:prefix "claimgraph-project-anchor-test"})))
+        _ (fs/create-dirs (fs/path tmp ".claimgraph"))
+        _ (spit (str (fs/path tmp ".claimgraph" "config.json"))
+                (json/generate-string {:harness "codex"}))
+        {:keys [exit out]} (argv ["config" "--project" tmp "--json"])
+        r (json/parse-string out true)]
+    (is (= 0 exit))
+    (testing "the project's own config file is the one read, not the repo
+              this test runs from — its --harness codex proves it, since
+              nothing on this command line passed --harness directly"
+      (is (str/includes? (get-in r [:config-file :path]) tmp))
+      (is (= "codex" (get-in r [:settings :harness :value])))
+      (is (= :config (keyword (get-in r [:settings :harness :source])))))
+    (testing "db and evidence-dir anchor to the project, coherently with
+              settings-file and skills-dir, which already did"
+      (is (str/starts-with? (get-in r [:resolved :db]) tmp)
+          "used to resolve against cwd: `claim config --project X` run from Y
+           reported Y's db")
+      (is (str/starts-with? (get-in r [:resolved :evidence-dir]) tmp))
+      (is (str/starts-with? (get-in r [:resolved :settings-file]) tmp))
+      (is (str/starts-with? (get-in r [:resolved :skills-dir]) tmp))
+      (is (= (str (fs/path tmp ".claimgraph" "db"))
+             (get-in r [:resolved :db]))
+          "the exact default location, not merely somewhere under tmp")
+      (is (= (str (fs/path tmp ".claimgraph" "db.evidence"))
+             (get-in r [:resolved :evidence-dir]))))))
+
+(deftest a-bare-run-with-no-project-is-unaffected
+  (testing "config-file-path's own default is untouched by the project
+            plumbing when no --project is passed anywhere on the line"
+    (is (= ".claimgraph/config.json" (config/config-file-path (into {} (System/getenv))))))
+  (let [{:keys [exit out]} (argv ["config" "--db" "/explicit/abs/db" "--json"])
+        r (json/parse-string out true)]
+    (is (= 0 exit))
+    (is (= "/explicit/abs/db" (get-in r [:resolved :db]))
+        "an absolute --db is unchanged by anchoring: fs/path's own resolve
+         rule returns an absolute second component untouched")))
 
 (deftest the-extractor-flag-reaches-the-command-it-names
   (is (= "mycmd" (:command (#'cli/llm-opts {:extractor "mycmd"})))

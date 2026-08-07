@@ -206,7 +206,7 @@ layer set it, and the fully resolved paths.
 
 | Setting | Flag | Env var | Default |
 |---|---|---|---|
-| store path | `--db` | `CLAIMGRAPH_DB` | `./.claimgraph/db` |
+| store path | `--db` | `CLAIMGRAPH_DB` | `<project>/.claimgraph/db` (project defaulting to cwd) |
 | harness | `--harness` | `CLAIMGRAPH_HARNESS` | `claude-code` |
 | auto-memory notes dir | `--notes-dir` | `CLAIMGRAPH_NOTES_DIR` | per harness, honoring `$CLAUDE_CONFIG_DIR` / `$CODEX_HOME` |
 | inject file (write-back target) | `--inject-file` | `CLAIMGRAPH_INJECT_FILE` | per harness: `MEMORY.md` / `memory_summary.md` |
@@ -228,7 +228,10 @@ confidence rather than filtering facts on read.
 
 The config file is JSON keyed by the kebab-case setting names
 (`{"harness": "codex", "notes-dir": "/mnt/notes"}`), lives at
-`$CLAIMGRAPH_CONFIG` or `./.claimgraph/config.json`, and is **committable**
+`$CLAIMGRAPH_CONFIG` or `<project>/.claimgraph/config.json` — project
+defaulting to cwd, so nothing changes for a bare `claim <verb>` run inside the
+project it manages, and a `--project`-taking verb resolves it (and a relative
+`--db`) against the project it was given instead — and is **committable**
 — `claim setup` writes the non-default choices you pass it, so one person's
 choices hold for every writer of the repo. It carries a `config-version`
 stamp (see below), and a key claimgraph does not recognise — a misspelling
