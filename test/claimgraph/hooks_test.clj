@@ -56,14 +56,17 @@
     (testing "fresh install creates .claude/settings.json"
       (let [r (hooks/install! {:project project})]
         (is (= :installed (:status r)))
-        (is (= "claim hooks run --harness claude-code" (:command r)))
+        (is (= "claim hooks run --harness claude-code --detach" (:command r))
+            "the installed hook detaches: the session's exit spawns the pass
+             rather than running it")
         (let [settings (json/parse-string (slurp (:settings r)) true)
               hook (-> settings :hooks :SessionEnd first :hooks first)]
           (is (= "command" (:type hook)))
-          (is (= 60 (:timeout hook)))
+          (is (= 10 (:timeout hook)))
           (is (= hooks/hook-timeout-seconds (:timeout hook))
-              "sized for capture: the hook makes no model calls, so reaching this
-               bound is a bug rather than a budget being spent")
+              "sized for a spawn: the hook opens no store and makes no model
+               call, so reaching this bound is a bug rather than a budget
+               being spent")
           (is (not (str/includes? (:command hook) "--consolidate-days"))
               "the cadence is gone with the pass it rationed — the curator's
                budget is the only bound left"))))
@@ -76,7 +79,8 @@
       (fs/create-dirs (fs/path project "bin"))
       (spit (str (fs/path project "bin" "claim")) "#!/bin/sh\n")
       (let [r (hooks/install! {:project project})]
-        (is (= "bin/claim hooks run --harness claude-code" (:command r)))))))
+        (is (= "bin/claim hooks run --harness claude-code --detach"
+               (:command r)))))))
 
 (deftest install-honors-a-settings-file-override
   (let [project (str (fs/create-temp-dir {:prefix "claimgraph-hooks-test"}))
@@ -154,6 +158,68 @@
          (hooks/curate-args {:harness "codex" :db "/s/db" :dir "/n"
                              :inject-file "view.md" :extractor "llm -m small"
                              :budget 7}))))
+
+(deftest capture-args-carry-only-what-this-run-resolved
+  (is (= ["hooks" "run"] (hooks/capture-args {}))
+      "a hook told nothing spawns a child that resolves everything for itself —
+       even the harness, whose default is the same one this process holds")
+  (is (= ["hooks" "run" "--db" "/s/db"] (hooks/capture-args {:db "/s/db"})))
+  (let [argv (hooks/capture-args {:harness "codex" :db "/s/db" :dir "/n"
+                                  :inject-file "view.md"
+                                  :extractor "llm -m small"
+                                  :code-ingest "manual" :no-curate true})]
+    (is (= ["hooks" "run" "--harness" "codex" "--db" "/s/db"
+            "--notes-dir" "/n" "--inject-file" "view.md"
+            "--extractor" "llm -m small" "--code-ingest" "manual"
+            "--no-curate"]
+           argv)
+        "--dir is spelled --notes-dir on the child's command line, and
+         --no-curate is a bare flag")
+    (is (not (some #{"--detach"} argv))
+        "the child IS the attached pass — a detaching child would spawn
+         forever")
+    (is (not (some #{"--fail-on-partial"} argv))
+        "a detached child's exit status reports to nobody")))
+
+(deftest a-spawned-capture-pass-outlives-the-hook-and-logs-where-it-said
+  ;; same risk as the curator hand-off one level up: two streams into one
+  ;; file, a log that does not accumulate, and a child nobody awaits — plus
+  ;; the one that is specific to re-invoking ourselves, that the child must
+  ;; not carry --detach
+  (let [dir (str (fs/create-temp-dir {:prefix "claimgraph-hooks-capture-test"}))
+        project (str (fs/create-temp-dir {:prefix "claimgraph-hooks-capture-project"}))
+        db (str dir "/db")
+        log (hooks/capture-log db)
+        read-log (fn [] (if (fs/exists? log) (slurp log) ""))]
+    (fs/create-dirs (fs/path project "bin"))
+    (spit (str (fs/path project "bin" "claim"))
+          "#!/bin/sh\necho \"argv: $*\"\necho 'and stderr' 1>&2\n")
+    (fs/set-posix-file-permissions (fs/path project "bin" "claim") "rwxr-xr-x")
+    (spit log "a previous capture pass's crash\n")
+
+    (let [r (hooks/spawn-capture! {:db db :project project :harness "codex"
+                                   :dir dir :code-ingest "session-end"})]
+      (is (= :spawned (:status r)))
+      (is (= (str db ".capture.log") (:log r))
+          "a sibling of the store, like every other artifact derived from it")
+      (is (str/ends-with? (first (:command r)) "/bin/claim")
+          "the project's own claim, absolute — the child's cwd is the project")
+      ;; not awaited, so wait on the output rather than on an exit status
+      (loop [n 0]
+        (when (and (< n 200) (not (str/includes? (read-log) "and stderr")))
+          (Thread/sleep 20)
+          (recur (inc n))))
+      (let [content (read-log)]
+        (is (str/includes? content "argv: hooks run --harness codex"))
+        (is (str/includes? content (str "--db " db)))
+        (is (str/includes? content (str "--notes-dir " dir)))
+        (is (str/includes? content "--code-ingest session-end"))
+        (is (not (str/includes? content "--detach"))
+            "the child runs the pass attached — detaching again would recurse")
+        (is (str/includes? content "and stderr")
+            "stderr shares the file: a pass that dies says why in one place")
+        (is (not (str/includes? content "a previous capture pass's crash"))
+            "and the log is this run's, not an accumulating pile")))))
 
 (deftest a-spawned-curator-outlives-the-hook-and-logs-where-it-said
   ;; the riskiest part of the hand-off is the part no unit can see: two

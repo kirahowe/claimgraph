@@ -81,6 +81,7 @@
   [(str db-rel "/")
    (str db-rel ".lock")
    (str db-rel ".curate.lock")
+   (str db-rel ".capture.log")
    (str db-rel ".curate.log")
    (str db-rel ".evidence/")
    (str db-rel ".oplog/")

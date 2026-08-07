@@ -19,7 +19,8 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 :curation`, refs `verdict:…` / `enrich:…`), not a new *shape*: an older reader
 treats them as ordinary episodes it has no opinion about, so nothing it
 already holds reads wrong. The consolidation stamp's removal deletes a sidecar
-file, which no reader ever parsed as an artifact. A predicate's new
+file, and `<db>.capture.log` adds one, neither of which any reader parses as an
+artifact. A predicate's new
 `:object-shape` is likewise additive: an older reader meets a registry field it
 has no opinion about, and a row that omits it — which is every row in every
 store written so far — reads exactly as it always did.
@@ -75,6 +76,20 @@ store written so far — reads exactly as it always did.
 
 ### Changed
 
+- **Quitting a session is instant: the SessionEnd hook is now a spawn.**
+  `hooks install` wires `hooks run --detach`, which opens no store, runs no
+  stage, and re-invokes the capture pass as a detached child logging to
+  `<db>.capture.log` — ~0.1s (bb's startup plus a process start) in place of
+  running `ingest-code` + `compile-context` inline, which cost ~7.6s in
+  exactly the sessions that had touched code. The chain is now hook →
+  detached capture → detached curator, each with its own log beside the
+  store. The hook's timeout drops from 60s to 10s to match. `claim hooks run`
+  by hand and `--fail-on-partial` in CI keep today's attached behavior, with
+  the report on stdout; `--detach` is opt-in everywhere except the installed
+  hook. **Re-run `claim hooks install` to pick up the new command** — an
+  existing hook entry keeps running the attached pass until you do.
+  `<db>.capture.log` joins the managed `.gitignore` block, like every other
+  sibling the store writes.
 - **Code is un-supersedable ground truth inside the audit's throwaway
   store.** `:instruction` claims mint at the same trust rank as `:code`
   (both rank 3 in `logic/source-trust`), so without a guard an instruction

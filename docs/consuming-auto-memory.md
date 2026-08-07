@@ -136,10 +136,20 @@ compile → ingest → compile cycle is a fixed point.)
 ## 4. Automation: the SessionEnd hook
 
 Claude Code hooks make the loop ambient today, no daemon required — with one
-hard-won division of labor (spec/maintenance.allium, decided 2026-08-05): the
-hook is **capture**, and capture is deterministic. `claim hooks run` does the
-delta-gated code pass and the recompile in seconds, then spawns `claim curate`
-detached and exits without waiting on it.
+hard-won division of labor (spec/maintenance.allium): the hook is **capture**,
+and capture is deterministic. `claim hooks run` does the delta-gated code pass
+and the recompile, then spawns `claim curate` detached and exits without
+waiting on it.
+
+**The session's exit waits on nothing at all.** The installed hook is
+`hooks run --detach`: it opens no store, spawns that capture pass detached
+into `<db>.capture.log`, and returns in the time it takes to start a process.
+Capture is cheap but not free — a code reconciliation costs seconds exactly
+when the session touched code, which is exactly when someone is waiting on
+their next prompt — so the chain is hook → detached capture → detached
+curator, each with its own log and nobody blocking. `claim hooks run` by hand
+(and `--fail-on-partial` in CI) stays attached, where a report a caller can
+read is the whole point.
 
 Every model call belongs to the curator: notes extraction, conflict judging,
 episode summaries, alias enrichment — one budgeted, convergent, singleton

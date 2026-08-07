@@ -509,9 +509,13 @@ scans never reinforce — only intent writes do.
   SessionEnd hook (wired by `hooks install` into the project's hook settings
   — default `.claude/settings.json`, overridable via `--settings-file`) runs
   `ingest-code-if-changed` → `compile-context` → spawn `curate`, at the end
-  of every session. **The session's exit is capture, and capture is
-  deterministic**: it takes seconds and never waits on a model. The code
-  stage runs first (so the curator's entity roster and conflict ground truth
+  of every session. **The session's exit waits on nothing**: the installed
+  command is `hooks run --detach`, which opens no store and spawns that pass
+  detached (log: `<db>.capture.log`), so quitting costs a process start
+  whatever the code delta is. Run `hooks run` yourself and it does the same
+  work attached, with the report on stdout. Capture is deterministic either
+  way and never waits on a model. The code stage runs first (so the
+  curator's entity roster and conflict ground truth
   are fresh) and is delta-gated: every code pass closes its episode with ref
   `<git-sha>[+<dirty-digest>]`, and the stage skips in milliseconds when the
   current ref matches the newest code episode's — teammates' pulled changes

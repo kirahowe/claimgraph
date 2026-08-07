@@ -3,8 +3,8 @@
     "SessionEnd" : [ {
       "hooks" : [ {
         "type" : "command",
-        "command" : "bin/claim hooks run --harness claude-code",
-        "timeout" : 60
+        "command" : "bin/claim hooks run --harness claude-code --detach",
+        "timeout" : 10
       } ]
     } ]
   }

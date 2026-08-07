@@ -5,7 +5,12 @@
 
   `hooks run` is CAPTURE, and capture is deterministic (spec/maintenance.allium,
   rule AmbientSessionEnd): ingest-code-if-changed → compile-context → spawn a
-  DETACHED curator. It runs in seconds and never waits on a model.
+  DETACHED curator. It runs in seconds and never waits on a model. With
+  --detach — the form `hooks install` wires in — the hook itself is only a
+  spawn: it opens no store and runs no stage, re-invoking that same pass as a
+  detached child that logs to <db>.capture.log, so the session's exit costs a
+  process start (~0.1s) whatever the code delta is. Attached is what a human
+  or CI gets by asking for it, and what --fail-on-partial reports on.
 
   The code stage runs FIRST, so the curator's entity roster and conflict ground
   truth are fresh, and is delta-gated on <git-sha>+<dirty-digest> against the
@@ -17,13 +22,16 @@
   learned. Stages are attempted independently — a failed stage is an :error
   entry, never an abort.
 
-  The hand-off is a spawn, not a call (decided 2026-08-05): `claim curate` is
-  started with its output redirected to <db>.curate.log and is never awaited,
-  so the session's exit costs what capture costs. This replaced an inline
-  ingest-notes + consolidate pass, which put dozens of LLM shell-outs inside a
-  bounded lifecycle hook: it hit the 600s timeout every session, landed
-  nothing, and re-queued everything. The timeout here is sized for capture and
-  hitting it is a bug, not a budget.
+  Neither hand-off is a call — curation decided 2026-08-05, capture
+  2026-08-07: each child is started with its output redirected
+  (<db>.curate.log, <db>.capture.log) and is never awaited, so the session's
+  exit waits on nothing at all. Curation moved out first, because an inline
+  ingest-notes + consolidate pass put dozens of LLM shell-outs inside a bounded
+  lifecycle hook: it hit the 600s timeout every session, landed nothing, and
+  re-queued everything. Capture followed for the same reason at a smaller
+  scale — a code-reconciliation pass, ~7.6s exactly when the session had
+  touched code, sat between the user and their next prompt. The timeout here
+  is sized for a spawn and hitting it is a bug, not a budget.
 
   `hooks install` merges a SessionEnd entry into the project's hook settings
   (default <project>/.claude/settings.json; overridable via --settings-file /
@@ -37,11 +45,12 @@
             [claimgraph.context :as context]))
 
 (def hook-timeout-seconds
-  "The SessionEnd hook's timeout, sized for what the hook actually does now:
-  a delta-gated code pass, a deterministic recompile, and a spawn. It was 600
-  when the hook owned the model calls, and every session paid all of it. A run
-  that reaches this bound is a bug to investigate, not a budget being spent."
-  60)
+  "The SessionEnd hook's timeout, sized for what the hook does: start one
+  detached process and say where its log is — bb's startup plus a spawn, ~0.1s
+  measured. Two orders of magnitude of headroom over that, because a hook that
+  is killed leaves the session with no capture at all. A run that reaches this
+  bound is a bug to investigate, not a budget being spent."
+  10)
 
 ;; ---------------------------------------------------------------------------
 ;; hooks run
@@ -60,6 +69,14 @@
   [db]
   (str db ".curate.log"))
 
+(defn capture-log
+  "Where a detached capture pass's stdout and stderr land: a sibling of the
+  store, like every other artifact derived from it. A detached process reports
+  to nobody, so this file is its entire crash-visibility surface — it holds the
+  pass's own JSON report and anything the pass printed to stderr."
+  [db]
+  (str db ".capture.log"))
+
 (defn curate-args
   "Pure: the argv `claim curate` is spawned with. Only settings this run
   actually resolved are passed — everything else the child resolves through
@@ -72,6 +89,28 @@
     inject-file (conj "--inject-file" (str inject-file))
     extractor (conj "--extractor" (str extractor))
     budget (conj "--budget" (str budget))))
+
+(defn capture-args
+  "Pure: the argv the detached capture pass is spawned with — this same verb,
+  attached. Same philosophy as curate-args: only settings this invocation was
+  explicitly given are forwarded, and everything else the child resolves
+  through the flag > env > config > default chain, including the harness (its
+  default is this process's default). Freezing a value we merely defaulted into
+  the child's command line would outrank a config the child reads for itself.
+
+  Never --detach: the child IS the attached pass, which is the point. Never
+  --fail-on-partial: a detached child's exit status reports to nobody, so the
+  partial report belongs in the log, not in a status no one reads."
+  [{:keys [harness db project dir inject-file extractor code-ingest no-curate]}]
+  (cond-> ["hooks" "run"]
+    harness (conj "--harness" (name harness))
+    db (conj "--db" (str db))
+    project (conj "--project" (str project))
+    dir (conj "--notes-dir" (str dir))
+    inject-file (conj "--inject-file" (str inject-file))
+    extractor (conj "--extractor" (str extractor))
+    code-ingest (conj "--code-ingest" (name code-ingest))
+    no-curate (conj "--no-curate")))
 
 (defn- claim-bin
   "The claim executable to spawn: a repo-local bin/claim when the project has
@@ -92,6 +131,30 @@
   [{:keys [db project] :as opts}]
   (let [log (curate-log db)
         args (curate-args opts)
+        bin (claim-bin project)]
+    (fs/create-dirs (fs/parent (fs/absolutize log)))
+    (fs/delete-if-exists log)
+    (apply process/process
+           {:dir (str (or project "."))
+            :out :append :out-file (fs/file log)
+            :err :append :err-file (fs/file log)}
+           bin args)
+    {:status :spawned :log log :command (into [bin] args)}))
+
+(defn spawn-capture!
+  "Start the capture pass and walk away. The child is this same verb attached,
+  so the pass is unchanged — only who waits for it is: the hook returns as soon
+  as the process exists, and the third stage of the child's own run is the
+  curator spawn, so the chain is hook → capture → curator with nobody blocking.
+
+  Both streams are redirected (in APPEND mode, so two descriptors onto one
+  file interleave instead of overwriting each other) into a log truncated per
+  run — the pass's JSON report lands there, a pass that dies leaves the reason
+  there, and the work it did not do is still owed by derivation at the next
+  session end."
+  [{:keys [db project] :as opts}]
+  (let [log (capture-log db)
+        args (capture-args opts)
         bin (claim-bin project)]
     (fs/create-dirs (fs/parent (fs/absolutize log)))
     (fs/delete-if-exists log)
@@ -181,7 +244,8 @@
         bin (or bin
                 (if (fs/exists? (fs/path project "bin" "claim"))
                   "bin/claim" "claim"))
-        run-cmd (str bin " hooks run --harness " (name (or harness :claude-code)))
+        run-cmd (str bin " hooks run --harness " (name (or harness :claude-code))
+                     " --detach")
         coach-cmd (str bin " coach --hook")
         updated (cond-> (install-plan settings :SessionEnd
                                       {:hooks [{:type "command" :command run-cmd
@@ -198,8 +262,9 @@
     (cond-> {:status (if added? :installed :updated)
              :settings settings-file
              :command run-cmd
-             :note (str "every session now ends with ingest-code-if-changed + "
-                        "compile-context, then hands curation (notes extraction, "
-                        "judging, summaries, enrichment) to a detached `claim curate` "
-                        "it does not wait for — its log is <db>.curate.log")}
+             :note (str "every session end now costs a spawn: the capture pass "
+                        "(ingest-code-if-changed + compile-context) runs detached, "
+                        "logging to <db>.capture.log, and hands curation (notes "
+                        "extraction, judging, summaries, enrichment) to a detached "
+                        "`claim curate`, logging to <db>.curate.log")}
       coach (assoc :coach-command coach-cmd))))

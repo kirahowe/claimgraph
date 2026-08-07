@@ -281,6 +281,7 @@
     (doseq [sibling ["/"             ; the LMDB directory itself
                      ".lock"         ; lease/lock-file, on the write lease
                      ".curate.lock"  ; lease/lock-file, on curate/curation-lease-key
+                     ".capture.log"  ; hooks/capture-log — the detached capture pass's output
                      ".curate.log"   ; hooks/curate-log — the detached curator's output
                      ".evidence/"    ; evidence/default-dir
                      ".oplog/"       ; oplog/oplog-dir

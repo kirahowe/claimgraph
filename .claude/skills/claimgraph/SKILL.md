@@ -93,16 +93,19 @@ Choose the epistemic class deliberately — it sets the conflict behavior:
 ## The ambient loop (zero-effort floor)
 
 The capture/injection loop can run itself: `bin/claim hooks install` wires
-a SessionEnd hook so every session ends with `hooks run` —
+a SessionEnd hook so every session ends with `hooks run --detach`. The hook
+is only a spawn, so the session's exit waits on nothing; the detached pass
+it starts is capture, and capture is deterministic —
 `ingest-code-if-changed` first (the mechanical code pass, delta-gated on
 `<git-sha>+<dirty-digest>` against the last code episode: free when nothing
 changed, reconciling when anything did, including teammates' pulled
 changes; opt out with the `code-ingest: manual` setting), then
-`ingest-notes` (the harness's auto-memory notes, delta-detected, ingested
-as inference-grade `agent-note` facts) then `compile-context` (the graph's
-current view written into the managed section of the file the harness
-auto-injects into the next session), with `consolidate` running when due
-(default: weekly). Every location involved is configurable — the notes
+`compile-context` (the graph's current view written into the managed
+section of the file the harness auto-injects into the next session), then
+a detached `bin/claim curate`, which is where every model call in the loop
+lives: notes extraction, judging, summaries, enrichment, under one budget.
+Each detached process logs beside the store (`<db>.capture.log`,
+`<db>.curate.log`). Every location involved is configurable — the notes
 dir, the inject file, the hook-settings file — see `bin/claim config`.
 
 The hook is the floor beneath this skill, not a replacement for it:

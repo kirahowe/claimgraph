@@ -463,10 +463,15 @@ rule Curate {
 -- delta-gated code pass (first, so the curator's entity roster and
 -- conflict ground truth are fresh; the code-ingest setting opts a
 -- project with an expensive analyzer out), the recompile, and the
--- DETACHED hand-off to curation. The session's exit never waits on a
--- model (decided 2026-08-05): the curator is spawned, not awaited — its
--- report lands in the curation episodes and its log, and a curator that
--- dies leaves derived work pending for the next run rather than a
+-- DETACHED hand-off to curation. The session's exit itself waits on
+-- NOTHING: not on a model (decided 2026-08-05, the curator is spawned
+-- and never awaited), and not on this pass either (decided 2026-08-07 —
+-- the code reconciliation costs seconds exactly when the session touched
+-- code, which is exactly when the user is waiting on their next prompt).
+-- The hook is therefore a spawn: the pass runs DETACHED, reporting to
+-- <db>.capture.log, and hands curation to its own detached process whose
+-- report lands in the curation episodes and <db>.curate.log. A child
+-- that dies leaves derived work pending for the next run rather than a
 -- half-done pass someone must notice. The recompile here is not
 -- redundant with the curator's: this one guarantees the freshest
 -- DETERMINISTIC view even if the curator never starts; the curator's

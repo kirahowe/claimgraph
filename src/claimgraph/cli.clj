@@ -576,22 +576,38 @@
   reports, and a stage failing is exactly when the next session most needs the
   view the other stages did recompile — but CI and cron need to be able to see
   it, so --fail-on-partial turns the same report into a non-zero status
-  without changing what it says."
+  without changing what it says.
+
+  --detach is the form the installed hook uses: this process resolves nothing
+  but the store path its log is named after, spawns itself attached, and
+  returns the log's location. No store is opened and no pod is loaded on that
+  path, so the session's exit costs a process start rather than a code pass.
+  The settings it was explicitly given ride the child's command line; the rest
+  the child resolves for itself, exactly as this one would have."
   [{:keys [opts]}]
-  (let [opts (-> opts
-                 (accept-alias :notes-dir :dir)
-                 (config/with-defaults [:harness :notes-dir :inject-file
-                                        :extractor :code-ingest]))
-        run (requiring-resolve 'claimgraph.hooks/run!)
-        r (with-write-store opts
-            (fn [s]
-              (run s (assoc (select-keys opts [:harness :project :inject-file
-                                               :extractor :code-ingest :no-curate])
-                            :dir (:notes-dir opts)
-                            :db (db-path opts)))))]
-    (emit opts r)
-    (when (and (:fail-on-partial opts) (= :partial (:status r)))
-      error-exit)))
+  (let [opts (accept-alias opts :notes-dir :dir)]
+    (if (:detach opts)
+      (emit opts (try ((requiring-resolve 'claimgraph.hooks/spawn-capture!)
+                       (assoc (select-keys opts [:harness :db :project :inject-file
+                                                 :extractor :code-ingest :no-curate])
+                              :dir (:notes-dir opts)
+                              :db (db-path opts)))
+                      ;; a hook that cannot spawn still reports and exits 0:
+                      ;; the harness's session is over either way
+                      (catch Exception e
+                        {:status :error :error (ex-message e)})))
+      (let [opts (config/with-defaults opts [:harness :notes-dir :inject-file
+                                             :extractor :code-ingest])
+            run (requiring-resolve 'claimgraph.hooks/run!)
+            r (with-write-store opts
+                (fn [s]
+                  (run s (assoc (select-keys opts [:harness :project :inject-file
+                                                   :extractor :code-ingest :no-curate])
+                                :dir (:notes-dir opts)
+                                :db (db-path opts)))))]
+        (emit opts r)
+        (when (and (:fail-on-partial opts) (= :partial (:status r)))
+          error-exit)))))
 
 (defn cmd-hooks-install [{:keys [opts]}]
   (let [opts (config/with-defaults opts [:harness :settings-file])
@@ -1126,6 +1142,8 @@ Commands:
                         [--budget 25000] [--dry-run]
   hooks install       Wire the ambient loop into the project's hook settings
                         (SessionEnd): every session ends with `hooks run`.
+                        The installed command carries --detach, so a session's
+                        exit costs a spawn and nothing waits on the pass.
                         Idempotent; foreign hooks and other settings are
                         preserved. Default target
                         <project>/.claude/settings.json — override with
@@ -1152,6 +1170,10 @@ Commands:
                         hook that fails is worse than a hook that reports.
                         [--fail-on-partial] turns that same report into
                         exit 1 for CI.
+                        [--detach] respawns this same pass as a detached
+                        process and returns immediately, opening no store —
+                        the form `hooks install` wires in, so the session's
+                        exit costs a process start (log: <db>.capture.log).
                         [--harness claude-code] [--project DIR]
                         [--notes-dir D] [--inject-file F] [--extractor CMD]
                         [--code-ingest session-end|manual] (manual opts the
@@ -1379,7 +1401,8 @@ Commands:
      :spec (merge (string-flags [:dir]) {:budget {:coerce :long} :dry-run {:coerce :boolean}})}
     {:cmds ["hooks" "run"] :fn cmd-hooks-run
      :spec (merge (string-flags [:dir])
-                  {:fail-on-partial {:coerce :boolean} :no-curate {:coerce :boolean}})}
+                  {:fail-on-partial {:coerce :boolean} :no-curate {:coerce :boolean}
+                   :detach {:coerce :boolean}})}
     {:cmds ["hooks" "install"] :fn cmd-hooks-install
      :spec (merge (string-flags [:bin]) {:coach {:coerce :boolean}})}
     {:cmds ["curate"] :fn cmd-curate

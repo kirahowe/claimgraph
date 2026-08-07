@@ -78,7 +78,7 @@ authoritative, always-current version of this list.
 | `judge` | Classify open conflicts; `--resolve` acts on high-confidence verdicts, never on contradictions; `--sweep` generates candidates |
 | `outcome` | `accepted` reinforces everything retrieved since the last mark; `rejected` reports it |
 | `compile-context` | Write the graph's current view into the harness's injection file |
-| `hooks install / run` | Wire and run the ambient SessionEnd loop: `ingest-code-if-changed` (delta-gated on `<git-sha>+<dirty-digest>`; `--code-ingest manual` opts out) → `ingest-notes` → `compile-context` → consolidate-when-due (`--coach` adds the prompt-time gate) |
+| `hooks install / run` | Wire and run the ambient SessionEnd loop: `ingest-code-if-changed` (delta-gated on `<git-sha>+<dirty-digest>`; `--code-ingest manual` opts out) → `compile-context` → a detached `curate`. The installed hook carries `--detach`, so the session's exit is a spawn and the pass logs to `<db>.capture.log` (`--coach` adds the prompt-time gate) |
 | `dump` / `load` | JSONL export and exact restore (the committable, portable artifact) |
 | `reconcile` | Apply other writers' effect logs; idempotent |
 | `mcp` | Serve the graph over MCP stdio |

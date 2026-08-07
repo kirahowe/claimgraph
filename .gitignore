@@ -3,6 +3,7 @@
 .claimgraph/db/
 .claimgraph/db.lock
 .claimgraph/db.curate.lock
+.claimgraph/db.capture.log
 .claimgraph/db.curate.log
 .claimgraph/db.evidence/
 .claimgraph/db.oplog/

@@ -132,7 +132,8 @@
 ;; | `<db>.retrievals` | outcome signal | append-only log of which facts reads surfaced |
 ;; | `<db>.lock` | lease | same-machine write serialization (token, TTL) |
 ;; | `<db>.curate.lock` | lease | the curation lease: a second instance of the same mechanics, making the detached curator a singleton (try-acquire, never a wait) |
-;; | `<db>.curate.log` | hooks | stdout+stderr of the curator the SessionEnd hook spawns and does not await — a detached process reports to nobody, so this is its whole crash-visibility surface |
+;; | `<db>.capture.log` | hooks | stdout+stderr of the capture pass the SessionEnd hook spawns and does not await — the pass's own JSON report, and the reason if it died |
+;; | `<db>.curate.log` | hooks | stdout+stderr of the curator that capture spawns and does not await — a detached process reports to nobody, so this is its whole crash-visibility surface |
 ;; | `<db>.version` | store backend | the persisted-format version this store was written at; a store from a future format is refused rather than schema-merged |
 ;;
 ;; ## Reading order
