@@ -5,7 +5,16 @@
 ;; taken on 2026-08-07/08 against this repo (88 source files, 640 code facts,
 ;; 11 pile files) on an M-series Mac with the Datalevin pod.
 ;;
-;; Read with: (clojure.edn/read-string (slurp "issues.md"))
+;; Two larger pieces of work live in their own files, because each is an epic
+;; with its own evidence and task breakdown rather than a single issue:
+;;
+;;   lazy-rewrite.edn            — shift from eager pre-assembly to
+;;                                 just-in-time construction
+;;   grep-baseline-benchmark.edn — does the graph beat grep on time, cost and
+;;                                 accuracy? decides whether on-demand
+;;                                 retrieval should exist at all
+;;
+;; Read with: (clojure.edn/read-string (slurp "issues.edn"))
 
 {:unknown-flags-and-free-help
  {:title "Unknown flags are silently accepted, and --help starts a paid run"
@@ -75,7 +84,11 @@
     conflict in the same section IS real and must survive."
    "Reinforcement already has re-sourcing semantics (spec/claims.allium); a merge
     should reuse them rather than invent a second path."
-   "Any model call here must draw from the shared run budget, never a private one."]}
+   "Any model call here must draw from the shared run budget, never a private one."]
+  :see-also
+  "grep-baseline-benchmark.edn :b6 — retrieval currently loses to grep partly
+   because a query returns six paraphrases instead of one fact, so the
+   benchmark run that informs the architecture decision must come after this."}
 
  :budget-allocation
  {:title "Budget allocation is unmanaged: stages starve, and a run cannot be predicted"

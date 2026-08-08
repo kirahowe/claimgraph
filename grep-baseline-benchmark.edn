@@ -1,0 +1,183 @@
+;; HARNESS: does claimgraph beat grep on time, cost, and accuracy?
+;;
+;; The bar the project has to clear. Anything built here must beat an agent
+;; simply grepping through hundreds or thousands of markdown files at read
+;; time — and until that is measured rather than asserted, the answer is not
+;; known.
+;;
+;; Companion to lazy-rewrite.edn (task :t11 consumes this result) and
+;; issues.edn (:perf-regression-gate shares the corpus and CI wiring).
+;;
+;; Read with: (clojure.edn/read-string (slurp "grep-baseline-benchmark.edn"))
+
+{:harness
+ {:title "Grep baseline benchmark"
+  :status :proposed
+  :question
+  "For each kind of question a coding agent actually asks about a project's
+   accumulated knowledge, which of three strategies answers it best on
+   latency, tokens, and correctness?"
+  :arms
+  {:grep "Agent greps the markdown corpus and reads what it finds. Cost must
+          include the READ tokens, not just grep's wall clock — grep returning
+          7 files in 22ms is not the whole price of the answer."
+   :graph "claimgraph on-demand retrieval: search / facts / recall / history,
+           or the equivalent MCP tools."
+   :injected "The compiled view alone, with NO query issued. This arm exists
+              because the view's advantage is that it arrives unbidden; it
+              should be scored on what it answers for free, and on what it
+              cannot answer at all."}}
+
+ :findings-2026-08-08
+ {:note
+  "Preliminary, measured on this project during the session that motivated the
+   harness. Not a substitute for the benchmark — one query, one store, no
+   ground truth — but enough to establish that the question is live."
+  :latency {:grep-ms 22
+            :grep-scope "notes + book + docs, matched 7 files"
+            :claim-search-ms 166
+            :ratio "grep ~7.5x faster"}
+  :accuracy
+  "For `reproduce-first review`, claim search returns one of six paraphrases
+   of a single lesson, flagged as conflicting with two of its own siblings, at
+   retrieval-score 0.0103. Reading the note answers the question better,
+   because the note states it once. The graph's disadvantage here is
+   self-inflicted (see issues.edn :admission-dedup) and the benchmark should be
+   re-run after dedup lands — a graph that answers with one clean fact is a
+   different contender."
+  :read-rate
+  "7 of 749 facts have ever been retrieved on demand (~0.9%); the most-read
+   fact was read twice; last retrieval 13 days before measurement. Subject to
+   lazy-rewrite.edn :t1 confirming the log records every read path."
+  :structural-advantage
+  "The graph's reply carries t-valid, effective-confidence, epistemic class,
+   source-type and conflict links. Grep cannot produce any of those at any
+   latency. Whether that is worth 7.5x is exactly what the benchmark decides."}
+
+ :design-notes
+ ["QUESTION KINDS MATTER MORE THAN QUESTION COUNT. Grep should WIN point
+   lookups of literal text, and a benchmark that hides that is dishonest. The
+   live question is whether the graph wins the classes grep structurally
+   cannot serve, by enough to justify its share of the eager spend."
+  "The injected arm gets no query. That is the point of it, not a handicap —
+   agents do not reliably grep for context they do not know exists, and the
+   view's advantage is proactivity rather than retrieval. Score it on coverage
+   of the question set with zero queries issued."
+  "Cost must be token cost, not wall clock alone. The grep arm's tokens are
+   dominated by reading matched files; the graph arm's by structured replies.
+   A fast answer that costs 30k tokens of file reading is not cheap."
+  "Corpus scale is a variable, not a constant. Grep degrades with corpus size
+   and the graph mostly does not. Run at several scales (tens, hundreds,
+   thousands of files) — the crossover point, if any, is the finding."]
+
+ :tasks
+ {:b1
+  {:title "Build the question corpus, stratified by kind"
+   :size :medium
+   :description
+   "Realistic questions an agent asks mid-task, grouped so each arm's strengths
+    and weaknesses are visible rather than averaged away:
+
+      :point-lookup  — what does X do / where is X configured
+      :temporal      — when did this change, what was true in June, since when
+      :provenance    — why was this decided, what superseded it, who asserted it
+      :conflict      — what is disputed here, what contradicts what
+      :synthesis     — what should I know before touching this subsystem
+      :negative      — questions with NO good answer, to catch confident
+                       fabrication in every arm
+
+    The negative class is not optional. An arm that answers everything
+    plausibly is worse than one that abstains, and only a labelled no-answer
+    set exposes that."
+   :acceptance
+   "At least a few dozen questions with balanced coverage across the classes,
+    drawn from real sessions rather than invented."}
+
+  :b2
+  {:title "Ground truth and a scoring rubric"
+   :size :medium
+   :depends-on [:b1]
+   :description
+   "Each question gets a reference answer and the evidence that supports it.
+    Scoring needs to distinguish correct, incomplete, and confidently wrong —
+    collapsing those loses the distinction the benchmark exists to make.
+
+    Judging will need care: an LLM judge is the practical option at this scale,
+    but it must be blind to which arm produced an answer, or the graph's
+    structured output will win on presentation."
+   :acceptance
+   "A rubric a second person could apply and land near the same score, and a
+    judge harness that never sees arm identity."}
+
+  :b3
+  {:title "Make the three arms runnable and comparable"
+   :size :large
+   :depends-on [:b1]
+   :description
+   "One entry point that answers a question set through each arm and records
+    per-question latency, tokens in and out, and the answer text. The arms must
+    face identical questions and identical corpora — the grep arm and the graph
+    arm reading different snapshots would invalidate everything.
+
+    The grep arm should be a genuine agent loop (grep, choose files, read,
+    answer), not a bare grep, since that is the real alternative claimgraph
+    competes with."
+   :acceptance
+   "A single command produces a complete per-arm, per-question record for a
+    given corpus and question set, reproducibly."}
+
+  :b4
+  {:title "Report latency, tokens, cost, and accuracy by question kind"
+   :size :small
+   :depends-on [:b2 :b3]
+   :description
+   "Per-kind breakdown, never a single headline number. The expected and
+    interesting shape is grep winning point lookups outright while losing
+    temporal, provenance and conflict — and the size of that second gap is the
+    decision input."
+   :acceptance
+   "A report that makes the per-kind crossover legible at a glance."}
+
+  :b5
+  {:title "State the decision thresholds BEFORE running it"
+   :size :small
+   :depends-on [:b1]
+   :description
+   "Write down in advance what result would cause retrieval to be kept,
+    narrowed, or conceded. Deciding afterwards invites reading the numbers to
+    favour the code that already exists.
+
+    A defensible starting position: retrieval earns its keep if it wins the
+    temporal, provenance and conflict classes decisively at acceptable cost,
+    even while losing point lookups. If it does not win those, it is not clear
+    what it is for, and lazy-rewrite.edn :t11 should take the concede branch."
+   :acceptance
+   "Thresholds recorded and dated before the first full run."}
+
+  :b6
+  {:title "Re-run after admission-time dedup lands"
+   :size :small
+   :depends-on [:b4]
+   :description
+   "Today's preliminary result is depressed by paraphrase pollution, which is a
+    known and separately-tracked defect rather than a property of the
+    architecture. The comparison is only fair against a graph whose answers are
+    deduplicated, so the run that informs the decision must come after
+    issues.edn :admission-dedup."
+   :acceptance
+   "Before-and-after numbers on the same question set, so the effect of dedup
+    on retrieval quality is itself measured."}
+
+  :b7
+  {:title "Wire the harness into CI as a quality gate"
+   :size :medium
+   :depends-on [:b4]
+   :description
+   "Once thresholds exist, regressions in retrieval quality should fail the
+    same way a performance regression does. Shares corpus and wiring with
+    issues.edn :perf-regression-gate; extraction precision belongs in the same
+    gate (issues.edn :extraction-quality-gate), since prompt and model changes
+    move all three silently."
+   :acceptance
+   "A CI run that fails on a material regression in accuracy or cost per
+    question kind."}}}

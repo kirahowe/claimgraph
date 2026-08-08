@@ -1,0 +1,293 @@
+;; EPIC: shift claimgraph from eager pre-assembly to just-in-time construction.
+;;
+;; Companion to issues.edn (the ordinary backlog) and grep-baseline-benchmark.edn
+;; (the harness that decides whether on-demand retrieval should exist at all).
+;;
+;; Read with: (clojure.edn/read-string (slurp "lazy-rewrite.edn"))
+
+{:epic
+ {:title "Lazy / just-in-time graph construction"
+  :status :proposed
+  :motivation
+  "GraphRAG-style pre-assembly of a corpus at write time does not pay for
+   itself, and LazyGraphRAG showed most of the quality is recoverable at a
+   small fraction of the indexing cost by deferring the expensive semantic
+   work to query time. The wiki analogy generalizes it: tokens spent writing
+   are capital goods, and the capital does not return unless the content is
+   read on the order of 25 times.
+
+   claimgraph is not a wiki and not a RAG index, but it does spend eagerly in
+   the same shape — every note is turned into claims by a model call whether
+   or not anything ever asks about it, and curation then judges pairs of those
+   claims on a schedule rather than on demand.
+
+   Measured on this project's own store 2026-08-08, the capital is not
+   returning. See :evidence."}
+
+ :evidence
+ {:store-size {:facts 749 :valid 740 :entities 208 :episodes 154
+               :open-conflicts 16}
+  :retrieval
+  {:log ".claimgraph/db.retrievals"
+   :events 5
+   :distinct-facts-read 7
+   :max-reads-of-any-fact 2
+   :last-event "2026-07-26 (13 days before measurement)"
+   :share-of-facts-ever-read "~0.9%"
+   :caveat "See task :t1 — this number is only meaningful if the log records
+            every read. It may be under-recording."}
+  :grep-baseline
+  {:grep-notes-book-docs-ms 22
+   :claim-search-ms 166
+   :ratio "grep ~7.5x faster"
+   :accuracy-note
+   "claim search for `reproduce-first review` returns one of six paraphrases
+    of a single lesson, flagged as conflicting with two of its own siblings,
+    at retrieval-score 0.0103. On that query the graph's answer is worse than
+    reading the note, which says the thing once."}
+  :injected-view
+  {:bytes 12477
+   :rows "~17 commitments + 2 conflict clusters + 5 supersessions + 50 facts"
+   :read-frequency "every session, unconditionally, without a query"
+   :note "The eager pipeline produces ~749 facts to fill ~50 slots."}}
+
+ :design-rule
+ "Spend eagerly only on what is either INJECTED or UNOBSERVABLE LATER.
+  Everything else defers.
+
+  Injected: the compiled view is read every session without anyone asking, so
+  its payback threshold is cleared trivially. It is also already lazy in the
+  right way — recomputed deterministically from the graph on each compile,
+  with no model call anywhere in it.
+
+  Unobservable later: bi-temporal validity, supersession links, episode
+  provenance, and write-time conflict detection record events that stop being
+  observable. A RAG index defers safely because the corpus is still there at
+  query time; a file that has been overwritten and a session that has ended
+  are not. Indexing can be deferred. Observation cannot.
+
+  On-demand retrieval is neither, and it is where the waste concentrates."
+
+ :non-goals
+ ["Making the bi-temporal record lazy. Observation is not deferrable."
+  "Removing write-time conflict detection. Its whole value is firing while the
+   user is present and can act; the same finding six months later is
+   archaeology."
+  "A format break. Version stays 1, additive data only."
+  "Regressing the injected view, which is the strongest leg and the one the
+   critique does not touch."]
+
+ :open-questions
+ ["Can notes be ranked well enough WITHOUT extraction to decide which ones earn
+   a model call? The strongest defence of eager extraction is that filling the
+   top 50 requires candidates, and you cannot rank what you never read. If
+   cheap ranking (recency, size, mention overlap with high-usage entities)
+   fills the view about as well as exhaustive extraction, the epic is
+   justified; if it does not, eagerness is load-bearing after all."
+  "What does a fact actually cost today, end to end — extraction share plus its
+   share of curation? Without that the payback arithmetic stays qualitative."
+  "Does anyone use temporal queries? `history` and `recall` exist; the
+   retrievals log shows no evidence either way, which is itself task :t1."]
+
+ :tasks
+ {:t1
+  {:title "Establish whether the retrievals log is trustworthy"
+   :size :small
+   :blocks [:t2 :t11]
+   :description
+   "Every number in this epic rests on the claim that 7 of 749 facts have ever
+    been read. A log that stopped 13 days ago admits two readings: retrieval is
+    genuinely unused, or retrieval logging is broken or bypassed. These call
+    for opposite responses, so nothing else should start until it is settled.
+
+    Check which read paths append to the log — CLI verbs, MCP tools/call, the
+    skill's own queries, coach — and whether any of them read without
+    recording. Confirm the ambient loop's own reads are excluded deliberately
+    rather than accidentally."
+   :acceptance
+   "Either: the log provably records every read path, and the 0.9% figure
+    stands. Or: gaps are identified and closed, and the figure is re-measured
+    over a fresh window before any design decision cites it."}
+
+  :t2
+  {:title "Instrument what the injected view actually earns"
+   :size :medium
+   :depends-on [:t1]
+   :description
+   "The view is read every session by construction, but 'injected' is not the
+    same as 'used'. Record which facts occupy the view over time, how often
+    its contents change, and how long a fact survives in it. A fact that has
+    held a slot for months is capital that returned; one that appeared once
+    and fell out paid for a single impression.
+
+    Attribution of downstream use is the hard part and probably not solvable
+    directly. Slot-tenure is a good proxy and is cheap."
+   :acceptance
+   "A report of slot tenure and churn for the view, over enough history to
+    distinguish stable capital from noise."}
+
+  :t3
+  {:title "Draw the tier boundary explicitly in the ingest path"
+   :size :medium
+   :description
+   "Today capture, extraction, conflict detection and curation are threaded
+    through one ingest path, so there is no seam at which deferral can be
+    introduced. Separate them by cost class: eager-deterministic (capture),
+    eager-cheap (collision pre-filter), deferred-expensive (extraction,
+    judging, summarization).
+
+    This is preparatory refactoring and should change no behaviour. Its value
+    is that every later task in this epic becomes a local change."
+   :acceptance
+   "The three classes are separately invocable, the suite is unchanged, and a
+    reader can tell from the call graph which class any given model call
+    belongs to."}
+
+  :t4
+  {:title "Cheap deterministic note index"
+   :size :medium
+   :depends-on [:t3]
+   :description
+   "The substrate deferral needs: for each note, its hash, size, mtime, source
+    kind, and the entity mentions found by plain string matching against the
+    known roster and its aliases. No model call.
+
+    This is what lets a note be RECORDED without being UNDERSTOOD — enough to
+    rank it, route a query to it, and prove it existed, while the expensive
+    reading of it waits for a reason."
+   :acceptance
+   "Every note the pile scan finds is indexed deterministically in time
+    comparable to the code pass, and the index is sufficient to answer 'which
+    notes might bear on entity X' without extraction."}
+
+  :t5
+  {:title "Store notes verbatim as first-class sources"
+   :size :medium
+   :depends-on [:t4]
+   :description
+   "Decouple 'this note exists and here is what it says' from 'here are the
+    claims it makes'. The verbatim text plus the cheap index becomes the
+    durable record; claims become a derived, regenerable projection.
+
+    This also fixes a present asymmetry: a claim carries a quote receipt, but
+    the source it came from is not itself retained, so a re-read means going
+    back to a file that may have changed."
+   :acceptance
+   "A note's content is recoverable from the store at the version that was
+    ingested, and claims reference it rather than a path that may have moved."}
+
+  :t6
+  {:title "Extract on demand, ranked by cheap signals"
+   :size :large
+   :depends-on [:t5]
+   :blocked-by [:open-question "note ranking without extraction"]
+   :description
+   "Replace extract-everything-at-write-time with extract-when-needed. Two
+    triggers: a compile that is ranking candidates for the injected view, and a
+    query whose cheap index routing lands on an unextracted note.
+
+    Ranking must work without extraction — recency, size, source kind, and
+    mention overlap with entities that already earn view slots. This is the
+    epic's central bet and the open question above.
+
+    Pair with hash-keyed caching (issues.edn :polish and the audit cache idea)
+    so a note extracted once is never re-extracted unchanged."
+   :acceptance
+   "The injected view built from on-demand extraction is materially as good as
+    the view built from exhaustive extraction, measured against the same
+    store, at a fraction of the model calls. If it is not, record that and
+    stop — the bet failed and eagerness was load-bearing."}
+
+  :t7
+  {:title "Cheap collision pre-filter so conflict detection stays eager"
+   :size :medium
+   :depends-on [:t4]
+   :description
+   "Write-time contradiction detection is the one feature laziness would
+    genuinely destroy, so it stays eager — but it does not need a full
+    extraction to fire. Match the incoming note's mentions against subjects
+    that already carry standing commitments, compare against existing objects
+    by similarity, and escalate to a model call only when a collision looks
+    likely.
+
+    This is LazyGraphRAG's cheap-best-first move pointed at conflicts rather
+    than community summaries: spend the model only where the cheap signal says
+    something is there."
+   :acceptance
+   "Instruction-conflict and contradiction findings fire at comparable recall
+    to today's exhaustive path, on a small fraction of the calls. Recall is the
+    metric that matters — a missed contradiction is the failure this feature
+    exists to prevent."}
+
+  :t8
+  {:title "Make curation read-triggered rather than scheduled"
+   :size :large
+   :depends-on [:t3]
+   :description
+   "Curation runs a fixed pass (~34 model calls) judging conflicts and
+    enriching entities regardless of whether anything reads the outcome. Judge
+    a conflict when someone looks at it, or when it competes for a slot in the
+    injected view — the two moments its verdict changes what a human sees.
+
+    Note the interaction with issues.edn :budget-allocation: today the judge is
+    starved by extraction. Under this model there is far less extraction to
+    starve it."
+   :acceptance
+   "No model call is made for a conflict nobody has looked at and that is not
+    contending for a view slot; the queue the user actually reads is judged at
+    least as well as today."}
+
+  :t9
+  {:title "Bound or retire the scheduled consolidation pass"
+   :size :medium
+   :depends-on [:t8]
+   :description
+   "Consolidation's ~34 sequential calls already exceeded a 600s hook timeout
+    once and made the pass permanently due. Once curation is demand-driven,
+    most of what consolidation does on a timer has a trigger instead. What
+    remains — closing genuinely stale episodes, summarizing for full-text
+    search — should be bounded and incremental rather than whole-store."
+   :acceptance
+   "No unbounded scheduled model work remains; whatever stays on a timer has a
+    per-run bound and makes progress incrementally."}
+
+  :t10
+  {:title "Fold the eager code pass into the same rule"
+   :size :small
+   :description
+   "The code pass is deterministic and cheap (1.4s of analysis for 88 files),
+    so it is NOT the capital sink and mostly belongs on the eager side. But it
+    is currently all-or-nothing on the git ref: one commit re-analyzes the
+    whole tree. Make it proportional to the diff.
+
+    Included here because it is the same principle — spend in proportion to
+    what changed — even though the deterministic layer is not where the waste
+    is. Depends on issues.edn :batched-writes for the write path."
+   :acceptance
+   "A one-file commit costs analysis and writes proportional to one file."}
+
+  :t11
+  {:title "Decide the fate of on-demand retrieval"
+   :size :medium
+   :depends-on [:t1]
+   :see-also "grep-baseline-benchmark.edn"
+   :description
+   "The benchmark, not this epic, settles whether leg 3 should exist. Three
+    outcomes worth planning for:
+
+    KEEP AND SPECIALIZE — the graph wins decisively on temporal, provenance
+    and conflict questions and loses point lookups to grep. Then retrieval
+    narrows to what grep cannot answer and stops competing on recall of
+    literal text.
+
+    KEEP AND FIX — it loses today only because of paraphrase pollution, and
+    admission-time dedup (issues.edn :admission-dedup) closes the gap.
+
+    CONCEDE — grep wins broadly enough that retrieval is not worth its share
+    of the eager spend, and claimgraph specializes in the two legs grep cannot
+    touch: the ambient injected view and the temporal record.
+
+    Conceding is a legitimate outcome and should not be treated as failure —
+    it would sharpen the product rather than shrink it."
+   :acceptance
+   "A decision recorded with the benchmark numbers behind it."}}}
