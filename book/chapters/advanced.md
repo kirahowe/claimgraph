@@ -40,8 +40,9 @@ first stage of `hooks run`, delta-gated on the episode ref, so the graph
 tracks the code (including teammates' pulled changes) with nobody in the
 loop.
 
-**`session-extract`** mines full transcripts (plain text or Claude Code
-session JSONL). The extractor is a pluggable subprocess (`--extractor`,
+**`ingest-session`** mines full transcripts (plain text or Claude Code
+session JSONL; `session-extract` is the older name and still works). The
+extractor is a pluggable subprocess (`--extractor`,
 `$CLAIMGRAPH_LLM_CMD`, default `claude -p`), and its prompt carries a bounded
 roster of known entities with aliases so it aligns synonyms instead of
 coining `AuthSvc` next to `AuthService`. Output is capped at 0.7 and typed
@@ -54,16 +55,19 @@ revision edges, and rejected options become `decided-against` commitments,
 all at decision-record authority.
 
 **`ingest-failure`** turns rejected or reverted work into procedural
-memory, following the workshop literature's guidance to extract the lesson
-rather than the diff: hazards land as `failure-mode` facts, corrective
+memory, following the MemAgents workshop literature's guidance to extract
+the lesson rather than the diff: hazards land as `failure-mode` facts, corrective
 practices as `prefers`, human rulings as `decided-against`. The episode's
 `failure-report` source type doubles as the valence signal for the outcome
 loop, and the raw material is kept as evidence.
 
 ## The offline passes
 
-**`consolidate`** is the Dreaming-style pass, run weekly by the hook or by
-hand: it summarizes and closes open episodes (summaries become full-text
+**`consolidate`** is the Dreaming-style pass, run at every session end by
+the detached curator (`claim curate`: notes ingest, then consolidation,
+then a recompile of the injected view, under one model-call budget whose
+every call lands a durable outcome) or by hand: it summarizes and closes
+open episodes (summaries become full-text
 searchable, which is what makes "why did we do X" a query), judges open
 conflicts, sweeps for conflict candidates the write path cannot see, emits
 [SIRA](https://arxiv.org/abs/2605.06647)-style alias enrichment so future FTS queries land better, and reports
@@ -72,7 +76,7 @@ to a mechanical digest, so the pass always makes progress.
 
 **`judge`** classifies flagged pairs as `contradicts`, `duplicate`,
 `supersedes`, or `compatible`. It reports by default; `--resolve` acts only
-on verdicts at or above `--min-confidence` (0.8), and a `contradicts`
+on verdicts at or above `--min-verdict-confidence` (0.8), and a `contradicts`
 verdict is never auto-resolved regardless of confidence. `judge --sweep`
 generates candidates writes cannot see (two values on an exclusive
 predicate, a dependency on something a standing decision rejected), with

@@ -70,6 +70,10 @@
    :remote-repo {:git-url repo-url
                  :branch  repo-branch}
    :book {:title "claimgraph: Structured Memory for Coding Agents"
+          :author "Kira Howe"
+          ;; one line: this string reaches _quarto.yml (and the page's meta
+          ;; description) verbatim, embedded newlines and indentation included
+          :description "A bi-temporal, epistemically typed knowledge graph for coding-agent memory: the problem and the field, the design, the working system chapter by chapter, the benchmark, and the reference."
           ;; Prose chapters are copied rather than evaluated, so they get no
           ;; such line -- but they keep their names, which means Quarto's own
           ;; repo-actions resolve them correctly from repo-subdir alone. The

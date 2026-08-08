@@ -79,6 +79,7 @@ authoritative, always-current version of this list.
 | `outcome` | `accepted` reinforces everything retrieved since the last mark; `rejected` reports it |
 | `compile-context` | Write the graph's current view into the harness's injection file |
 | `hooks install / run` | Wire and run the ambient SessionEnd loop: `ingest-code-if-changed` (delta-gated on `<git-sha>+<dirty-digest>`; `--code-ingest manual` opts out) → `compile-context` → a detached `curate`. The installed hook carries `--detach`, so the session's exit is a spawn and the pass logs to `<db>.capture.log` (`--coach` adds the prompt-time gate) |
+| `curate` | The detached curation run `hooks run` spawns, also runnable by hand: `ingest-notes` → `consolidate` → `compile-context`, stages attempted independently. One model-call budget spans the run (`--budget`, default 20); every call lands a durable outcome, so runs converge and deferred work is named. A singleton via the curation lease (a second curator reports `already-running`, exit 0); logs to `<db>.curate.log` |
 | `dump` / `load` | JSONL export and exact restore (the committable, portable artifact) |
 | `reconcile` | Apply other writers' effect logs; idempotent |
 | `mcp` | Serve the graph over MCP stdio |
@@ -90,7 +91,13 @@ authoritative, always-current version of this list.
 | `CLAIMGRAPH_DB` | Default store path |
 | `CLAIMGRAPH_DTLV` | Path to the Datalevin pod binary (otherwise `$PATH`) |
 | `CLAIMGRAPH_LLM_CMD` | Default extractor and judge command (`claude -p`) |
+| `CLAIMGRAPH_LLM_TIMEOUT_MS` | Bound on every LLM shell-out (default 120000) |
 | `CLAIMGRAPH_CODE_INGEST` | The ambient code stage: `session-end` (default) or `manual` |
 | `CLAIMGRAPH_WRITER` | This machine's writer id for the effect log |
 | `CLAIMGRAPH_TEST_SKIP_DATALEVIN=1` | Run the test suite pod-free |
 | `CLAIMGRAPH_BENCH_STORE=memory` | Run benchmark mechanics pod-free |
+
+Every other setting has an environment variable of its own name
+(`CLAIMGRAPH_NOTES_DIR`, `CLAIMGRAPH_INJECT_FILE`, `CLAIMGRAPH_SETTINGS_FILE`,
+`CLAIMGRAPH_BUDGET`, `CLAIMGRAPH_HARNESS`, …); `claim config` lists the full
+set with each value's provenance.

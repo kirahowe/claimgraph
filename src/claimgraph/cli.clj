@@ -1232,9 +1232,10 @@ Commands:
                         so re-dump from the source store instead.
   mcp                 Serve the graph over MCP (stdio): the store opens once
                         per session instead of paying the ~350ms bb+pod cold
-                        start per call. Tools: memory_facts, memory_search,
-                        memory_recall, memory_history, memory_conflicts,
-                        memory_coach, memory_assert (lease-guarded).
+                        start per call. Tools: memory_facts, memory_neighbor,
+                        memory_search, memory_recall, memory_history,
+                        memory_conflicts, memory_coach, memory_assert
+                        (lease-guarded).
                         Wire up: claude mcp add claimgraph -- bin/claim mcp
   reconcile           Merge other writers' effect logs into this store.
                         Every write already appends to your own log in

@@ -71,7 +71,7 @@ Where a fact came from bounds how much weight it can ever carry:
 
 Re-asserting an existing fact reinforces it. Facts decay in confidence over time, but if they are re-asserted their disuse clock resets and base confidence rises toward the source's ceiling, but never above it, and never by repetition alone. This is how a fact the code ingester re-derives five hundred times stays distinguishable and always carries less weight than a human decision.
 
-Rank powers two write-path defenses that exist because memory poisoning is a real problem now. Even in a non-adversarial system (like this one),  ([MINJA](https://arxiv.org/abs/2503.03704)), not a hypothetical:
+Rank powers two write-path defenses that exist because memory poisoning is a demonstrated attack ([MINJA](https://arxiv.org/abs/2503.03704) reached 98% injection success through ordinary queries), not a hypothetical:
 
 - **Outranked writes cannot supersede.** A session note cannot silently
   replace what a decision record established; it flags instead.
@@ -174,11 +174,15 @@ harness session → auto-memory notes → ingest-notes (delta-detected,
 inject at session start  ←  compile-context  ←  graph (+ consolidate, judge)
 ```
 
-A SessionEnd hook runs the loop: first a mechanical code-freshness pass
-(every detected language analyzer, delta-gated on the code episode's
-`<git-sha>+<dirty-digest>` ref, so it costs nothing when nothing changed
-and reconciles teammates' pulled changes when it did), then capture, then
-compile. The compiled view (standing decisions, open conflicts, recent
+A SessionEnd hook runs the loop as two detached passes, so quitting a
+session costs a process spawn and never waits on a model. Capture is
+deterministic: a mechanical code-freshness pass (every detected language
+analyzer, delta-gated on the code episode's `<git-sha>+<dirty-digest>`
+ref, so it costs nothing when nothing changed and reconciles teammates'
+pulled changes when it did), then a recompile of the injected view.
+Capture then spawns a detached curator — notes ingest, consolidation, a
+final recompile — which owns every model call, under one budget whose
+every call lands a durable outcome. The compiled view (standing decisions, open conflicts, recent
 supersessions, top current facts) is written into a marker-delimited
 managed section of the file the harness already injects. The managed
 section is stripped before ingestion hashes its input, so the graph never

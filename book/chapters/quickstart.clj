@@ -28,7 +28,7 @@
 ;; happens in a throwaway in-memory store, and nothing is written:
 ;;
 ;; ```bash
-;; bin/claim audit --pretty
+;; bin/claim audit
 ;;   87 claims extracted from 4 files
 ;;    7 contradictions  (opposed claims coexisting in the pile)
 ;;    2 instruction conflicts (agent memory at odds with your instruction files)

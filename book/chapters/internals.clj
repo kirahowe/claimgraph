@@ -92,7 +92,9 @@
 ;;
 ;; Extraction output passes an admission screen before the write path.
 ;; The hard rules are shape and floor (confidence at least 0.3, subject at
-;; most 80 characters, literal at most 250); soft signals (known subject,
+;; most 80 characters, literal at most 250 characters — or 1000 where the
+;; predicate's registry row declares prose-shaped objects, as the seed does
+;; for the lesson-bearing predicates); soft signals (known subject,
 ;; known predicate, class weight) only affect the score. Junk never reaches
 ;; the graph, and because the raw evidence tier keeps the extractor's full
 ;; input, screening is safe: gate the graph, keep the log.
@@ -142,6 +144,7 @@
 ;; there, pure and testable), then `core.clj` for how plans execute, then
 ;; one store backend, then the verticals (`oplog.clj`, `context.clj`,
 ;; `ingest/notes.clj`, `ingest/code.clj` and its per-language adapters,
-;; `consolidate.clj`, `audit.clj`, `mcp.clj`). The test suite mirrors that
-;; structure, 168 tests and 994 assertions across 24 test namespaces, and
+;; `hooks.clj`, `curate.clj`, `consolidate.clj`, `audit.clj`, `mcp.clj`).
+;; The test suite mirrors that
+;; structure, 400 tests and 2392 assertions across 26 test namespaces, and
 ;; `bb test` runs it against both backends.

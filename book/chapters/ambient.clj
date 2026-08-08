@@ -92,7 +92,9 @@
                            :dir notes-dir
                            :now #inst "2026-07-18"}))
 
-(select-keys result [:harness :file :bytes :sections])
+(-> result
+    (select-keys [:harness :file :bytes :sections])
+    (update :file fs/file-name))
 
 ;; The managed section it wrote, verbatim:
 
@@ -138,9 +140,10 @@
                                 :facts first :id)
                   :reason "the ADR stands"})
 
-(context/compile! store {:harness :claude-code
-                         :dir notes-dir
-                         :now #inst "2026-07-19"})
+(-> (context/compile! store {:harness :claude-code
+                             :dir notes-dir
+                             :now #inst "2026-07-19"})
+    (select-keys [:bytes :sections]))
 
 (= hash-with-note
    (notes/content-hash (harness/strip-managed-section (slurp note-file))))
@@ -171,24 +174,36 @@
 ;; ## The hook that runs it
 ;;
 ;; ```bash
-;; bin/claim hooks install            # SessionEnd: ingest-code-if-changed,
-;;                                       #   ingest-notes, compile-context,
-;;                                       #   consolidate when due (default weekly)
+;; bin/claim hooks install            # SessionEnd: spawn the capture pass
+;;                                       #   (ingest-code-if-changed, compile-context),
+;;                                       #   which spawns a detached `claim curate`
 ;; bin/claim hooks install --coach    # also: a UserPromptSubmit gate that
 ;;                                       #   interrupts only when the graph holds a
 ;;                                       #   standing decision, failure mode, or open
 ;;                                       #   conflict touching the prompt
-;; bin/claim hooks run                # the same pass, by hand
+;; bin/claim hooks run                # the capture pass, by hand
+;; bin/claim curate                   # the curation run, by hand
 ;; ```
 ;;
-;; The first stage keeps the mechanical code tier fresh with the same
+;; The loop splits along the determinism boundary. Capture — the hook's
+;; own pass — is deterministic end to end and costs seconds: the code
+;; stage, then the recompile, logging to `<db>.capture.log`. Every model
+;; call belongs to the detached curator it spawns: `claim curate` runs
+;; notes ingest, then consolidation (judge, summaries, sweep, enrichment),
+;; then a final recompile so the next session's view carries what curation
+;; learned. One model-call budget spans the run, every call lands a
+;; durable outcome (so runs converge toward a free no-op), the curation
+;; lease makes it a singleton, and it logs to `<db>.curate.log`. Quitting
+;; a session therefore costs a process spawn; nothing waits on a model.
+;;
+;; The code stage keeps the mechanical tier fresh with the same
 ;; zero-effort economics as the rest of the loop: it is delta-gated on
 ;; `<git-sha>+<dirty-digest>` against the last code episode's ref, so it
 ;; costs milliseconds when nothing changed and reconciles when anything
 ;; did — including teammates' pulled changes, which no skill nudge would
 ;; ever catch (the `code-ingest` setting opts it out for projects with
-;; expensive analyzers). Stages report independently: an analyzer or
-;; extractor failure never blocks the deterministic recompile. The coach is
+;; expensive analyzers). Stages report independently: an analyzer
+;; failure never blocks the deterministic recompile. The coach is
 ;; the push-side complement to the
 ;; skill's pull-side judgment, and it stays silent unless the gate fires;
 ;; always-on injection is the pattern the [AGENTS.md study](https://arxiv.org/abs/2602.11988) measured into the

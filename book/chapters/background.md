@@ -101,7 +101,8 @@ real experimental results rather than intuition. The conclusions below, drawn fr
 
 **Ambient context injection does not pay.** The
 [AGENTS.md study](https://arxiv.org/abs/2602.11988) (Gloaguen et al., an oral
-at the workshop) measured repository context files across SWE-bench tasks and
+at the ICLR 2026 MemAgents workshop — "the workshop" throughout this book)
+measured repository context files across SWE-bench tasks and
 a set of developer-committed ones. Its finding was that "Providing context files does not generally improve task success rates, while increasing inference cost by over 20% on average."
 The lesson is narrower than "context files are useless". The main takeaway is that always-injected context loses to selective retrieval at query time. Any memory
 system whose read path includes "dump everything into the prompt" is on the wrong

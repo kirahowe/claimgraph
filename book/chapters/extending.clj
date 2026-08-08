@@ -160,7 +160,7 @@
 
 (def project (str (fs/create-temp-dir {:prefix "claimgraph-book-extending"})))
 
-(fs/create-dirs (fs/path project "app"))
+(str (fs/relativize project (fs/create-dirs (fs/path project "app"))))
 (spit (str (fs/path project "app" "db.py")) "import sqlite3\n")
 (spit (str (fs/path project "app" "api.py")) "import app.db\nimport requests\n")
 
@@ -180,7 +180,7 @@
                          :which (fn [_] "bb")
                          :command-fn (fn [{:keys [dir]}]
                                        (python-analyzer-output dir))})
-    (select-keys [:status :files :ref :invalidated :analyzers]))
+    (select-keys [:status :files :invalidated :analyzers]))
 
 ;; And the graph now knows things no one typed:
 

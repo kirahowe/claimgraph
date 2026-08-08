@@ -37,7 +37,7 @@
 
 (def project (str (fs/create-temp-dir {:prefix "claimgraph-book-audit"})))
 
-(fs/create-dirs (fs/path project "src" "fixture"))
+(str (fs/relativize project (fs/create-dirs (fs/path project "src" "fixture"))))
 (spit (str (fs/path project "src" "fixture" "app.clj"))
       "(ns fixture.app (:require [fixture.util]))\n")
 (spit (str (fs/path project "src" "fixture" "util.clj"))
@@ -155,7 +155,9 @@
 
 ;; ## The human rendering
 ;;
-;; `--pretty` prints the scorecard with the per-finding receipts:
+;; At a terminal, `claim audit` prints this scorecard by default, with the
+;; per-finding receipts (`--scorecard` forces it anywhere; piped or
+;; captured output is JSON):
 
 (println (claim-audit/render-pretty report))
 
@@ -182,11 +184,11 @@
 ;; ## At the shell
 ;;
 ;; ```bash
-;; bin/claim audit --pretty              # the scorecard above, for your repo
+;; bin/claim audit                       # the scorecard above, for your repo
 ;; bin/claim audit --out report.json     # keep the receipts
 ;; bin/claim audit --no-judge            # raw mechanical flags, no LLM verdicts
 ;; bin/claim audit --no-code             # skip the staleness-vs-code prong
-;; bin/claim audit --file NOTES.md --dir docs/agent-notes   # widen the pile
+;; bin/claim audit --file NOTES.md --scan-dir docs/agent-notes   # widen the pile
 ;; ```
 ;;
 ;; Exit code is 0 even with findings — it is a report, not a gate. The
