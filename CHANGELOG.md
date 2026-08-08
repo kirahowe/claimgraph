@@ -76,6 +76,36 @@ store written so far — reads exactly as it always did.
 
 ### Changed
 
+- **`claim audit` extracts concurrently: a first run finishes in minutes.**
+  Extraction and assertion are separate phases — the extractor calls run on a
+  bounded pool (`--concurrency`, default 6) while assertion stays serial, so
+  the order claims reach the store is untouched and with it the collision
+  direction that makes a note arriving against a standing instruction its own
+  finding. Instructions extract and apply as a complete wave before any note's
+  prompt is built, so notes still see the entities instructions established.
+  Measured on an eleven-file pile: 3:15 against roughly 23 minutes. The
+  model-call budget now also goes to the sources worth spending it on —
+  injected files first, then largest — instead of to whichever sorted first
+  by path.
+
+- **The compiled view takes half the injection window, not all of it.**
+  `context/injection-window` (25 KB) is what a harness injects at session
+  start, shared by the compiled view and every instruction file it reads;
+  `context/default-budget` (12.5 KB) is the view's share. A view budgeted at
+  the full window competes for bytes a project's own `CLAUDE.md` also needs,
+  which reads as an injection overrun whenever both are healthy. Open
+  conflicts also fold into one line per connected component rather than one
+  per pair, so N mutually incompatible facts cost one line instead of
+  N-choose-2 — six paraphrases of a single lesson were spending a fifth of
+  the window restating one disagreement. Both shrink the compiled view;
+  `--budget` on `compile-context` overrides.
+
+- **The injection finding names a remedy.** An over-budget scorecard now
+  reports the overrun, the largest injected files, and which of the two
+  causes applies — claimgraph's own view dominating, which
+  `compile-context --budget` fixes, or the instruction files, which it
+  does not — instead of a red flag with no attached action.
+
 - **Quitting a session is instant: the SessionEnd hook is now a spawn.**
   `hooks install` wires `hooks run --detach`, which opens no store, runs no
   stage, and re-invokes the capture pass as a detached child logging to

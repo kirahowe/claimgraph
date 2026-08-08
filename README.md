@@ -104,6 +104,7 @@ $ bin/claim audit --scorecard
   23 restatements    (the same fact maintained in more than one place)
    3 name clusters   (AuthSvc / auth-service / AuthService)
   41 KB injected per session against a ~25 KB window  ** over budget **
+     16 KB over — largest injected: CLAUDE.md 22 KB, AGENTS.md 7 KB
      (of which 8 KB is claimgraph's compiled view)
      15 KB of on-demand notes scanned, not injected
 ```
@@ -543,8 +544,9 @@ scans never reinforce — only intent writes do.
   (`docs/consuming-auto-memory.md`): compiles the graph's current view into a
   marker-delimited managed section at the head of the file the harness
   auto-injects (Claude Code: `MEMORY.md`), so every session starts with it for
-  free. Deterministic (no LLM), budgeted (25 KB default — the injection
-  window), idempotent. Priority order: standing decisions (never relitigate),
+  free. Deterministic (no LLM), budgeted (12.5 KB default — half the 25 KB
+  injection window, since the view shares it with every instruction file a
+  harness injects), idempotent. Priority order: standing decisions (never relitigate),
   open conflicts, recent supersessions ("Heroku → Fly on 2026-06-02" — the
   what-changed briefing), top current facts by effective confidence, with
   code-derived facts excluded — the injected view carries only what the code

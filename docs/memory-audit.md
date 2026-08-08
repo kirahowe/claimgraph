@@ -79,8 +79,14 @@ from this spec, all in the settle-in-implementation spirit:*
   shape a missing `dtlv` gives `setup` — a run that can't reach its
   extractor fails up front, not partway through a pile. Past preflight,
   `--budget` (default 20, the same knob `curate` uses) caps total calls
-  across extraction and judging; work past the cap is deferred and named in
-  the scorecard rather than silently dropped. Each remaining call is
+  across extraction and judging; the cap is spent on the sources worth it —
+  injected files first, since those cost context in every session, then
+  largest — and work past it is deferred and named in the scorecard rather
+  than silently dropped. Extraction runs `--concurrency` calls at a time
+  (default 6) because each is a subprocess that spends its time waiting;
+  assertion stays serial, so the order claims reach the store, and with it
+  the note-against-standing-instruction collision direction, is unchanged by
+  how the calls interleave. Each remaining call is
   isolated — one file's or one pair's failure doesn't abort the run — and
   surfaces as a `status: "partial"` scorecard carrying an `:llm` receipts
   section; three consecutive failures trip a breaker rather than spending
@@ -134,6 +140,7 @@ claim audit [--project DIR]           # default cwd
             [--no-judge]              # skip the LLM verdict pass (report raw)
             [--no-llm]                # deterministic subset only — no extractor
             [--budget N]              # model-call cap, extraction + judging (default 20)
+            [--concurrency N]         # extraction calls in flight (default 6; 1 = serial)
             [--extractor CMD]         # the usual chain ($CLAIMGRAPH_LLM_CMD…)
             [--quiet]                 # silence the stderr progress lines
             [--out FILE]              # also write the scorecard JSON to FILE
@@ -207,8 +214,11 @@ Six stages, all inside one throwaway in-memory store:
    `--resolve` — audit fixes nothing.
 6. **Score**: fold results into the scorecard (§7) — plus
    `core/entity-duplicates` for **name clusters** and the byte arithmetic
-   for **injection bloat** (sum of pile bytes vs. the 25 KB
-   `context/default-budget` window; flag files individually over it).
+   for **injection bloat** (injected bytes vs. the 25 KB
+   `context/injection-window`; flag files individually over it, and when the
+   sum is over, name the dominant cause — `:managed-view` when claimgraph's
+   own compiled view is the larger half and the hand-written half still fits,
+   `:instructions` otherwise — with the remedy that addresses it).
 
 ## 5. Two deliberate deviations from the ambient tier
 
@@ -267,7 +277,11 @@ qualifies".
                      "files": ["CLAUDE.md", "memory/architecture.md"], "count": 3}],
    "name-clusters": [["AuthSvc", "AuthService"]],
    "extraction-noise": {"rejected": 2, "ambiguous": 1}},
- "injection": {"pile-bytes": 41200, "window-bytes": 25000, "over-budget": true},
+ "injection": {"injected-bytes": 41200, "managed-bytes": 8100,
+               "on-demand-bytes": 15000, "window-bytes": 25000,
+               "over-budget": true, "over-by": 16200, "cause": "instructions",
+               "largest": [{"path": "CLAUDE.md", "bytes": 22400}],
+               "remedy": "..."},
  "summary": {"contradictions": 7, "stale": 9, "disagreements": 12,
              "restatements": 23, "name-clusters": 3},
  "next": ["claim setup  # the graph tracks these instead of accumulating them"]}
@@ -290,7 +304,7 @@ split as the notes ingester. Reuse, don't rebuild:
 | code ground truth | `ingest.clj-code/ingest!` |
 | judge + sweep | `judge/judge-conflicts!`, `judge/sweep-conflicts!` (`:judge-fn` injectable; never pass `:resolve`) |
 | name drift | `core/entity-duplicates` |
-| budget arithmetic | `context/default-budget` |
+| budget arithmetic | `context/injection-window` (the whole injected surface; `context/default-budget` is the compiled view's share of it) |
 | prerequisite check | pattern from `setup/check-prerequisites` (`:which` injectable); extractor hard, dtlv irrelevant |
 
 Steps:
