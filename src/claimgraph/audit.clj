@@ -401,12 +401,12 @@
         injected-bytes (reduce + 0 (map :bytes injected))
         managed-bytes (reduce + 0 (map #(or (:managed-bytes %) 0) injected))
         on-demand-bytes (reduce + 0 (map :bytes on-demand))
-        over (filterv #(> (:bytes %) context/default-budget) injected)]
+        over (filterv #(> (:bytes %) context/injection-window) injected)]
     (cond-> {:injected-bytes injected-bytes
              :managed-bytes managed-bytes
              :on-demand-bytes on-demand-bytes
-             :window-bytes context/default-budget
-             :over-budget (> injected-bytes context/default-budget)}
+             :window-bytes context/injection-window
+             :over-budget (> injected-bytes context/injection-window)}
       (seq over) (assoc :files-over-window (mapv :path over)))))
 
 (defn scorecard

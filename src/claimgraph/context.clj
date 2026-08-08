@@ -25,11 +25,24 @@
             [claimgraph.logic :as logic]
             [claimgraph.store :as store]))
 
-(def default-budget
-  "Bytes for the whole managed block, markers included. Claude Code injects
-  the first ~200 lines / 25 KB of MEMORY.md; staying inside that window is
-  the point of the exercise."
+(def injection-window
+  "Bytes a harness injects at session start — Claude Code reads the first
+  ~200 lines / 25 KB of MEMORY.md. The whole injected surface shares this
+  one window: the compiled view, every CLAUDE.md/AGENTS.md up the ancestor
+  walk, and each harness's global instructions. `claim audit` measures that
+  sum against this number."
   25000)
+
+(def default-budget
+  "Bytes for the whole managed block, markers included — the compiled view's
+  SHARE of injection-window, not the window itself. The view is one
+  participant in a window it does not own: a budget equal to the window
+  licenses the compiler to spend every byte a project's own instruction
+  files also need, which puts a project over the window whenever both are
+  healthy. Half leaves the other half for the files a human wrote, and the
+  graph stays queryable for whatever the fold drops (fit-to-budget's
+  truncation announcement points at it)."
+  12500)
 
 (def supersession-window-days 30)
 (def max-facts 50)
