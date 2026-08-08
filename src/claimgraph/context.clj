@@ -117,6 +117,118 @@
          (sort-by (comp - logic/ms :at))
          vec)))
 
+(defn- uf-find
+  "Union-find root lookup, no path compression — a conflict component tops
+  out at one subject's disputed predicates, never large enough for the
+  mutation compression would buy to matter."
+  [parents id]
+  (loop [id id]
+    (let [p (get parents id id)]
+      (if (= p id) id (recur p)))))
+
+(defn- uf-union [parents a b]
+  (let [ra (uf-find parents a) rb (uf-find parents b)]
+    (if (= ra rb) parents (assoc parents ra rb))))
+
+(defn conflict-components
+  "Pure: conflict pairs -> connected components over fact identity, each
+  component a vector of its facts, deduped and sorted by :id.
+
+  open-conflicts emits one pair per disagreeing pair of facts, so N facts
+  mutually disputing one (subject, predicate) surface as N-choose-2 pairs —
+  6 near-duplicate claims become 15 pairs restating the same disagreement,
+  and rendering pairs directly grows the injected section quadratically in
+  exactly the place bytes are scarcest. Union-find over fact :id — never
+  object-str — folds the double-counted edges back into one node set per
+  disagreement: two facts can disagree while sharing rendered text (one
+  :object-kind :entity, one :literal, same spelling), and conflict links are
+  stored by id regardless of how the object renders, so id is the only join
+  key that means what the graph means.
+
+  group-by hands components back in whatever order its hash landed them,
+  and that order must never reach the compiled view (the namespace
+  docstring's 'same graph + same clock = byte-identical' invariant). Both
+  levels are re-sorted explicitly afterward — ids within a component by
+  string compare, components against each other by their now-sorted id
+  vectors — so the hash map's incidental order never survives past this
+  function, and callers inherit determinism for free."
+  [conflicts]
+  (let [by-id (reduce (fn [m {:keys [fact candidate]}]
+                        (assoc m (:id fact) fact (:id candidate) candidate))
+                      {} conflicts)
+        parents (reduce (fn [ps {:keys [fact candidate]}]
+                          (uf-union ps (:id fact) (:id candidate)))
+                        {} conflicts)
+        by-root (group-by #(uf-find parents %) (keys by-id))]
+    (->> (vals by-root)
+         (map (fn [ids] (mapv by-id (sort ids))))
+         (sort-by (fn [facts] (mapv :id facts))))))
+
+(def ^:private max-component-objects
+  "Distinct object strings spelled out per (subject, predicate) slot before
+  the rest collapse into a count — the elision that keeps a 20-fact
+  component from reproducing the pair-line bug in miniature, as one 3 KB
+  line instead of 190 short ones."
+  5)
+
+(def ^:private max-component-slots
+  "(subject, predicate) slots spelled out per heterogeneous component
+  before the rest collapse into a count — see `component-line`."
+  3)
+
+(defn- distinct-objects
+  "Distinct rendered object strings for a set of facts, sorted for a
+  deterministic order and capped at `cap`."
+  [facts cap]
+  (let [objs (->> facts (map object-str) distinct sort)]
+    (if (<= (count objs) cap)
+      (str/join " / " objs)
+      (str (str/join " / " (take cap objs))
+           " / … " (- (count objs) cap) " more"))))
+
+(defn- component-slots
+  "A component's facts grouped by (subject, predicate), largest slot first,
+  ties broken by the slot key itself — deterministic for the same reason
+  `conflict-components` sorts explicitly rather than trusting group-by's
+  map order. Decides both which slot speaks for a single-slot component and
+  which slots survive the cap in a heterogeneous one."
+  [facts]
+  (->> facts
+       (group-by (juxt subject-str pred-str))
+       (sort-by (fn [[k v]] [(- (count v)) k]))))
+
+(defn- component-line
+  "One rendered line for a connected component of disputing facts.
+
+  conflict-candidates only ever pairs facts sharing a subject — it groups by
+  subject id before pairing — but a pair can be :cross-predicate (different
+  predicates on one subject, arguing over loosely the same object), so a
+  component is guaranteed one subject but never guaranteed one predicate;
+  nothing in the shape rules out a future conflict source relaxing even the
+  subject guarantee. The common case (`component-slots` returns exactly one
+  slot) renders the familiar single-predicate line. The rare heterogeneous
+  case renders every slot up to `max-component-slots`, each with its own
+  count and object list, rather than picking one predicate to speak for
+  facts it does not describe — a component of unrelated disagreements must
+  not read as one dispute smaller than it is, or as a dispute about a
+  predicate half its facts never touched."
+  [facts]
+  (let [slots (component-slots facts)]
+    (if (= 1 (count slots))
+      (let [[[subj pred] fs] (first slots)]
+        (str "- " subj " " pred ": " (count fs) " claims in contention — "
+             (distinct-objects fs max-component-objects)))
+      (let [shown (take max-component-slots slots)
+            more (- (count slots) (count shown))]
+        (str "- " (count facts) " claims in contention across " (count slots)
+             " predicates — "
+             (str/join "; "
+                       (map (fn [[[subj pred] fs]]
+                              (str subj " " pred " (" (count fs) ": "
+                                   (distinct-objects fs max-component-objects) ")"))
+                            shown))
+             (when (pos? more) (str "; … " more " more")))))))
+
 (defn compiled-sections
   "Pure: the whole store's facts + open conflict pairs + the clock -> the
   priority-ordered sections of the compiled view, ready for the budget fold."
@@ -143,10 +255,7 @@
                    commitments)}
      {:key :conflicts
       :header "Open conflicts (awaiting review — `claim conflicts`)"
-      :lines (mapv (fn [{:keys [fact candidate]}]
-                     (str "- " (subject-str fact) " " (pred-str fact) ": "
-                          (object-str fact) " vs " (object-str candidate)))
-                   conflicts)}
+      :lines (mapv component-line (conflict-components conflicts))}
      {:key :supersessions
       :header "Changed recently"
       :lines (mapv (fn [{:keys [old new at]}]

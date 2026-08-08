@@ -269,6 +269,82 @@
     (is (str/includes? (first lines) "\"accepted\" → \"superseded\"")
         "old → new, with the successor the judge picked")))
 
+;; ---------------------------------------------------------------------------
+;; Pure: conflict components
+;; ---------------------------------------------------------------------------
+
+(defn- all-pairs
+  "Every unordered {:fact :candidate} pair over `facts` — the shape
+  open-conflicts hands compiled-sections when N facts mutually dispute one
+  slot. N facts yield N-choose-2 pairs, the exact blow-up the component
+  fold exists to undo."
+  [facts]
+  (vec (for [i (range (count facts))
+             j (range (inc i) (count facts))]
+         {:fact (nth facts j) :candidate (nth facts i)})))
+
+(defn- conflict-lines [conflicts]
+  (:lines (first (filter #(= :conflicts (:key %))
+                         (context/compiled-sections
+                          {:facts [] :conflicts conflicts :now now})))))
+
+(deftest multi-fact-conflict-collapses-to-one-line
+  (let [facts (mapv (fn [n] (fact {:id (str "f-" n) :object-lit (str "claim-" n)}))
+                    (range 6))
+        lines (conflict-lines (all-pairs facts))]
+    (is (= 1 (count lines))
+        "6 mutually-conflicting facts produce 15 pairs but one component")
+    (is (str/includes? (first lines) "6 claims in contention"))
+    (is (str/includes? (first lines) "svc prefers"))))
+
+(deftest independent-conflicts-stay-separate-lines
+  ;; Two disjoint 3-fact disagreements (3 pairs each, 6 pairs total) must
+  ;; collapse to exactly one line per disagreement, not merge into one line
+  ;; and not stay at one line per pair — the old per-pair renderer produced
+  ;; 6 lines here, three per subject, restating each clique's disagreement
+  ;; three times over.
+  (let [group-a (mapv (fn [n] (fact {:id (str "a-" n) :subject {:name "svc-a"}
+                                     :object-lit (str "claim-" n)}))
+                      (range 3))
+        group-b (mapv (fn [n] (fact {:id (str "b-" n) :subject {:name "svc-b"}
+                                     :object-lit (str "claim-" n)}))
+                      (range 3))
+        lines (conflict-lines (into (all-pairs group-a) (all-pairs group-b)))]
+    (is (= 2 (count lines))
+        "two disjoint 3-fact cliques stay two components, one line each")
+    (is (some #(str/includes? % "svc-a") lines))
+    (is (some #(str/includes? % "svc-b") lines))))
+
+(deftest conflict-rendering-does-not-depend-on-pair-order
+  (let [facts (mapv (fn [n] (fact {:id (str "f-" n) :object-lit (str "claim-" n)}))
+                    (range 5))
+        pairs (all-pairs facts)]
+    (is (= (conflict-lines pairs)
+           (conflict-lines (vec (reverse pairs)))
+           (conflict-lines (vec (shuffle pairs))))
+        "same conflict graph, any pair order -> byte-identical rendered lines")))
+
+(deftest large-component-elides-instead-of-listing-every-object
+  (let [facts (mapv (fn [n] (fact {:id (str "f-" n) :object-lit (str "claim-" n)}))
+                    (range 20))
+        lines (conflict-lines (all-pairs facts))]
+    (is (= 1 (count lines)) "one component, not one line per pair")
+    (is (str/includes? (first lines) "20 claims in contention"))
+    (is (str/includes? (first lines) "more")
+        "distinct objects beyond the cap collapse into a count")
+    (is (< (count (.getBytes ^String (first lines) "UTF-8")) 400)
+        "elision bounds the line itself, not just the reported count")))
+
+(deftest heterogeneous-component-names-every-disputed-predicate
+  (let [f1 (fact {:id "f-dep" :predicate :core/depends-on :object-lit "GraphQL"})
+        f2 (fact {:id "f-against" :predicate :core/decided-against :object-lit "GraphQL"})
+        lines (conflict-lines [{:fact f2 :candidate f1}])]
+    (is (= 1 (count lines)))
+    (is (str/includes? (first lines) "depends-on"))
+    (is (str/includes? (first lines) "decided-against")
+        "a component spanning two predicates on one subject names both,
+         rather than picking one to speak for facts it does not describe")))
+
 (deftest budget-cuts-low-priority-lines-first
   (let [sections [{:key :a :header "A" :lines ["- a1" "- a2"]}
                   {:key :b :header "B" :lines (mapv #(str "- b" %) (range 50))}]
