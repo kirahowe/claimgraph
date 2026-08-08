@@ -763,6 +763,7 @@
                    :no-judge (:no-judge opts)
                    :no-llm (:no-llm opts)
                    :budget (:budget opts)
+                   :concurrency (:concurrency opts)
                    :extractor (:extractor opts)
                    :progress-fn (when-not (:quiet opts)
                                   (fn [line] (binding [*out* *err*] (println line))))})]
@@ -952,8 +953,13 @@ Commands:
                         injection arithmetic, code baseline; needs no
                         extractor)
                         [--budget N] (hard cap on model calls for the whole
-                        run, default 20; deferred work is named in the
-                        scorecard)
+                        run, default 20; the calls go to the files worth
+                        them — injected first, then largest — and deferred
+                        work is named in the scorecard)
+                        [--concurrency N] (extraction calls in flight at
+                        once, default 6; each is a subprocess that spends
+                        its time waiting, so this is the run's wall clock.
+                        1 for a strictly serial pass)
                         [--quiet] (no progress on stderr)
                         [--extractor CMD] [--out FILE] (also write the JSON
                         scorecard to FILE) [--scorecard|--json|--pretty]
@@ -1331,7 +1337,8 @@ Commands:
                    :scan-dir {:coerce [:string]}
                    :scorecard {:coerce :boolean}
                    :no-code {:coerce :boolean} :no-judge {:coerce :boolean}
-                   :budget {:coerce :long} :no-llm {:coerce :boolean}
+                   :budget {:coerce :long} :concurrency {:coerce :long}
+                   :no-llm {:coerce :boolean}
                    :quiet {:coerce :boolean}})}
     {:cmds ["config"] :fn cmd-config :spec (string-flags [:dir])}
     {:cmds ["version"] :fn cmd-version}

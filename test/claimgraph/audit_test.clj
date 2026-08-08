@@ -993,10 +993,14 @@
                          :judge-fn fixture-judge})]
     (is (= 1 @calls) "the budget allows exactly one extraction call")
     (is (= 3 (count (:files r))))
-    (testing "the two files the budget didn't reach carry the skip reason"
-      (let [[first-file & rest-files] (:files r)]
-        (is (nil? (:llm first-file)) "the one call spent lands a normal report")
-        (is (every? #(= {:status :skipped :reason :budget-exhausted} (:llm %)) rest-files))))
+    (testing "the one call lands on the pile's most valuable file, and the two
+              it didn't reach carry the skip reason"
+      (let [by-suffix (fn [suffix] (first (filter #(str/ends-with? (:path %) suffix) (:files r))))]
+        (is (nil? (:llm (by-suffix "CLAUDE.md")))
+            "the largest injected file spends the call; a normal report, no skip reason")
+        (is (= {:status :skipped :reason :budget-exhausted} (:llm (by-suffix "AGENTS.md")))
+            "sorting first by name buys nothing")
+        (is (= {:status :skipped :reason :budget-exhausted} (:llm (by-suffix "note.md"))))))
     (testing "the :llm section names what the run couldn't reach"
       (is (= 1 (get-in r [:llm :allowed])))
       (is (= 1 (get-in r [:llm :spent])))
@@ -1031,6 +1035,11 @@
     (is (= "partial" (:status r)))))
 
 (deftest trip-after-consecutive-failures
+  ;; :concurrency 1 because this is the exact-arithmetic case: the breaker
+  ;; counts failures it has already been told about, so serially it stops
+  ;; the very next call and the count is trip-threshold on the nose. The
+  ;; concurrent case, where calls already waiting on a subprocess cannot be
+  ;; un-made, is breaker-still-stops-a-dead-extractor-under-concurrency.
   (let [{:keys [project note-dir]} (write-fixture!)
         _ (spit (str note-dir "/extra1.md") "another note")
         _ (spit (str note-dir "/extra2.md") "yet another note")
@@ -1041,6 +1050,7 @@
                          :ctx isolated-ctx
                          :ancestor-limit project :managed-paths []
                          :budget 100
+                         :concurrency 1
                          :extractor-fn extractor})]
     (is (= 5 (count (:files r))) "two instruction files plus three notes")
     (is (= audit/trip-threshold @calls)
@@ -1103,6 +1113,233 @@
                (cli/run ["audit" "--project" tmp "--extractor" "no-such-binary-xyz"
                         "--json" "--quiet"]))]
     (is (= 1 code) "a blocked audit is not a clean exit, unlike an ordinary report")))
+
+(deftest gate-budget-is-a-hard-cap-under-concurrent-spend
+  ;; The race the extraction pool makes reachable: a gate that reads the
+  ;; counter, decides, and then writes it lets every thread in flight see
+  ;; the same last affordable slot and take it. --budget is the user's
+  ;; money and the user's minutes, so overshooting it is not a rounding
+  ;; error.
+  ;;
+  ;; 64 threads released together against a budget of 1, over several
+  ;; rounds: a lost update is a real interleaving, not a certainty, and a
+  ;; single round of a racy gate comes out correct often enough that one
+  ;; round would be a coin toss dressed as a test.
+  (let [budget 1
+        threads 64
+        rounds 8
+        outcomes
+        (mapv (fn [_]
+                (let [gate (audit/llm-gate {:extract-run (constantly "")
+                                            :judge-run (constantly "")
+                                            :budget budget})
+                      spend! (:spend! gate)
+                      granted (atom 0)
+                      start (java.util.concurrent.CountDownLatch. 1)
+                      askers (mapv (fn [_]
+                                     (future (.await start)
+                                             (when (spend!) (swap! granted inc))))
+                                   (range threads))]
+                  (.countDown start)
+                  (run! deref askers)
+                  (assoc ((:report gate)) :granted @granted)))
+              (range rounds))]
+    (is (= #{budget} (set (map :granted outcomes)))
+        "exactly --budget calls are granted, however many threads ask at once")
+    (is (= #{budget} (set (map :spent outcomes)))
+        "and the counter agrees with what was handed out")
+    (is (= #{(- threads budget)} (set (map :deferred outcomes)))
+        "every refused ask is counted once — no ask vanishes and none is counted twice")))
+
+(deftest extraction-overlaps-and-apply-order-stays-canonical
+  ;; Extraction is a wait on a subprocess and carries no store access, so
+  ;; the waits overlap; assertion is the whole conflict machinery against
+  ;; one store, and its ORDER decides what a collision means, so it stays
+  ;; serial and canonical. This plants the two halves against each other:
+  ;; four instruction files whose extraction calls all have to be in flight
+  ;; at once for the barrier to release, finishing in the exact reverse of
+  ;; the order they must be applied in.
+  (let [proj (temp-dir)
+        letters ["a" "b" "c" "d"]
+        ;; a.md finishes last, d.md first — completion order and apply
+        ;; order can only agree here by accident
+        finish-delay {"a" 240 "b" 180 "c" 120 "d" 60}
+        latch (java.util.concurrent.CountDownLatch. (count letters))
+        in-flight (atom 0)
+        peak (atom 0)
+        finished (atom [])
+        claim (fn [subject]
+                (str "{\"subject\":\"" subject "\",\"predicate\":\"prefers\","
+                     "\"object\":\"argon2 hashing\",\"object_kind\":\"literal\","
+                     "\"class\":\"preference\",\"quote\":\"prefers argon2 hashing\"}"))]
+    (fs/create-dirs (fs/path proj ".claude" "rules"))
+    (spit (str proj "/.claude/rules/a.md") "auth-service prefers argon2 hashing.\n")
+    (spit (str proj "/.claude/rules/b.md") "nothing durable here\n")
+    (spit (str proj "/.claude/rules/c.md") "nothing durable here\n")
+    (spit (str proj "/.claude/rules/d.md") "AuthService prefers argon2 hashing.\n")
+    (let [extractor
+          (fn [prompt]
+            (let [letter (first (filter #(str/includes? prompt (str "rules/" % ".md")) letters))]
+              (swap! peak max (swap! in-flight inc))
+              (.countDown latch)
+              ;; bounded, so a serial run fails this test instead of hanging it
+              (.await latch 1500 java.util.concurrent.TimeUnit/MILLISECONDS)
+              (Thread/sleep (finish-delay letter))
+              (swap! in-flight dec)
+              (swap! finished conj letter)
+              (case letter
+                "a" (claim "auth-service")
+                "d" (claim "AuthService")
+                "")))
+          r (audit/audit! {:project proj :ctx isolated-ctx
+                           :ancestor-limit proj :managed-paths []
+                           :concurrency 4 :no-judge true
+                           :extractor-fn extractor})]
+      (testing "all four calls are genuinely in flight together — the pool does its job"
+        (is (= 4 @peak)))
+      (testing "and they complete in the reverse of the order they must be applied in"
+        (is (= ["d" "c" "b" "a"] @finished)))
+      (testing "reports still come back in the canonical [kind-rank, path] order"
+        (is (= [".claude/rules/a.md" ".claude/rules/b.md"
+                ".claude/rules/c.md" ".claude/rules/d.md"]
+               (mapv :path (:files r)))))
+      (testing "and so does ASSERT order: a.md's spelling minted the entity and
+                d.md's became the alias, though d.md answered first"
+        (is (= [["auth-service" "AuthService"]]
+               (get-in r [:findings :name-clusters])))))))
+
+(deftest breaker-still-stops-a-dead-extractor-under-concurrency
+  ;; The breaker cannot un-make calls already waiting on a subprocess, so
+  ;; concurrently it bounds the overshoot by the pool's width instead of
+  ;; stopping on the exact threshold. What must not happen is a dead
+  ;; extractor being handed the whole pile one call at a time.
+  (let [proj (temp-dir)
+        home (temp-dir)
+        ctx {:home home :env {}}
+        h (harness/resolve-harness nil)
+        note-dir (harness/notes-path h {:project proj :ctx ctx})
+        concurrency 3
+        file-count 12
+        calls (atom 0)]
+    (fs/create-dirs note-dir)
+    (doseq [i (range file-count)]
+      (spit (str note-dir "/note-" (format "%02d" i) ".md") "a note the extractor fails on\n"))
+    (let [r (audit/audit! {:project proj :ctx ctx
+                           :ancestor-limit proj :managed-paths []
+                           :budget 100 :concurrency concurrency :no-judge true
+                           :extractor-fn (fn [_]
+                                           (swap! calls inc)
+                                           (throw (ex-info "boom" {:type :llm-command-failed})))})]
+      (is (= file-count (count (:files r))))
+      (is (true? (get-in r [:llm :tripped?])))
+      (is (<= @calls (+ audit/trip-threshold concurrency))
+          "at most the pool's width of calls can already be in flight when it trips")
+      (is (< @calls file-count) "the dead extractor never gets the whole pile")
+      (is (= "partial" (:status r))))))
+
+(deftest extraction-order-values-injected-then-large
+  ;; One kind throughout — the harness's own inject-file is a note that IS
+  ;; injected — so the canonical [kind-rank, path] order (a, m, z) and the
+  ;; value order disagree on every position, and a sort that quietly kept
+  ;; following paths cannot pass by coincidence.
+  (let [pile [{:path "a-note.md" :bytes 100 :injected? false :kind :note}
+              {:path "m-inject.md" :bytes 500 :injected? true :kind :note}
+              {:path "z-note.md" :bytes 9000 :injected? false :kind :note}]]
+    (testing "injected before on-demand however big, then larger before smaller"
+      (is (= ["m-inject.md" "z-note.md" "a-note.md"]
+             (mapv :path (audit/extraction-order pile)))))
+    (testing "the budget buys the most valuable that many, never the first that many by name"
+      (is (= #{"m-inject.md"} (audit/select-for-extraction pile 1)))
+      (is (= #{"m-inject.md" "z-note.md"} (audit/select-for-extraction pile 2)))
+      (is (= #{"m-inject.md" "z-note.md" "a-note.md"} (audit/select-for-extraction pile 9))))
+    (testing "a budget of nothing selects nothing"
+      (is (= #{} (audit/select-for-extraction pile 0))))))
+
+(deftest budget-selects-by-value-not-by-name
+  (let [proj (temp-dir)
+        home (temp-dir)
+        ctx {:home home :env {}}
+        h (harness/resolve-harness nil)
+        note-dir (harness/notes-path h {:project proj :ctx ctx})]
+    ;; AGENTS.md sorts first by name and is the smallest; the note is the
+    ;; biggest file in the pile but is recalled on demand, never injected.
+    (spit (str proj "/AGENTS.md") "tiny\n")
+    (spit (str proj "/CLAUDE.md") (str "CLAUDE " (apply str (repeat 400 "x")) "\n"))
+    (fs/create-dirs note-dir)
+    (spit (str note-dir "/aaa.md") (str "note " (apply str (repeat 4000 "y")) "\n"))
+    (let [extracted-from
+          (fn [budget]
+            (let [seen (atom #{})]
+              (audit/audit! {:project proj :ctx ctx
+                             :ancestor-limit proj :managed-paths []
+                             :budget budget :no-judge true
+                             :extractor-fn (fn [prompt]
+                                             (swap! seen conj
+                                                    (second (re-find #"file=\"([^\"]+)\"" prompt)))
+                                             "")})
+              @seen))]
+      (testing "one call goes to the largest INJECTED file, not the alphabetically first"
+        (is (= #{"CLAUDE.md"} (extracted-from 1))))
+      (testing "two calls take both instruction files before the bigger on-demand note —
+                an injected file costs context every session, a note only when recalled"
+        (is (= #{"AGENTS.md" "CLAUDE.md"} (extracted-from 2))))
+      (testing "a budget that covers the pile audits all of it"
+        (is (= 3 (count (extracted-from 20))))))))
+
+(deftest over-budget-injection-carries-its-remedy
+  (testing "the compiled view as the larger half — the lever is the compile budget"
+    ;; the shape measured on claimgraph itself: 26,893 bytes injected, of
+    ;; which 19,591 (73%) is claimgraph's own view
+    (let [r (audit/injection-report
+             [{:path "MEMORY.md" :bytes 19591 :managed-bytes 19591 :injected? true}
+              {:path "CLAUDE.md" :bytes 5000 :managed-bytes 0 :injected? true}
+              {:path "AGENTS.md" :bytes 2302 :managed-bytes 0 :injected? true}])]
+      (is (true? (:over-budget r)))
+      (is (= 1893 (:over-by r)) "the overrun is stated, not just the fact of one")
+      (is (= :managed-view (:cause r)))
+      (is (= ["MEMORY.md" "CLAUDE.md"] (mapv :path (:largest r)))
+          "the injected files the bytes are actually in, biggest first")
+      (is (str/includes? (:remedy r) "claim compile-context --budget"))
+      (is (str/includes? (:remedy r) "compiled view"))))
+  (testing "hand-written files filling the window — the lever is the files"
+    (let [r (audit/injection-report
+             [{:path "MEMORY.md" :bytes 2000 :managed-bytes 2000 :injected? true}
+              {:path "CLAUDE.md" :bytes 30000 :managed-bytes 0 :injected? true}])]
+      (is (= :instructions (:cause r)))
+      (is (str/includes? (:remedy r) "trim or consolidate"))
+      (is (str/includes? (:remedy r) "CLAUDE.md"))
+      (is (not (str/includes? (:remedy r) "claim compile"))
+          "trimming the view cannot be the answer when it is not the problem")))
+  (testing "a view that IS the larger half but could not fix it alone still names the files"
+    (let [r (audit/injection-report
+             [{:path "MEMORY.md" :bytes 40000 :managed-bytes 40000 :injected? true}
+              {:path "CLAUDE.md" :bytes 26000 :managed-bytes 0 :injected? true}])]
+      (is (= :instructions (:cause r))
+          "26 KB of hand-written files is over the window with the view at zero")))
+  (testing "an in-budget pile carries no remedy — there is nothing to do"
+    (let [r (audit/injection-report [{:path "CLAUDE.md" :bytes 100 :managed-bytes 0 :injected? true}])]
+      (is (nil? (:remedy r)))
+      (is (nil? (:over-by r)))
+      (is (nil? (:cause r))))))
+
+(deftest over-budget-remedy-reaches-both-the-json-and-the-scorecard
+  (let [files [{:path "MEMORY.md" :bytes 19591 :managed-bytes 19591 :injected? true :claims 0}
+               {:path "CLAUDE.md" :bytes 7302 :managed-bytes 0 :injected? true :claims 3}]
+        sc (audit/scorecard {:project "p" :files files :fold (audit/fold-results [])
+                             :judged [] :no-judge true :clusters [] :entities []
+                             :code {:status :skipped :note "skipped by --no-code"}
+                             :noise {}})
+        out (audit/render-pretty sc)]
+    (testing "the JSON next steps carry the lever, not only the funnel's own CTA"
+      (is (= 2 (count (:next sc))))
+      (is (str/includes? (first (:next sc)) "claim setup"))
+      (is (str/includes? (second (:next sc)) "claim compile-context --budget")))
+    (testing "the scorecard states the overrun and names where the bytes are"
+      (is (str/includes? out "** over budget **"))
+      (is (str/includes? out "KB over — largest injected: MEMORY.md 20 KB")))
+    (testing "and the remedy renders as its own next: line — a JSON-only remedy
+              is one nobody at a terminal ever reads"
+      (is (str/includes? out "next: claim compile-context --budget")))))
 
 (deftest progress-narrates
   (let [{:keys [project note-dir]} (write-fixture!)
