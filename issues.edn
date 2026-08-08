@@ -1,0 +1,377 @@
+;; claimgraph — open work, as an EDN map.
+;;
+;; Each entry carries the measurement or verbatim output that motivated it,
+;; because the numbers are the expensive part to re-derive. Measurements were
+;; taken on 2026-08-07/08 against this repo (88 source files, 640 code facts,
+;; 11 pile files) on an M-series Mac with the Datalevin pod.
+;;
+;; Read with: (clojure.edn/read-string (slurp "issues.md"))
+
+{:unknown-flags-and-free-help
+ {:title "Unknown flags are silently accepted, and --help starts a paid run"
+  :priority :p0
+  :size :small
+  :description
+  "The CLI accepts any unrecognized flag and proceeds as if it were not there.
+   `claim audit --totally-bogus-flag` runs a normal audit and exits 0. Because
+   `help` is a verb rather than a flag in this CLI, `claim audit --help` parses
+   as an unknown boolean option and starts a REAL audit against the live
+   extractor — several minutes of wall clock and real money, from the single
+   most likely thing a new user types.
+
+   `--help` should work on every verb, print that verb's usage, cost nothing,
+   and exit 0. Unknown flags should exit 2, which is the code the top-level
+   help already promises for `a flag value that would not parse`."
+  :evidence
+  ["claim audit --no-llm --totally-bogus-flag  =>  full normal scorecard, exit 0"
+   "claim audit --help  =>  started a live audit; killed at ~150s after a preflight and extraction calls"]
+  :approach
+  "Declare flags per verb (the spec map already exists in cli.clj) and reject
+   anything not in it. Add --help/-h as a universal flag handled before any
+   work is dispatched, so it can never reach a code path that spends money.
+   Consider a general rule: no verb may make a model call before argument
+   validation completes."
+  :notes
+  "Found the hard way — a subagent typed `--help` while working on the audit
+   pipeline and spent real tokens on an audit nobody asked for."}
+
+ :admission-dedup
+ {:title "Near-match deduplication at admission for entities and facts"
+  :priority :p0
+  :size :large
+  :description
+  "Paraphrases of one idea enter the graph as distinct facts, then surface as
+   a combinatorial pile of conflicts demanding human adjudication. Six
+   near-identical `reproduce-first review` claims, written by six different
+   sessions, produced 15 pairwise conflicts — every one of them asking the
+   user to resolve a disagreement that does not exist.
+
+   This is the failure mode that decides whether the tool is worth using. The
+   review queue IS the product; once it fills with restatements, users stop
+   reading it, and every downstream feature inherits worthless input.
+
+   Clustering the rendered view (shipped 2026-08-07) makes the symptom 83%
+   cheaper to display. It does not stop the graph accumulating paraphrases,
+   and the clustered line still reads oddly: `6 claims in contention` followed
+   by six statements that say the same thing.
+
+   Entities need the same treatment — `near-match` exists for entity lookup
+   and self-heals by recording the queried name as an alias, but nothing
+   applies that similarity at write time."
+  :evidence
+  ["6 paraphrase claims -> 15 conflict pairs -> 5047 bytes, 19% of the 25 KB injection window"
+   "After display clustering: 1 line, 753 bytes (82.7% reduction) — symptom only"
+   "Live store conflicts section: 16 rows, 15 of them one semantic disagreement"]
+  :approach
+  "Screen at admission rather than at render. `logic/screen-candidates` is the
+   natural seam — it already runs before assert. Candidate mechanisms, cheapest
+   first: normalized-object hashing for exact restatements; a similarity
+   threshold over (subject, predicate) siblings; a judge call reserved for
+   pairs above the threshold, which folds into the existing budget discipline.
+   A near-duplicate should reinforce the standing fact (raising confidence,
+   re-sourcing per the existing reinforcement rules) rather than mint a rival."
+  :constraints
+  ["Must not silently merge genuine disagreements — the 2-claim instruction-files
+    conflict in the same section IS real and must survive."
+   "Reinforcement already has re-sourcing semantics (spec/claims.allium); a merge
+    should reuse them rather than invent a second path."
+   "Any model call here must draw from the shared run budget, never a private one."]}
+
+ :budget-allocation
+ {:title "Budget allocation is unmanaged: stages starve, and a run cannot be predicted"
+  :priority :p0
+  :size :medium
+  :description
+  "Three related defects in how a run plans and divides its spend.
+
+   1. NO PER-STAGE RESERVATION. Extraction, sweep, and judge draw from one flat
+      pool in that order. On a default-budget run the judge — described in help
+      as the false-positive filter that `keeps the headline honest` — never
+      executes at all. Latency was hiding this: nobody waited 23 minutes to
+      discover the last stage got nothing.
+
+   2. NO PREFLIGHT ESTIMATE. Everything needed to predict a run is known before
+      a single call is spent: the pile file count and their sizes, the code
+      file count, the configured budget and concurrency, and an observed
+      per-call latency. The user should see `11 files, ~20 calls, est. 3-4 min`
+      and be able to adjust budget or concurrency BEFORE committing, rather
+      than discovering the shape of the run by waiting it out.
+
+   3. CALLS ARE A POOR UNIT. A 20 KB extraction and a one-word preflight both
+      count as one. Allocation across stages in particular wants tokens, since
+      extraction and judging have very different per-call sizes.
+
+   Deferral is currently the only feedback, and it arrives after the money is
+   spent: a run reports 42 deferred calls once there is nothing to be done."
+  :evidence
+  ["Real run, default budget 20: extraction 11 calls, sweep 9 calls, judge 0 calls, 42 deferred"
+   "Output: `sweep: 9 candidates, 0 linked` then `judge: 0 verdicts, 0 compatible removed`"
+   "llm-gate counts calls only: `llm: 20 calls, 1 failed, 42 deferred (budget 20)`"]
+  :approach
+  "Reserve a share per stage rather than serving first-come; the judge is the
+   cheapest way to keep the headline honest, so it should be the last thing
+   starved rather than the first. Derive an estimate from the scanned source
+   list before the first call and print it (with a --dry-run that stops there).
+   Revisit the default budget of 20, chosen when 20 calls meant 23 minutes of
+   wall clock and now the binding constraint on coverage rather than time."
+  :decided
+  "Kira, 2026-08-08: budget allocation is a general problem, not just judge
+   starvation; runtime should be estimable from the pile file count up front."
+  :see-also [:cost-transparency :concurrency-timeout]}
+
+ :batched-writes
+ {:title "Batch the write path: 10.5ms fixed per commit, 125x available"
+  :priority :p1
+  :size :large
+  :description
+  "Store-backed ingest costs ~26ms per fact, essentially all of it commit
+   overhead. Datalevin's transact cost is fixed per call (LMDB commit), not
+   proportional to datom count, and each assert performs several: ensure-entity
+   for the subject, sometimes the object, then the fact itself.
+
+   This is the only thing in the system that scales with repository size. A
+   10k-file repo at ~70k facts projects to roughly half an hour of pure writes.
+
+   `core/ingest` documents per-fact transactions as deliberate: `applying
+   conflict policy fact-by-fact takes precedence over batch atomicity`. That
+   tradeoff is correct for facts that actually collide and vacuous for the rest.
+   Crucially, the profile shows reads are three orders of magnitude cheaper than
+   commits — so DECISIONS can stay strictly per-fact while only COMMITS batch."
+  :evidence
+  ["300 rows, one transact each: 3161.6 ms (10.54 ms/row)"
+   "300 rows, single transact:   25.3 ms (0.08 ms/row)  => 125x"
+   "resolve-entity 0.44 ms/call, get-facts 0.69 ms/call, -list-entities 1.58 ms/call"
+   "cold insert 38.48 ms/fact; re-assert (duplicate path) 11.24 ms/fact"
+   "claim ingest-code into a fresh store: 16.6s for 640 facts / 88 files"
+   "the same 88 files through the in-memory audit store: 1.4s"]
+  :approach
+  "DECIDE AGAINST AN OVERLAY, FLUSH ONCE. Prefetch the slice the incoming batch
+   touches — entities for the subject set, stable predicates, currently-valid
+   facts for those subjects — run the unmodified decision loop against an
+   in-memory projection seeded from it, and flush the recorded delta in one
+   transact. Each decision sees every prior decision's effect, so conflict
+   detection, supersession, reinforcement and flagging all batch too, not just
+   the non-interacting share.
+
+   The usual objection to an overlay is that it means reimplementing the
+   store's mutation semantics in a second place, where the two can drift.
+   That objection does not apply here: `claimgraph.store.memory` is already a
+   full second implementation of the store protocol, and `bb test` runs the
+   entire suite against BOTH backends. The equivalence is already asserted
+   continuously, so the overlay reuses proven semantics rather than inventing
+   them.
+
+   `code/ingest!` already prefetches much of the needed slice for staleness
+   diffing (`-select-facts` with :valid-cheap over the scope), so the read side
+   is partly built.
+
+   Cheaper first slice if the full overlay is deferred: pre-create all needed
+   entities in one transact before the fact loop. Cold inserts create ~1.1
+   entities per fact, so this alone removes most of the transacts."
+  :constraints
+  ["The oplog is the replication record and must keep per-fact granularity even
+    when the store transact is batched — decouple oplog append from store commit."
+   "Prefetch must be keyed by the incoming subject set, not the whole graph, or
+    a large store trades write time for read time and memory."
+   "Read-then-write widens the window another writer could change the store in.
+    Single-writer is already the assumption (the curator is a singleton via
+    try-acquire on <db>.curate.lock); decide whether the batch takes the lease."
+   "Losing a batch to a crash loses more work than losing one fact. The oplog is
+    the record and the store its materialized view, so recovery exists — confirm
+    it actually replays."
+   "Alias clash refusal is a write-time decision; it must fire in the overlay."
+   "Format version stays 1; additive data only."
+   "Verify against a worktree of the previous release in both directions —
+    the standing rule for anything touching a persisted format."]
+  :decided
+  "Kira, 2026-08-08: batch the conflict decisions too, deciding against current
+   db state plus accumulated in-memory changes, rather than only batching facts
+   that provably cannot interact."}
+
+ :doctor
+ {:title "Health check, and surfacing silent background failure"
+  :priority :p1
+  :size :medium
+  :description
+  "The SessionEnd hook detaches `claim curate` and never looks back. If it
+   fails every time — expired auth, exhausted budget, the recursive-hook bug
+   that already happened once — nothing ever tells the user. A tool that writes
+   to your memory unattended must be able to answer `is this working?` in one
+   command, and must volunteer the answer when it is not.
+
+   `claim stats` reports store counts. There is no health surface.
+
+   Two halves, and both are needed: a `claim doctor` that reports on demand,
+   and proactive surfacing so the next interactive command mentions a
+   persistent background failure without being asked."
+  :evidence
+  ["Known prior incident: claude -p fired SessionEnd recursively, leaving consolidation
+    permanently due; discovered by investigation, not by the tool reporting it."]
+  :approach
+  "Record a durable health row per background run (last success, last failure,
+   consecutive failure count, last error). `doctor` reads it alongside the
+   live checks setup already performs — dtlv present, extractor authenticated,
+   store readable and format-compatible, lease not stale, hook wired to the
+   binary that actually exists. Surface a persistent-failure banner on the next
+   ordinary command, rate-limited so it informs rather than nags."}
+
+ :episode-rollback
+ {:title "Drop or roll back a session's ingest"
+  :priority :p1
+  :size :medium
+  :description
+  "`claim episode` offers open, close, and list. There is no way to retract one.
+
+   When a session ingests garbage — a bad extraction run, a misconfigured
+   source, an experiment — the user needs to undo that specific contribution
+   without hand-editing the store. This is distinct from invalidation-as-
+   decision-change: the claim is not superseded by better knowledge, it should
+   never have been admitted.
+
+   Structurally this is already available and simply unexposed: every fact
+   carries its episode, and bi-temporality means retraction is an invalidation
+   sweep that preserves history rather than a destructive delete."
+  :evidence
+  ["claim help: `episode open` / `episode close` / `episode list` — no retract verb"
+   "A real run produced `claimgraph has-version llm-timeout-ms default 120s` from a
+    misparse; today nothing removes that except manual invalidation."]
+  :approach
+  "A retraction verb taking an episode id, invalidating every fact it asserted
+   with a distinct invalidation-kind that says `withdrawn` rather than
+   `superseded` — so the Changed-recently briefing and the audit prongs can
+   tell a mistake from a decision. Reinstate facts an ingest superseded, since
+   an ingest that should not have happened should not have closed anything.
+   Needs a dry-run showing exactly what would change."
+  :constraints
+  ["A withdrawn episode's effects may have been replicated; decide how the oplog
+    carries a retraction to peers."
+   "Facts reinforced by a later legitimate episode must not be withdrawn wholesale."]}
+
+ :perf-regression-gate
+ {:title "Performance budgets in CI, plus a soak suite"
+  :priority :p1
+  :size :medium
+  :description
+  "`bb bench` describes itself as doubling as a longitudinal regression check
+   but asserts no time budgets, so nothing fails when throughput regresses. The
+   26ms/fact write wall and the ~70s serial extraction both existed for a long
+   time and were found by hand profiling, not by the suite.
+
+   Beyond a gate, the system needs a soak suite: it is a long-lived, stateful,
+   background-writing tool, and its interesting failures are accumulation
+   failures — paraphrase pileup, non-converging curation, unbounded conflict
+   growth, lease staleness. Those do not appear in a unit test that starts from
+   an empty store."
+  :evidence
+  ["Wall found by manual profiling: 640 facts = 16.6s, entirely commit overhead"
+   "Serial extraction: ~70s/call x 11 files, invisible to the suite"]
+  :approach
+  "Assert wall-clock budgets on a fixed corpus (`N facts in under X seconds`,
+   generous enough not to flake on CI hardware but tight enough to catch an
+   order of magnitude). For soak: drive many synthetic sessions against one
+   store, then assert invariants over the result — conflicts do not grow
+   without bound, curation converges, no episode stays open forever, the
+   compiled view stays inside its budget, entity count tracks distinct subjects
+   rather than drifting upward with paraphrase."}
+
+ :cost-transparency
+ {:title "Token-denominated budgets and cumulative cost reporting"
+  :priority :p1
+  :size :medium
+  :description
+  "Budgets are denominated in CALLS and scoped to a single run. Nothing
+   accumulates across runs, and a call is a poor proxy for cost — extraction on
+   a 20 KB file and a one-word preflight both count as one.
+
+   For a tool making dozens of background model calls a day, `what did this
+   cost me this week` is a precondition for people trusting it unattended."
+  :evidence
+  ["llm-gate counts calls only: `llm: 20 calls, 1 failed, 42 deferred (budget 20)`"
+   "Preflight is one full round-trip and is deliberately unmetered"]
+  :approach
+  "Meter tokens where the extractor reports them, else estimate from prompt and
+   reply bytes. Record per-run spend durably (the same place doctor reads).
+   Report cumulative spend by day/week and by stage, so it is visible which
+   stage the money goes to. Allow budgets expressed in tokens as well as calls."}
+
+ :extraction-quality-gate
+ {:title "Junk extractions are admitted and reported as findings"
+  :priority :p1
+  :size :medium
+  :description
+  "A real run extracted `claimgraph has-version` with the object `llm-timeout-ms
+   default 120s` — the model read the phrase `120s llm-timeout-ms default` in a
+   note as a version string. That fact was admitted, then surfaced to the user
+   as a `disagreement` against the genuine version, carrying the same weight as
+   a real finding.
+
+   Distinct from near-duplicate admission: that is one idea entering many times,
+   this is a bad parse entering once. Both erode the queue's signal, and the
+   queue is the product."
+  :evidence
+  ["disagreement: claimgraph has-version 0.1.0-alpha  vs  claimgraph has-version llm-timeout-ms default 120s"
+   "Real audit run, 107 claims from 11 files"]
+  :approach
+  "Predicates already declare object shape (value vs prose, 250 vs 1000 chars).
+   Extend that vocabulary so a predicate can constrain its object beyond length
+   — a version, a path, an identifier — and reject at screening rather than
+   admitting and reporting. Track admitted-vs-rejected as a quality metric over
+   time so prompt and model changes show up as movement rather than silence.
+   Pairs naturally with a labelled fixture set as a regression gate on
+   extraction precision."}
+
+ :concurrency-timeout
+ {:title "Parallel extraction pushes slow calls past the 120s timeout"
+  :priority :p1
+  :size :small
+  :description
+  "Six concurrent `claude -p` harnesses contend for CPU and memory, so per-call
+   latency rises under parallelism. A call that comfortably fit the 120s
+   default serially no longer does: a real run lost one file to
+   llm-command-timeout.
+
+   Introduced by the parallel-extraction change of 2026-08-08 and worth fixing
+   deliberately rather than by lowering concurrency reflexively — the point of
+   the design is that wall clock stops caring about any individual slow call."
+  :evidence
+  ["warning: .../allium-specs.md: extraction failed (llm-command-timeout)"
+   "warning: 1 model call failed (llm-command-timeout: 1)"
+   "Same file extracted fine under the serial path"]
+  :approach
+  "Scale the timeout with the configured concurrency, so contention cannot
+   convert a slow call into a lost file. A lost file is a silent coverage hole:
+   it reports as a warning and the pile is then audited without it, which reads
+   as a clean result on an incomplete scan.
+
+   Lowering concurrency instead would trade the whole point of the parallel
+   design — wall clock no longer caring about any individual slow call — to
+   defend a constant."
+  :decided
+  "Kira, 2026-08-08: raise the timeout with concurrency rather than capping
+   concurrency."}
+
+ :polish
+ {:title "Small sharp edges found while measuring"
+  :priority :p2
+  :size :small
+  :description
+  "Collected minor items, each independently trivial:
+
+   1. --concurrency is unclamped: `--concurrency 500` would fork 500 agent
+      subprocesses. Clamp to something defensible.
+   2. The audit scorecard prints absolute paths in its largest-injected line,
+      which runs past 200 characters and wraps three times, burying the
+      managed-view breakdown underneath. Relativize to the project root.
+      DECIDED (Kira, 2026-08-08): relativizing is the mitigation — the line
+      stays, the paths shorten. Note that pile sources legitimately sit outside
+      the project root (ancestor CLAUDE.md, the harness config dir), so those
+      need a sensible fallback rather than a long ../../.. chain.
+   3. A clustered conflict line still spells out up to five near-identical prose
+      objects (~700 bytes). Per-object truncation would help, though
+      :admission-dedup removes the cause.
+   4. Remedy strings name CLI verbs as string literals; one shipped naming
+      `claim compile`, which does not exist (the verb is `compile-context`),
+      and three tests asserted the wrong string without noticing. Assert
+      suggested commands against the actual verb table."
+  :evidence
+  ["Shipped and fixed 2026-08-08: `claim compile --budget` -> `claim compile-context --budget`"]}}
